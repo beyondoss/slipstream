@@ -1,0 +1,102 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  check-version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - id: check
+        run: |
+          LOCAL=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$LOCAL" >> "$GITHUB_OUTPUT"
+          PUBLISHED=$(cargo search beyond-slipstream --limit 1 2>/dev/null | head -1 | sed -n 's/.*= "\(.*\)".*/\1/p')
+          echo "local=$LOCAL published=$PUBLISHED"
+          if [ "$LOCAL" = "$PUBLISHED" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check-version
+    if: needs.check-version.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../launch-${{ matrix.target }}.${{ matrix.archive }} launch
+      - uses: actions/upload-artifact@v7
+        with:
+          name: launch-${{ matrix.target }}
+          path: launch-${{ matrix.target }}.${{ matrix.archive }}
+  release:
+    name: Release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.check-version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "v${{ needs.check-version.outputs.version }}" \
+            --generate-notes \
+            launch-*.tar.gz
+  publish:
+    name: Publish to crates.io
+    needs: [check-version, build]
+    if: needs.check-version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -1,0 +1,17 @@
+[settings]
+experimental = true
+activate_aggressive = true
+
+[tools]
+rust = "1.92"
+yamlfmt = "0.12.1"
+dprint = "0.50.2"
+"ubi:nats-io/nats-server" = "2.14.1"
+
+[tasks.format]
+description = "Auto-format all code using dprint (Go, TypeScript, YAML, JSON, Markdown)"
+run = "dprint fmt"
+
+[tasks."format:check"]
+description = "Verify code formatting without making changes (CI-friendly)"
+run = "dprint check"

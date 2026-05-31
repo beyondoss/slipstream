@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[package]
+name = "beyond-slipstream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Watchable distributed config over NATS JetStream — cache locally, stream updates, resume from a sequence number after any restart."
+
+[lib]
+name = "slipstream"
+path = "src/lib.rs"
+
+[dependencies]
+async-nats = "0.46"
+async-trait = "0.1"
+base64 = "0.22"
+crc32fast = "1"
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[[bench]]
+name = "snapshot"
+harness = false
+
+[[bench]]
+name = "ack"
+harness = false
