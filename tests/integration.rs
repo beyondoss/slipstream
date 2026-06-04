@@ -624,6 +624,78 @@ async fn watch_prefix_from_replays_only_the_delta() {
     assert!(matches!(&updates[0], KvUpdate::Put(e) if e.key == "node.b"));
 }
 
+/// Demonstrates the seed-then-watch race a snapshot consumer must avoid, and that resuming from the
+/// snapshot revision closes it.
+///
+/// A consumer that seeds via `scan()` and then subscribes via `watch_prefix()` has a window between
+/// the two calls. `watch_prefix` uses NATS `DeliverPolicy::New` (no initial-state replay), so a
+/// write that lands in that window is in neither the snapshot nor the watch stream — it is silently
+/// lost until the next full reseed. `watch_prefix_from(snapshot_revision)` instead replays
+/// everything after the snapshot, so the gap write is delivered.
+#[tokio::test]
+async fn seed_then_watch_prefix_loses_writes_in_the_gap() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("seed-race").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    // A pre-existing deny entry, present when the snapshot is taken.
+    writer.put("blackhole.1", b"spend").await.expect("put 1");
+
+    // 1) Snapshot — what a seeding consumer loads as its baseline — plus the revision it reflects.
+    let snapshot = store.reader().scan("blackhole.").await.expect("scan");
+    assert_eq!(snapshot.len(), 1);
+    let baseline_rev = snapshot
+        .iter()
+        .filter_map(|e| e.version.as_u64())
+        .max()
+        .unwrap_or(0);
+
+    // 2) A write lands in the race window: after the scan, before any watch attaches.
+    writer.put("blackhole.2", b"fraud").await.expect("put 2");
+
+    // --- The bug: watch_prefix (DeliverPolicy::New) ---
+    {
+        let (tx, mut rx) = mpsc::channel(64);
+        let w = watcher.clone();
+        tokio::spawn(async move {
+            let _ = w.watch_prefix("blackhole.", tx).await;
+        });
+        // Handshake until the watch is provably attached and live (drains the sentinel echoes).
+        establish_watch(writer.as_ref(), &mut rx, "blackhole.sentinel").await;
+
+        // The watch is live now, so a *fresh* write is delivered...
+        writer.put("blackhole.3", b"spend").await.expect("put 3");
+        let got = collect_updates(&mut rx, 1).await;
+        // ...but the first thing we see is blackhole.3, not blackhole.2: the gap write was dropped.
+        // (blackhole.2 has a lower revision; had the watch carried it, it would arrive first.)
+        assert!(
+            matches!(&got[0], KvUpdate::Put(e) if e.key == "blackhole.3"),
+            "watch_prefix delivered a post-subscribe write but silently dropped the gap write \
+             blackhole.2; got {:?}",
+            got[0].key()
+        );
+    }
+
+    // --- The fix: watch_prefix_from(snapshot revision) ---
+    {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cursor = WatchCursor::from_u64(baseline_rev);
+        let w = watcher.clone();
+        tokio::spawn(async move {
+            let _ = w.watch_prefix_from("blackhole.", &cursor, tx).await;
+        });
+        // Resuming from the snapshot revision replays everything after it; the first such entry is
+        // exactly the gap write that watch_prefix lost.
+        let got = collect_updates(&mut rx, 1).await;
+        assert!(
+            matches!(&got[0], KvUpdate::Put(e) if e.key == "blackhole.2"),
+            "watch_prefix_from(snapshot revision) must deliver the gap write; got {:?}",
+            got[0].key()
+        );
+    }
+}
+
 #[tokio::test]
 async fn watch_from_compacted_cursor_does_not_spuriously_fail() {
     let nats = TestNats::start().await;
@@ -1042,5 +1114,328 @@ async fn health_reflects_server_death() {
     assert!(
         flipped.is_ok(),
         "is_healthy() must report false after the NATS server dies"
+    );
+}
+
+// --- watch_applied combinator (against real NATS) ---------------------------
+//
+// These exercise the cursor-after-apply combinator end to end against a live
+// `nats-server`, not a stub watcher. The stub-based unit tests in
+// `src/applied.rs` cover deterministic timing (paused clock) and fault
+// injection; these cover the thing only the real backend can prove — that the
+// resume guarantee holds against real JetStream revision ordering.
+//
+// All of these resume from a captured baseline cursor via `watch_all_from`,
+// which replays everything strictly after the cursor regardless of when the
+// subscription attaches. That sidesteps the `DeliverPolicy::New` attach race
+// (see `seed_then_watch_prefix_loses_writes_in_the_gap`) without needing the
+// sentinel handshake, which the combinator's owned watcher can't expose.
+
+use slipstream::snapshot::{self, SnapshotWriter};
+use slipstream::{BatchConfig, WatchScope, watch_applied};
+use tokio::sync::watch as tokio_watch;
+
+/// parse: keep every Put as its key string; drop deletes/purges.
+fn put_key(u: &KvUpdate) -> Option<String> {
+    match u {
+        KvUpdate::Put(e) => Some(e.key.clone()),
+        _ => None,
+    }
+}
+
+/// parse: keep only Puts under the `node.` prefix — everything else is
+/// "received but nothing to apply".
+fn node_put_key(u: &KvUpdate) -> Option<String> {
+    match u {
+        KvUpdate::Put(e) if e.key.starts_with("node.") => Some(e.key.clone()),
+        _ => None,
+    }
+}
+
+/// Drive `watch_applied` over all keys, resuming from `baseline`, collecting
+/// each applied key and each post-apply cursor onto unbounded channels. Returns
+/// the spawned task handle plus the two receivers and the shutdown sender.
+#[allow(clippy::type_complexity)]
+fn spawn_applied(
+    watcher: Arc<dyn slipstream::KvWatcher>,
+    baseline: Option<WatchCursor>,
+    snapshot: Option<SnapshotWriter>,
+    parse: fn(&KvUpdate) -> Option<String>,
+) -> (
+    tokio::task::JoinHandle<Result<WatchCursor, KvError>>,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<u64>,
+    tokio_watch::Sender<bool>,
+) {
+    let (applied_tx, applied_rx) = mpsc::unbounded_channel::<String>();
+    let (cursor_tx, cursor_rx) = mpsc::unbounded_channel::<u64>();
+    let (sd_tx, sd_rx) = tokio_watch::channel(false);
+
+    let task = tokio::spawn(watch_applied(
+        watcher,
+        WatchScope::All,
+        baseline,
+        snapshot,
+        BatchConfig::default(),
+        parse,
+        move |batch: Vec<String>| {
+            for k in batch {
+                let _ = applied_tx.send(k);
+            }
+        },
+        move |c: WatchCursor| {
+            let _ = cursor_tx.send(c.as_u64().unwrap_or(0));
+        },
+        sd_rx,
+    ));
+
+    (task, applied_rx, cursor_rx, sd_tx)
+}
+
+/// Receive exactly `n` applied keys, failing on timeout so a missing apply
+/// can't hang the suite.
+async fn collect_applied(rx: &mut mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for an applied update")
+            .expect("applied channel closed early");
+        out.push(key);
+    }
+    out
+}
+
+/// End to end: updates after the resume cursor are applied in revision order,
+/// and the returned cursor is the highest applied revision.
+#[tokio::test]
+async fn applied_streams_and_advances_cursor() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("applied").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    // Baseline: capture a cursor, then write the real updates after it.
+    let base = writer.put("baseline", b"x").await.expect("put baseline");
+    let baseline = WatchCursor::from_u64(base.as_u64().expect("u64 rev"));
+
+    writer.put("node.a", b"1").await.expect("put a");
+    writer.put("node.b", b"2").await.expect("put b");
+    let last = writer.put("node.c", b"3").await.expect("put c");
+    let last_rev = last.as_u64().expect("u64 rev");
+
+    let (task, mut applied_rx, _cursor_rx, sd_tx) =
+        spawn_applied(watcher, Some(baseline), None, put_key);
+
+    let got = collect_applied(&mut applied_rx, 3).await;
+    assert_eq!(
+        got,
+        vec!["node.a", "node.b", "node.c"],
+        "updates applied in revision order"
+    );
+
+    sd_tx.send(true).expect("signal shutdown");
+    let cursor = task.await.expect("task join").expect("watch_applied ok");
+    assert_eq!(
+        cursor.as_u64(),
+        Some(last_rev),
+        "returned cursor is the highest applied revision"
+    );
+}
+
+/// The headline guarantee. Run the combinator with a real snapshot, shut it
+/// down, then start a SECOND run from the persisted snapshot cursor and prove
+/// the delta replays with nothing skipped and nothing re-applied — i.e. a
+/// crash+restart resumes exactly where apply left off.
+#[tokio::test]
+async fn applied_resumes_from_snapshot_cursor_without_skipping() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("applied-resume").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    let snap_dir = tempfile::tempdir().expect("snap dir");
+    let snap_path = snap_dir.path().join("state.snap");
+
+    // Baseline cursor, then the first wave of writes.
+    let base = writer.put("baseline", b"x").await.expect("put baseline");
+    let baseline = WatchCursor::from_u64(base.as_u64().expect("u64 rev"));
+    writer.put("node.a", b"1").await.expect("put a");
+    let b_rev = writer
+        .put("node.b", b"2")
+        .await
+        .expect("put b")
+        .as_u64()
+        .expect("u64 rev");
+
+    // --- Run 1: apply {a, b}, checkpoint the snapshot, shut down. ---
+    let writer1 = SnapshotWriter::open(&snap_path, u64::MAX).expect("open snapshot");
+    let (task, mut applied_rx, _cur_rx, sd_tx) =
+        spawn_applied(watcher.clone(), Some(baseline), Some(writer1), put_key);
+
+    let first = collect_applied(&mut applied_rx, 2).await;
+    assert_eq!(first, vec!["node.a", "node.b"]);
+    sd_tx.send(true).expect("shutdown run 1");
+    let cursor1 = task.await.expect("join 1").expect("run 1 ok");
+    assert_eq!(
+        cursor1.as_u64(),
+        Some(b_rev),
+        "run 1 applied through node.b"
+    );
+
+    // The on-disk snapshot must carry the applied cursor and applied state — the
+    // checkpoint is written at the post-apply cursor, never ahead of it.
+    let loaded = snapshot::load(&snap_path)
+        .expect("load snapshot")
+        .expect("snapshot present");
+    assert_eq!(
+        loaded.cursor.as_u64(),
+        Some(b_rev),
+        "snapshot cursor equals the applied cursor"
+    );
+    // The snapshot holds exactly what the combinator received — the post-cursor
+    // delta {node.a, node.b}. `baseline` is the resume cursor itself and is
+    // excluded (resume is exclusive of the cursor revision), so it never reaches
+    // the snapshot log.
+    let mut snap_keys: Vec<&str> = loaded.entries.keys().map(String::as_str).collect();
+    snap_keys.sort_unstable();
+    assert_eq!(snap_keys, vec!["node.a", "node.b"]);
+
+    // --- Between runs: more writes land while nothing is watching. ---
+    writer.put("node.c", b"3").await.expect("put c");
+    let d_rev = writer
+        .put("node.d", b"4")
+        .await
+        .expect("put d")
+        .as_u64()
+        .expect("u64 rev");
+
+    // --- Run 2: resume from the snapshot cursor. Only the delta {c, d} may
+    //     appear — a and b must NOT be re-applied (cursor1 is exclusive), and
+    //     nothing in the gap may be skipped. ---
+    let (task2, mut applied_rx2, _cur_rx2, sd_tx2) =
+        spawn_applied(watcher, Some(loaded.cursor), None, put_key);
+
+    let delta = collect_applied(&mut applied_rx2, 2).await;
+    assert_eq!(
+        delta,
+        vec!["node.c", "node.d"],
+        "resume replays exactly the post-cursor delta, in order"
+    );
+    sd_tx2.send(true).expect("shutdown run 2");
+    let cursor2 = task2.await.expect("join 2").expect("run 2 ok");
+    assert_eq!(
+        cursor2.as_u64(),
+        Some(d_rev),
+        "run 2 applied through node.d"
+    );
+}
+
+/// An update that `parse` rejects (here: a non-`node.` key) is still received,
+/// so the cursor must advance past it even though nothing is applied for it.
+#[tokio::test]
+async fn applied_advances_cursor_over_rejected_updates() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("applied-reject").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    let base = writer.put("baseline", b"x").await.expect("put baseline");
+    let baseline = WatchCursor::from_u64(base.as_u64().expect("u64 rev"));
+
+    // node.a is applied; other.x is rejected by `node_put_key` but lands at a
+    // higher revision — the cursor must still reach it.
+    writer.put("node.a", b"1").await.expect("put a");
+    let rejected_rev = writer
+        .put("other.x", b"junk")
+        .await
+        .expect("put other")
+        .as_u64()
+        .expect("u64 rev");
+
+    let (task, mut applied_rx, mut cursor_rx, sd_tx) =
+        spawn_applied(watcher, Some(baseline), None, node_put_key);
+
+    // Exactly one update is applied: node.a.
+    let got = collect_applied(&mut applied_rx, 1).await;
+    assert_eq!(got, vec!["node.a"]);
+
+    // Wait until a checkpoint reports the cursor at-or-past the rejected entry.
+    // It arrives because every *received* update bumps the high-water, applied
+    // or not.
+    let reached = timeout(Duration::from_secs(5), async {
+        while let Some(rev) = cursor_rx.recv().await {
+            if rev >= rejected_rev {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for cursor to pass the rejected update");
+    assert!(reached, "cursor advanced past the rejected update");
+
+    sd_tx.send(true).expect("shutdown");
+    let cursor = task.await.expect("join").expect("ok");
+    assert_eq!(
+        cursor.as_u64(),
+        Some(rejected_rev),
+        "final cursor covers the rejected (un-applied) update"
+    );
+}
+
+/// A resume cursor compacted out of the stream must not strand the combinator:
+/// it keeps working and applies subsequent updates (via the CursorExpired →
+/// full-watch fallback when the backend reports expiry, or by transparently
+/// resuming from the earliest retained revision when it doesn't). Either way,
+/// the contract is "no error, updates still flow" — same as
+/// `watch_from_compacted_cursor_does_not_spuriously_fail`.
+#[tokio::test]
+async fn applied_survives_compacted_resume_cursor() {
+    let nats = TestNats::start().await;
+    let conn = nats.connect().await;
+    // history=1: each re-put of a key purges the prior revision, pushing the
+    // stream's first sequence past old cursors.
+    let store = conn
+        .store_with_config(StoreConfig {
+            name: "applied-compacted".into(),
+            max_history: Some(1),
+            max_bytes: Some(1024 * 1024),
+            ..Default::default()
+        })
+        .await
+        .expect("open store");
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    for i in 0..6u8 {
+        writer.put("node.k", &[i]).await.expect("put k");
+    }
+
+    // Cursor at revision 1 — long since compacted away.
+    let stale = WatchCursor::from_u64(1);
+    let (task, mut applied_rx, _cur_rx, sd_tx) =
+        spawn_applied(watcher, Some(stale), None, node_put_key);
+
+    // The fallback watch is DeliverPolicy::New, so it only sees *fresh* writes.
+    // Re-put node.k on a retry loop until one is applied — that proves the
+    // combinator recovered from the stale cursor and is streaming live.
+    let applied = timeout(Duration::from_secs(10), async {
+        loop {
+            writer.put("node.k", b"live").await.expect("put live");
+            if let Ok(Some(key)) = timeout(Duration::from_millis(250), applied_rx.recv()).await {
+                return key;
+            }
+        }
+    })
+    .await
+    .expect("combinator never applied an update after a compacted resume cursor");
+    assert_eq!(applied, "node.k");
+
+    sd_tx.send(true).expect("shutdown");
+    let cursor = task.await.expect("join").expect("watch_applied ok");
+    assert!(
+        cursor.as_u64().is_some(),
+        "combinator returned a live cursor after recovering from compaction"
     );
 }
