@@ -23,11 +23,13 @@
 
 #![deny(unsafe_code)]
 
+mod applied;
 mod kv;
 mod nats;
 pub mod snapshot;
 mod stores;
 
+pub use applied::{BatchConfig, WatchScope, watch_applied};
 pub use kv::{
     KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };

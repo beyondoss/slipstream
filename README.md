@@ -4,7 +4,7 @@ Trait-based KV abstraction over NATS JetStream. Read, write, and watch distribut
 
 ```toml
 [dependencies]
-beyond-slipstream = "0.1"
+beyond-slipstream = "0.2"
 ```
 
 ## Concepts
@@ -22,6 +22,7 @@ beyond-slipstream = "0.1"
 | `KvUpdate`           | One watch event: `Put`, `Delete`, or `Purge`                                     |
 | `Snapshot`           | Deduplicated KV state + cursor at a point in time. Disk cache, not source of truth |
 | `SnapshotWriter`     | Append-only log of `KvUpdate`s; survives restarts without a full NATS scan       |
+| `watch_applied`      | Watch loop that advances the cursor only after your `apply` returns               |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, global ordering) |
 
 ## Usage
@@ -185,6 +186,8 @@ while let Some(update) = rx.recv().await {
 }
 ```
 
+This loop has a trap: `current_cursor` must track what `cache.apply()` has consumed, not what `rx.recv()` delivered. Get it wrong and a crash skips updates on resume. [`watch_applied`](#applied-watch) runs this loop for you with that invariant enforced.
+
 The snapshot is a cache. Delete it and the service falls back to full replay on next start.
 
 ### File format
@@ -203,6 +206,36 @@ Record:  crc32:u32le ++ type:u8 ++ payload
 `version_bytes` is the raw [`VersionToken`] bytes (≤10), not a fixed u64, so NATS revisions (8 bytes) and FDB versionstamps (10 bytes) both round-trip intact.
 
 A truncated final record (crash mid-write) is discarded; earlier records are intact. A CRC failure mid-file returns `SnapshotError::Corrupted`.
+
+## Applied watch
+
+`watch_applied` drives the watch-batch-apply-checkpoint loop and enforces one rule the hand-rolled version can't: the cursor advances only after your `apply` returns, never on receipt.
+
+```rust
+use slipstream::{watch_applied, BatchConfig, KvUpdate, WatchCursor, WatchScope};
+
+let final_cursor = watch_applied(
+    watcher,
+    WatchScope::All,                  // or WatchScope::Prefix("node.".into())
+    load_cursor(),                    // Option<WatchCursor> — resume here, or None
+    Some(snapshot_writer),            // checkpoints at the applied cursor, or None
+    BatchConfig::default(),           // 10ms window, 100 updates per batch
+    |update: &KvUpdate| parse(update),        // KvUpdate -> Option<U>; None just drops it
+    |batch: Vec<U>| cache.apply_batch(batch), // your only domain logic
+    |cursor: WatchCursor| persist(cursor),    // fires after apply returns
+    shutdown,                                 // tokio::sync::watch::Receiver<bool>
+).await?;
+```
+
+A batch closes when `window` elapses or it hits `max` updates, whichever comes first. Then, in order: `apply(batch)` runs to completion, the cursor advances to the batch's highest revision, the snapshot checkpoints at that cursor, and `on_applied` fires.
+
+Persist the cursor on receipt instead and a crash between receive and apply loses data: the cursor reads "caught up to rev N" while rev N sits in an unapplied buffer, and the next resume starts past it. `watch_applied` checkpoints at the applied cursor, so a persisted cursor always means every update up to it has been applied.
+
+- `parse` returning `None` (corrupt bytes, irrelevant key) still advances the cursor — nothing to apply means nothing to skip.
+- On `CursorExpired`, it falls back to a full watch automatically.
+- It returns the final applied cursor on shutdown or stream close.
+
+`apply` runs inline. If it panics, the panic aborts the watch.
 
 ## NATS mapping
 
