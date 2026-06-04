@@ -3,7 +3,10 @@ experimental = true
 activate_aggressive = true
 
 [tools]
-rust = "1.92"
+# `components` pulls clippy + rustfmt into the toolchain; mise installs rust with
+# the minimal rustup profile otherwise, and CI's `cargo clippy` step can't find
+# the component.
+rust = { version = "1.92", components = "clippy,rustfmt" }
 yamlfmt = "0.12.1"
 dprint = "0.50.2"
 "ubi:nats-io/nats-server" = "2.14.1"
