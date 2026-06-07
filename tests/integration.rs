@@ -1131,7 +1131,7 @@ async fn health_reflects_server_death() {
 // (see `seed_then_watch_prefix_loses_writes_in_the_gap`) without needing the
 // sentinel handshake, which the combinator's owned watcher can't expose.
 
-use slipstream::snapshot::{self, SnapshotWriter};
+use slipstream::snapshot::{self, AppendLogSnapshot};
 use slipstream::{BatchConfig, WatchScope, watch_applied};
 use tokio::sync::watch as tokio_watch;
 
@@ -1159,7 +1159,7 @@ fn node_put_key(u: &KvUpdate) -> Option<String> {
 fn spawn_applied(
     watcher: Arc<dyn slipstream::KvWatcher>,
     baseline: Option<WatchCursor>,
-    snapshot: Option<SnapshotWriter>,
+    snapshot: Option<AppendLogSnapshot>,
     parse: fn(&KvUpdate) -> Option<String>,
 ) -> (
     tokio::task::JoinHandle<Result<WatchCursor, KvError>>,
@@ -1269,9 +1269,9 @@ async fn applied_resumes_from_snapshot_cursor_without_skipping() {
         .expect("u64 rev");
 
     // --- Run 1: apply {a, b}, checkpoint the snapshot, shut down. ---
-    let writer1 = SnapshotWriter::open(&snap_path, u64::MAX).expect("open snapshot");
+    let (_resume1, store1) = AppendLogSnapshot::open(&snap_path, u64::MAX).expect("open snapshot");
     let (task, mut applied_rx, _cur_rx, sd_tx) =
-        spawn_applied(watcher.clone(), Some(baseline), Some(writer1), put_key);
+        spawn_applied(watcher.clone(), Some(baseline), Some(store1), put_key);
 
     let first = collect_applied(&mut applied_rx, 2).await;
     assert_eq!(first, vec!["node.a", "node.b"]);

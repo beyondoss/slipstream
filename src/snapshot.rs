@@ -73,6 +73,12 @@ pub enum SnapshotError {
     InvalidFormat(String),
     #[error("snapshot corrupted (CRC mismatch)")]
     Corrupted,
+    /// A pluggable [`SnapshotStore`] backend (e.g. the `fjall` on-disk store)
+    /// reported an error. Kept backend-agnostic — no backend type leaks into this
+    /// enum's signature — so enabling a backend feature does not change the public
+    /// error surface.
+    #[error("snapshot backend error: {0}")]
+    Backend(String),
 }
 
 /// Result of loading a snapshot from disk.
@@ -280,6 +286,193 @@ pub fn load(path: &Path) -> Result<Option<Snapshot>, SnapshotError> {
     }
 
     Ok(Some(Snapshot { cursor, entries }))
+}
+
+// ---------------------------------------------------------------------------
+// The durable-fold contract
+// ---------------------------------------------------------------------------
+
+/// A durable, resumable, queryable fold of a KV watch stream.
+///
+/// This is the primitive slipstream owns: a place to apply a stream of
+/// [`KvUpdate`]s such that, after any restart, the fold resumes from exactly
+/// where it left off and stays a faithful function of the log. [`watch_applied`]
+/// drives it; consumers pick the backend.
+///
+/// [`watch_applied`]: crate::watch_applied
+///
+/// ## Invariants every implementation must hold
+///
+/// - **Pure function of the log.** Delete the store, replay every update with
+///   revision `>` the persisted cursor, and you get byte-identical state. The
+///   store caches the fold; it is never the source of truth (that is NATS).
+/// - **Cursor-after-apply.** A persisted cursor `C` implies every update with
+///   revision `≤ C` is durably folded in. [`apply`](Self::apply) writes data and
+///   cursor together so the cursor never names a revision whose data is absent —
+///   on a transactional backend in one txn, on the append log data-then-cursor
+///   (a torn write leaves data *ahead* of the cursor, which replay re-folds, never
+///   skips).
+/// - **Snapshot is a cache.** Any tail lost to power loss (under a no-sync
+///   durability mode) is rebuilt by resuming the watch from the recovered cursor;
+///   never a correctness failure.
+///
+/// ## Threading
+///
+/// Methods are **synchronous** and may block on I/O — the same runtime-agnostic
+/// discipline as the rest of this module. [`watch_applied`] offloads
+/// [`apply`](Self::apply) to a blocking task; a consumer calling
+/// [`get`](Self::get)/[`range`](Self::range) from an async context should do the
+/// same.
+pub trait SnapshotStore: Sized + Send {
+    /// Open (or resume) the store at `path`.
+    ///
+    /// Returns the persisted resume cursor — [`WatchCursor::none`] when the store
+    /// is fresh — and the store ready to [`apply`](Self::apply)/query. Pass the
+    /// returned cursor to [`watch_applied`](crate::watch_applied) as the resume
+    /// position.
+    ///
+    /// Backends with tuning knobs (compaction threshold, sync mode) expose them
+    /// on their own constructors; this uses safe defaults.
+    fn load(path: &Path) -> Result<(WatchCursor, Self), SnapshotError>;
+
+    /// Atomically fold `batch` into the store and advance the resume cursor.
+    ///
+    /// Data and cursor become durable together (see the cursor-after-apply
+    /// invariant). `batch` is the raw, revision-ordered updates received since the
+    /// last flush — including ones a consumer's `parse` rejected, since they are
+    /// still part of the bucket's state. `cursor` is the highest revision received
+    /// in the batch.
+    fn apply(&mut self, batch: &[KvUpdate], cursor: &WatchCursor) -> Result<(), SnapshotError>;
+
+    /// Look up the live entry for `key`. `None` if absent or deleted.
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, SnapshotError>;
+
+    /// All live entries whose key starts with `prefix`, in ascending key order.
+    ///
+    /// Buffers the whole match set into a `Vec`. Convenient for the bounded
+    /// prefixes an in-RAM consumer scans, but a broad prefix against an on-disk
+    /// fold (the 1B-route case an on-disk backend exists for) materializes every
+    /// match at once — use [`for_each_in_range`](Self::for_each_in_range) there.
+    fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, SnapshotError>;
+
+    /// Stream every live entry whose key starts with `prefix`, in ascending key
+    /// order, invoking `f` once per entry — without buffering the whole match
+    /// set in memory.
+    ///
+    /// This is the memory-bounded counterpart to [`range`](Self::range). The
+    /// reason to pick an on-disk backend is a fold too large for RAM; for such a
+    /// consumer a broad [`range`](Self::range) defeats the purpose by collecting
+    /// every match into one `Vec`. `f` returning `Err` stops the scan early and
+    /// propagates that error.
+    ///
+    /// The provided implementation delegates to [`range`](Self::range) — correct
+    /// for in-RAM backends, where the fold already fits in memory. On-disk
+    /// backends override it to stream straight from storage.
+    fn for_each_in_range(
+        &self,
+        prefix: &str,
+        mut f: impl FnMut(KvEntry) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        for entry in self.range(prefix)? {
+            f(entry)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppendLogSnapshot: the default, pure-Rust backend
+// ---------------------------------------------------------------------------
+
+/// Default compaction threshold for [`AppendLogSnapshot::load`]: 10 MiB of
+/// appended records before a compaction is triggered. Matches the value the
+/// hand-rolled callers used; tune via [`AppendLogSnapshot::open`].
+pub const DEFAULT_COMPACT_THRESHOLD: u64 = 10 * 1024 * 1024;
+
+/// The append-only CRC log as a [`SnapshotStore`] (the default backend).
+///
+/// Wraps the existing [`SnapshotWriter`] + [`load`] machinery — same v2 on-disk
+/// format, same CRC framing, same FDB-versionstamp-safe cursor encoding, so files
+/// written by either path are mutually loadable. Keeps the whole fold in a
+/// [`HashMap`] in RAM to serve [`get`](SnapshotStore::get)/[`range`](SnapshotStore::range),
+/// which is exactly what edge/tunnel-style consumers already do — small state,
+/// pure Rust. A consumer that cannot hold its fold in RAM wants an on-disk
+/// backend instead (e.g. the `fjall` feature).
+pub struct AppendLogSnapshot {
+    writer: SnapshotWriter,
+    entries: HashMap<String, KvEntry>,
+    cursor: WatchCursor,
+}
+
+impl AppendLogSnapshot {
+    /// Open or resume the log at `path` with an explicit compaction threshold.
+    ///
+    /// Replays any existing log into the in-RAM fold (and compacts it, exactly as
+    /// [`load`] does), then opens the writer for append. Returns the resume cursor
+    /// alongside the store.
+    pub fn open(path: &Path, compact_threshold: u64) -> Result<(WatchCursor, Self), SnapshotError> {
+        let (cursor, entries) = match load(path)? {
+            Some(snap) => (snap.cursor, snap.entries),
+            None => (WatchCursor::none(), HashMap::new()),
+        };
+        let writer = SnapshotWriter::open(path, compact_threshold)?;
+        Ok((
+            cursor.clone(),
+            Self {
+                writer,
+                entries,
+                cursor,
+            },
+        ))
+    }
+}
+
+impl SnapshotStore for AppendLogSnapshot {
+    fn load(path: &Path) -> Result<(WatchCursor, Self), SnapshotError> {
+        Self::open(path, DEFAULT_COMPACT_THRESHOLD)
+    }
+
+    fn apply(&mut self, batch: &[KvUpdate], cursor: &WatchCursor) -> Result<(), SnapshotError> {
+        // Stream the raw records, then the cursor checkpoint — data-then-cursor,
+        // so a torn write leaves data ahead of the cursor (re-folded on resume),
+        // never a cursor ahead of its data. The in-RAM fold mirrors the same
+        // mutations so get/range stay consistent with what was just durably written.
+        for update in batch {
+            self.writer.write_update(update)?;
+            match update {
+                KvUpdate::Put(entry) => {
+                    self.entries.insert(entry.key.clone(), entry.clone());
+                }
+                KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                    self.entries.remove(key);
+                }
+            }
+        }
+        // checkpoint() flushes the buffered records + the cursor record to the OS;
+        // it returns true when the log has grown past the compaction threshold, in
+        // which case we compact inline (this whole call already runs off the hot
+        // path via spawn_blocking in watch_applied).
+        if self.writer.checkpoint(cursor)? {
+            self.writer.compact()?;
+        }
+        self.cursor = cursor.clone();
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, SnapshotError> {
+        Ok(self.entries.get(key).cloned())
+    }
+
+    fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, SnapshotError> {
+        let mut out: Vec<KvEntry> = self
+            .entries
+            .values()
+            .filter(|e| e.key.starts_with(prefix))
+            .cloned()
+            .collect();
+        out.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------

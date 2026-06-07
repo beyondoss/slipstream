@@ -69,7 +69,10 @@ watch_all_from(cursor, tx)
 | `KvUpdate`               | One watch event: `Put`, `Delete`, or `Purge`                         | Not a read result; carries deletes too           |
 | `Snapshot`               | Deduplicated KV state + cursor persisted to disk                     | Not the source of truth; a cache of NATS         |
 | `SnapshotWriter`         | Append-only log of `KvUpdate`s; no in-memory state beyond a counter  | Not the in-memory cache itself                   |
-| `watch_applied`          | Combinator: batch → apply → *then* advance cursor/checkpoint         | Not a raw watch; the cursor follows `apply`, not receipt |
+| `SnapshotStore`          | Trait: the durable-fold contract — atomic `apply(batch, cursor)`, `load`, `get`, `range` | Not a serving index; stops at fold + cursor + query |
+| `AppendLogSnapshot`      | Default `SnapshotStore`: append-only log + in-RAM fold (pure-Rust)   | Not for folds larger than RAM                     |
+| `FjallSnapshot`          | On-disk `SnapshotStore` (fjall LSM, `feature = "fjall"`) for large folds | Not in the pure-Rust core; opt-in feature        |
+| `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore` | Not a raw watch; the cursor follows `apply`, not receipt |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, …)        | Not enforced; purely advisory                    |
 
 ## Layer Architecture
@@ -91,7 +94,8 @@ watch_all_from(cursor, tx)
 └─────────────────────────────────────────────────────────────┘
                   snapshot.rs (orthogonal, optional)
 ┌─────────────────────────────────────────────────────────────┐
-│          SnapshotWriter │ load() │ compact_to_file()        │
+│   SnapshotStore trait: apply(batch, cursor) │ load │ get │ range
+│   AppendLogSnapshot (default, in-RAM)  FjallSnapshot (feat)  │
 │          (append-only CRC log, tempfile+rename compact)     │
 └─────────────────────────────────────────────────────────────┘
                   applied.rs (combinator over KvWatcher + snapshot)
@@ -181,6 +185,32 @@ Every NATS operation is wrapped in `timed()` (30 s). Without it, a CLOSE_WAIT co
 | Unknown  | len=0                    | `None`     |
 
 ## Snapshot Subsystem
+
+### The durable-fold trait
+
+The durable fold is a trait, `SnapshotStore`, so the backend is pluggable while the contract is fixed:
+
+```rust
+fn load(path) -> (WatchCursor, Self);          // resume position + store
+fn apply(&mut self, batch, cursor);            // fold data AND advance cursor, atomically
+fn get(key) -> Option<KvEntry>;                // point query
+fn range(prefix) -> Vec<KvEntry>;              // ordered prefix scan
+```
+
+Three invariants bind every implementation:
+
+- **Pure function of the log.** Delete the store, replay every update with revision `> cursor`, and the state is identical. The store caches the fold; NATS is the source of truth.
+- **Cursor-after-apply.** `apply` makes data and cursor durable together, so the cursor never names a revision whose data is absent — one transaction on a transactional backend, data-then-cursor on the append log (a torn write leaves data *ahead* of the cursor, which replay re-folds, never skips).
+- **Snapshot is a cache.** A tail lost to power loss (under a no-sync durability mode) is rebuilt by resuming the watch from the recovered cursor.
+
+`watch_applied` is generic over `SnapshotStore`: on each flush, after `apply` returns, it hands the raw batch + post-apply cursor to `store.apply(...)` on a blocking task. The trait stops at fold + cursor + query; serving structures built from the fold (routing rings, hashrings) live in the consumer, which reads them out via `get`/`range`.
+
+| Backend | Module | State | Durability |
+| ------- | ------ | ----- | ---------- |
+| `AppendLogSnapshot` (default) | `snapshot.rs` | Append-only CRC log + in-RAM `HashMap` fold | `checkpoint` flush (page cache); `fsync` only at `compact` |
+| `FjallSnapshot` (`feature = "fjall"`) | `snapshot_fjall.rs` | On-disk fjall LSM (`data` + `meta` partitions) | One atomic batch per `apply` (data + cursor); per-commit `fsync` configurable (NO_SYNC default) |
+
+`FjallSnapshot` keeps the cursor in the same fjall `Batch` as the data it names, so under NO_SYNC a crash can lose the un-synced tail but never desynchronize cursor from data — on reopen the recovered cursor is consistent and the watch re-folds the tail. The rest of this section describes the **append-log backend** (the default), whose on-disk format is below.
 
 ### File Format
 
@@ -339,8 +369,9 @@ Checkpoints are frequent (every N watch events). An fsync per checkpoint would a
 | `src/kv.rs`       | Core traits (`KvReader`, `KvWriter`, `KvWatcher`, `KvTtl`) and types (`KvEntry`, `KvUpdate`, `VersionToken`, `WatchCursor`, `KvError`) |
 | `src/stores.rs`   | `Connection`, `KvStore`, `StoreConfig`, `StorageType`, `ConnectionCapabilities`      |
 | `src/nats.rs`     | NATS JetStream implementation; bucket creation, scan consumer lifecycle, timeout wrapping, Synadia Cloud workarounds |
-| `src/snapshot.rs` | Append-only snapshot log: `SnapshotWriter`, `load()`, `replay_log()`, `compact_to_file()` |
-| `src/applied.rs`  | `watch_applied` cursor-after-apply combinator: `WatchScope`, `BatchConfig`            |
+| `src/snapshot.rs` | `SnapshotStore` trait; append-only log + `AppendLogSnapshot` (default backend): `SnapshotWriter`, `load()`, `replay_log()`, `compact_to_file()` |
+| `src/snapshot_fjall.rs` | `FjallSnapshot`: on-disk `SnapshotStore` backed by fjall (`feature = "fjall"`)  |
+| `src/applied.rs`  | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig` |
 | `src/lib.rs`      | Re-exports all public types; no logic                                                |
 | `benches/`        | Criterion benchmarks for snapshot write/checkpoint/load throughput and batch throughput |
 | `tests/`          | Integration tests (require live NATS)                                                |

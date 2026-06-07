@@ -27,6 +27,8 @@ mod applied;
 mod kv;
 mod nats;
 pub mod snapshot;
+#[cfg(feature = "fjall")]
+mod snapshot_fjall;
 mod stores;
 
 pub use applied::{BatchConfig, WatchScope, watch_applied};
@@ -34,4 +36,7 @@ pub use kv::{
     KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };
 pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
+pub use snapshot::{AppendLogSnapshot, SnapshotStore};
+#[cfg(feature = "fjall")]
+pub use snapshot_fjall::{FjallConfig, FjallSnapshot};
 pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};

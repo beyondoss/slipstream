@@ -7,6 +7,12 @@ Trait-based KV abstraction over NATS JetStream. Read, write, and watch distribut
 beyond-slipstream = "0.2"
 ```
 
+The crate core is pure-Rust. On-disk snapshot backends are opt-in cargo features (no C toolchain is pulled unless you enable one):
+
+```toml
+beyond-slipstream = { version = "0.2", features = ["fjall"] } # on-disk SnapshotStore for large folds
+```
+
 ## Concepts
 
 | Term                 | What It Is                                                                       |
@@ -22,7 +28,10 @@ beyond-slipstream = "0.2"
 | `KvUpdate`           | One watch event: `Put`, `Delete`, or `Purge`                                     |
 | `Snapshot`           | Deduplicated KV state + cursor at a point in time. Disk cache, not source of truth |
 | `SnapshotWriter`     | Append-only log of `KvUpdate`s; survives restarts without a full NATS scan       |
-| `watch_applied`      | Watch loop that advances the cursor only after your `apply` returns               |
+| `SnapshotStore`      | Trait: the durable-fold contract — `apply` (data + cursor, atomically), `load`, `get`, `range` |
+| `AppendLogSnapshot`  | Default `SnapshotStore`: the append-only log + an in-RAM fold (pure-Rust, small state) |
+| `FjallSnapshot`      | On-disk `SnapshotStore` for folds too large for RAM; queryable (`feature = "fjall"`) |
+| `watch_applied`      | Watch loop that advances the cursor only after your `apply` returns, folding into any `SnapshotStore` |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, global ordering) |
 
 ## Usage
@@ -207,18 +216,57 @@ Record:  crc32:u32le ++ type:u8 ++ payload
 
 A truncated final record (crash mid-write) is discarded; earlier records are intact. A CRC failure mid-file returns `SnapshotError::Corrupted`.
 
-## Applied watch
+### Pluggable backends
 
-`watch_applied` drives the watch-batch-apply-checkpoint loop and enforces one rule the hand-rolled version can't: the cursor advances only after your `apply` returns, never on receipt.
+The durable fold is a trait, [`SnapshotStore`], so a consumer picks where its fold lives. The contract is small — apply a batch and advance the cursor *atomically*, resume from the cursor on restart, and query the result:
 
 ```rust
-use slipstream::{watch_applied, BatchConfig, KvUpdate, WatchCursor, WatchScope};
+pub trait SnapshotStore: Sized + Send {
+    fn load(path: &Path) -> Result<(WatchCursor, Self), SnapshotError>;
+    fn apply(&mut self, batch: &[KvUpdate], cursor: &WatchCursor) -> Result<(), SnapshotError>;
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, SnapshotError>;
+    fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, SnapshotError>;
+}
+```
+
+Every backend keeps the same invariants: the fold is a pure function of the log (delete the store, replay from the cursor, get identical state), the cursor never names a revision whose data isn't durable (cursor-after-apply), and the store is a cache — a tail lost to power loss is rebuilt by resuming the watch.
+
+| Backend | When | Notes |
+| ------- | ---- | ----- |
+| `AppendLogSnapshot` | **Default.** Fold fits in RAM (edge/tunnel-style services) | Pure-Rust, the append-only log above plus an in-RAM map serving `get`/`range`. No extra dependencies. |
+| `FjallSnapshot` | Fold too large for RAM (e.g. routing at ~1B keys) | On-disk [fjall](https://docs.rs/fjall) LSM, `feature = "fjall"`. Each `apply` is one atomic batch (data **and** cursor); durability (NO_SYNC vs fsync) is configurable. |
+
+Pick a backend, then hand it to [`watch_applied`](#applied-watch) — `load` returns the resume cursor alongside the store:
+
+```rust
+use slipstream::{AppendLogSnapshot, SnapshotStore};
+
+// Default in-RAM backend:
+let (resume, store) = AppendLogSnapshot::load(Path::new("/var/lib/svc/state.snap"))?;
+
+// Or, behind `feature = "fjall"`, an on-disk fold for a large consumer:
+// let (resume, store) = FjallSnapshot::open(dir, FjallConfig { sync: false })?;
+
+let final_cursor = watch_applied(
+    watcher, WatchScope::All, Some(resume), Some(store), BatchConfig::default(),
+    parse, apply, on_applied, shutdown,
+).await?;
+```
+
+The trait stops at *durable fold + cursor + query*. Serving structures built from the fold (routing rings, hashrings, indexes) live in the consumer — query them out of the store with `get`/`range`. A consumer with a different engine can implement `SnapshotStore` itself; the rest of slipstream is unchanged.
+
+## Applied watch
+
+`watch_applied` drives the watch-batch-apply-checkpoint loop and enforces one rule the hand-rolled version can't: the cursor advances only after your `apply` returns, never on receipt. It is generic over the [`SnapshotStore`](#pluggable-backends) backend, so the consumer chooses where the durable fold lives (or `None` to run without persistence).
+
+```rust
+use slipstream::{watch_applied, AppendLogSnapshot, BatchConfig, KvUpdate, WatchCursor, WatchScope};
 
 let final_cursor = watch_applied(
     watcher,
     WatchScope::All,                  // or WatchScope::Prefix("node.".into())
-    load_cursor(),                    // Option<WatchCursor> — resume here, or None
-    Some(snapshot_writer),            // checkpoints at the applied cursor, or None
+    Some(resume),                     // Option<WatchCursor> — resume here, or None
+    Some(store),                      // any SnapshotStore (e.g. AppendLogSnapshot), or None
     BatchConfig::default(),           // 10ms window, 100 updates per batch
     |update: &KvUpdate| parse(update),        // KvUpdate -> Option<U>; None just drops it
     |batch: Vec<U>| cache.apply_batch(batch), // your only domain logic
@@ -227,7 +275,7 @@ let final_cursor = watch_applied(
 ).await?;
 ```
 
-A batch closes when `window` elapses or it hits `max` updates, whichever comes first. Then, in order: `apply(batch)` runs to completion, the cursor advances to the batch's highest revision, the snapshot checkpoints at that cursor, and `on_applied` fires.
+A batch closes when `window` elapses or it hits `max` updates, whichever comes first. Then, in order: `apply(batch)` runs to completion, the cursor advances to the batch's highest revision, the batch + cursor are folded into the `store` atomically (on a blocking task), and `on_applied` fires.
 
 Persist the cursor on receipt instead and a crash between receive and apply loses data: the cursor reads "caught up to rev N" while rev N sits in an unapplied buffer, and the next resume starts past it. `watch_applied` checkpoints at the applied cursor, so a persisted cursor always means every update up to it has been applied.
 

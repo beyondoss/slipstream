@@ -58,7 +58,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
-use crate::snapshot::SnapshotWriter;
+use crate::snapshot::SnapshotStore;
 
 /// What to watch: every key, or every key under a prefix.
 ///
@@ -102,15 +102,18 @@ impl Default for BatchConfig {
 ///
 /// Subscribes per `scope` (resuming from `resume` when it carries a position),
 /// batches updates per `config`, applies each batch via `apply`, and only then
-/// advances the cursor / checkpoints `snapshot` / calls `on_applied`. Returns
-/// the final applied cursor when the watch ends (shutdown signalled, or the
-/// underlying stream closed).
+/// advances the cursor / folds the batch into `store` / calls `on_applied`.
+/// Returns the final applied cursor when the watch ends (shutdown signalled, or
+/// the underlying stream closed).
 ///
-/// Raw [`KvUpdate`]s are streamed to `snapshot` as they arrive, but the
-/// *checkpoint* cursor written on each flush is the post-apply cursor — so a
-/// loaded snapshot's cursor is always consistent with the state it carries
-/// (the cursor never names a revision whose `apply` had not returned before the
-/// checkpoint).
+/// `store` is any [`SnapshotStore`] backend the consumer chose (the in-RAM
+/// [`AppendLogSnapshot`](crate::AppendLogSnapshot) default, an on-disk backend, or
+/// its own impl) — or `None` to run without persistence. On each flush, *after*
+/// `apply` returns, the whole batch of raw [`KvUpdate`]s is handed to
+/// `store.apply(batch, applied_cursor)` on a blocking task, so the store's
+/// persisted cursor is always the post-apply cursor and never names a revision
+/// whose `apply` had not returned. The store fold is atomic (data + cursor), so a
+/// crash leaves the store consistent and resume re-folds only the tail.
 ///
 /// On [`KvError::CursorExpired`] from the `*_from` resume path, this logs and
 /// falls back to a full-scope watch (`watch_all` / `watch_prefix`). Callers see
@@ -127,15 +130,15 @@ impl Default for BatchConfig {
 // type and is monomorphized at the call site. Folding them into a builder struct
 // would either box the closures or force a single generic bundle, losing that.
 #[allow(clippy::too_many_arguments)]
-// The flush macro resets `batch_high`/`batch_deadline`/`snapshot` for the next
-// loop iteration. At the two flush sites that return immediately afterward
-// (shutdown, channel-close) those resets are dead stores — correct, but flagged.
+// The flush macro resets `batch_high`/`batch_deadline` for the next loop
+// iteration. At the two flush sites that return immediately afterward (shutdown,
+// channel-close) those resets are dead stores — correct, but flagged.
 #[allow(unused_assignments)]
-pub async fn watch_applied<U, P, A, O>(
+pub async fn watch_applied<U, S, P, A, O>(
     watcher: Arc<dyn KvWatcher>,
     scope: WatchScope,
     resume: Option<WatchCursor>,
-    mut snapshot: Option<SnapshotWriter>,
+    mut store: Option<S>,
     config: BatchConfig,
     mut parse: P,
     mut apply: A,
@@ -144,6 +147,10 @@ pub async fn watch_applied<U, P, A, O>(
 ) -> Result<WatchCursor, KvError>
 where
     U: Send,
+    // `Send + 'static`: each flush moves `store` onto a blocking task to run its
+    // (potentially blocking) `apply`, then takes it back — the same offload the
+    // append log's compaction always used.
+    S: SnapshotStore + Send + 'static,
     P: FnMut(&KvUpdate) -> Option<U> + Send,
     A: FnMut(Vec<U>) + Send,
     O: FnMut(WatchCursor) + Send,
@@ -175,21 +182,27 @@ where
     // "nothing to apply", hence covered. Reset to `none()` after every flush.
     let batch_cap = config.max.clamp(1, 64);
     let mut batch: Vec<U> = Vec::with_capacity(batch_cap);
+    // Raw received updates for the durable `store`, in revision order. Only
+    // populated when a `store` is present; the store folds the *raw* updates
+    // (including ones `parse` rejected — they are still part of the bucket's
+    // state), whereas the parsed `batch` above is the consumer's domain view.
+    let mut raw_batch: Vec<KvUpdate> = Vec::new();
     let mut batch_high = WatchCursor::none();
     // `Some` once a batch has opened and the window timer is armed; `None`
     // between flushes. Only the armed/idle distinction is read in the loop —
     // the absolute instant lives in the pinned `sleep` future below.
     let mut batch_deadline: Option<tokio::time::Instant> = None;
 
-    // Flush the current batch: apply (if non-empty), then advance the cursor,
-    // checkpoint the snapshot at that cursor, and fire `on_applied` — in that
-    // order. Returns whether the snapshot grew past its compaction threshold.
-    // Defined as a macro so it can mutate the locals above and `.await` nothing
-    // itself; compaction (which does block) is handled by the caller via
-    // `flush_and_compact!`.
-    macro_rules! flush_inner {
+    // Flush the current batch, in order: run the domain `apply` (if non-empty) to
+    // completion, advance the cursor, fold the raw batch + cursor durably into
+    // `store`, then fire `on_applied`. The store fold runs on a blocking task
+    // (its `apply` may block on I/O), moving the store in and taking it back — the
+    // same offload the append log's compaction always used. A store error is
+    // logged and the watch continues (the snapshot is a cache); a panicked
+    // blocking task drops the store irrecoverably, which breaks the
+    // resume-after-restart guarantee, so it is surfaced as fatal.
+    macro_rules! flush {
         () => {{
-            let mut needs_compact = false;
             // Nothing received since the last flush → nothing to do at all.
             if !batch.is_empty() || !batch_high.is_none() {
                 if !batch.is_empty() {
@@ -197,67 +210,44 @@ where
                     // advance below. Move the batch out so a panicking apply
                     // can't leave half-consumed state behind.
                     //
-                    // `replace` (not `take`) leaves a pre-sized Vec behind:
-                    // `take` swaps in a zero-capacity `Vec::new()`, so every
-                    // batch after the first re-climbs the reallocation ladder
-                    // (4→8→…→cap). Handing back a `with_capacity` Vec keeps the
-                    // amortized allocation to one per batch.
+                    // `replace` (not `take`) leaves a pre-sized Vec behind so each
+                    // batch after the first doesn't re-climb the reallocation
+                    // ladder (4→8→…→cap).
                     apply(std::mem::replace(&mut batch, Vec::with_capacity(batch_cap)));
                 }
                 if !batch_high.is_none() {
                     applied = batch_high.clone();
-                    if let Some(sw) = snapshot.as_mut() {
-                        match sw.checkpoint(&applied) {
-                            Ok(true) => needs_compact = true,
-                            Ok(false) => {}
-                            Err(e) => warn!(error = %e, "snapshot checkpoint failed"),
+                    if let Some(mut st) = store.take() {
+                        let raw = std::mem::take(&mut raw_batch);
+                        let cur = applied.clone();
+                        // Hand the store back unconditionally on a clean return so
+                        // a *failed* apply (Ok(Err)) keeps the watch running; only
+                        // a *panicked* task (Err) loses the store and is fatal.
+                        match tokio::task::spawn_blocking(move || {
+                            let res = st.apply(&raw, &cur);
+                            (st, res)
+                        })
+                        .await
+                        {
+                            Ok((st, Ok(()))) => store = Some(st),
+                            Ok((st, Err(e))) => {
+                                warn!(error = %e, "snapshot store apply failed; continuing");
+                                store = Some(st);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "snapshot store task panicked; aborting watch");
+                                handle.abort();
+                                return Err(KvError::WatchError(format!(
+                                    "snapshot store task panicked: {e}"
+                                )));
+                            }
                         }
                     }
                     on_applied(applied.clone());
+                    batch_high = WatchCursor::none();
                 }
-                batch_high = WatchCursor::none();
             }
             batch_deadline = None;
-            needs_compact
-        }};
-    }
-
-    // Flush, then run compaction off the hot path if the log grew too large.
-    // Compaction reads and rewrites the whole snapshot file, so it must not run
-    // on the async reactor thread — `spawn_blocking` moves it to the blocking
-    // pool and we reclaim the writer afterward.
-    macro_rules! flush_and_compact {
-        () => {{
-            if flush_inner!()
-                && let Some(mut sw) = snapshot.take()
-            {
-                // Return the writer to the closure unconditionally so a *failed*
-                // compaction (Ok(Err)) still hands the writer back — checkpoints
-                // continue, only this compaction was skipped. A *panicked*
-                // blocking task (Err) drops the writer on the blocking thread and
-                // we can't recover it; rather than silently run the rest of the
-                // watch without persistence — which breaks the resume-after-restart
-                // guarantee — we surface it as a fatal error.
-                match tokio::task::spawn_blocking(move || {
-                    let res = sw.compact();
-                    (sw, res)
-                })
-                .await
-                {
-                    Ok((sw, Ok(()))) => snapshot = Some(sw),
-                    Ok((sw, Err(e))) => {
-                        warn!(error = %e, "snapshot compaction failed; continuing without compacting");
-                        snapshot = Some(sw);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "snapshot compaction task panicked; aborting watch");
-                        handle.abort();
-                        return Err(KvError::WatchError(format!(
-                            "snapshot compaction task panicked: {e}"
-                        )));
-                    }
-                }
-            }
         }};
     }
 
@@ -281,7 +271,7 @@ where
             // re-delivered on the next resume — and return the applied cursor.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    flush_and_compact!();
+                    flush!();
                     handle.abort();
                     // Observe the task's terminal state. An abort surfaces as a
                     // cancelled JoinError, which we ignore; a genuine panic that
@@ -297,7 +287,7 @@ where
 
             // Batch window elapsed.
             () = &mut sleep, if batch_deadline.is_some() => {
-                flush_and_compact!();
+                flush!();
             }
 
             update = rx.recv() => {
@@ -308,15 +298,13 @@ where
                         // keeps it.
                         batch_high = WatchCursor::from_version(u.version().clone());
 
-                        // Stream the raw update to the snapshot log as it
-                        // arrives. The durable checkpoint is written later at
-                        // the applied cursor, so a crash here just means the log
-                        // holds data ahead of its cursor — re-applied on resume,
-                        // never skipped.
-                        if let Some(sw) = snapshot.as_mut()
-                            && let Err(e) = sw.write_update(&u)
-                        {
-                            warn!(error = %e, "snapshot write failed");
+                        // Buffer the raw update for the durable store fold (which
+                        // commits the whole batch + cursor atomically on flush).
+                        // Done before `parse` consumes `u` by reference, and only
+                        // when a store is present so the no-persistence path keeps
+                        // its zero-copy cost.
+                        if store.is_some() {
+                            raw_batch.push(u.clone());
                         }
 
                         if let Some(parsed) = parse(&u) {
@@ -334,15 +322,19 @@ where
                             batch_deadline = Some(deadline);
                         }
 
-                        if batch.len() >= config.max {
-                            flush_and_compact!();
+                        // Flush on a full parsed batch, or — when persisting — a
+                        // full raw batch, so a window packed with parse-rejected
+                        // updates can't grow `raw_batch` without bound before the
+                        // window elapses.
+                        if batch.len() >= config.max || raw_batch.len() >= config.max {
+                            flush!();
                         }
                     }
                     None => {
                         // Stream closed. Flush the remainder, then surface the
                         // watch task's terminal result: a clean end returns the
                         // applied cursor, an error propagates.
-                        flush_and_compact!();
+                        flush!();
                         return match handle.await {
                             Ok(Ok(())) => Ok(applied),
                             Ok(Err(e)) => Err(e),
@@ -412,6 +404,7 @@ async fn run_watch(
 mod tests {
     use super::*;
     use crate::kv::{KvEntry, VersionToken};
+    use crate::snapshot::AppendLogSnapshot;
     use async_trait::async_trait;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -545,7 +538,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch| ab.lock().unwrap().push(batch),
@@ -579,7 +572,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| {
@@ -621,7 +614,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig {
                 window: Duration::from_secs(3600), // effectively never
                 max,
@@ -660,7 +653,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig {
                 window: Duration::from_secs(3600), // window won't fire
                 max: 100,
@@ -710,7 +703,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max,
@@ -756,7 +749,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             // Reject everything — simulates corrupt/irrelevant entries.
             |_u: &KvUpdate| -> Option<Vec<u8>> { None },
@@ -799,7 +792,7 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -825,7 +818,7 @@ mod tests {
     async fn snapshot_checkpoint_matches_applied_cursor() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("applied.snap");
-        let writer = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        let (_resume, store) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
 
         let updates = vec![put("node.a", b"1", 1), put("node.b", b"2", 2)];
         let watcher = Arc::new(MockWatcher::new(updates, false)); // close after
@@ -835,7 +828,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            Some(writer),
+            Some(store),
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -882,7 +875,7 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(WatchCursor::from_u64(9)), // resume past rev 9 — not expired
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -920,7 +913,7 @@ mod tests {
             watcher,
             WatchScope::Prefix("node.".to_string()),
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -958,7 +951,7 @@ mod tests {
             watcher,
             WatchScope::Prefix("node.".to_string()),
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -987,7 +980,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -1026,7 +1019,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             // Keep only keys under "keep."; reject everything else.
             |u: &KvUpdate| -> Option<Vec<u8>> {
@@ -1072,7 +1065,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            None,
+            None::<AppendLogSnapshot>,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {
@@ -1111,8 +1104,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("applied.snap");
         // threshold 0 → every checkpoint reports "needs compact", forcing the
-        // spawn_blocking compaction branch on each flush.
-        let writer = SnapshotWriter::open(&path, 0).unwrap();
+        // store's inline-compaction branch on each flush (run off the hot path via
+        // spawn_blocking inside watch_applied).
+        let (_resume, store) = AppendLogSnapshot::open(&path, 0).unwrap();
 
         // Re-put the same key across flushes so compaction has duplicates to
         // dedup; small max forces multiple flushes (hence multiple compactions).
@@ -1129,7 +1123,7 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
-            Some(writer),
+            Some(store),
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max: 1, // one update per flush → a compaction per update
