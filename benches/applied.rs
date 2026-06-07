@@ -81,7 +81,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
                         watcher as Arc<dyn KvWatcher>,
                         WatchScope::All,
                         None,
-                        None,
+                        None::<slipstream::AppendLogSnapshot>,
                         BatchConfig {
                             window: Duration::from_millis(10),
                             max: 100,
