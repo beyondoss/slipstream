@@ -38,5 +38,5 @@ pub use kv::{
 pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
-pub use snapshot_fjall::{FjallConfig, FjallSnapshot};
+pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
 pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};
