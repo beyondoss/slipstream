@@ -39,6 +39,14 @@ impl KvWatcher for ScriptedWatcher {
     async fn watch_prefix(&self, _prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError> {
         self.watch_all(tx).await
     }
+
+    async fn watch_prefixes(
+        &self,
+        _prefixes: &[&str],
+        tx: Sender<KvUpdate>,
+    ) -> Result<(), KvError> {
+        self.watch_all(tx).await
+    }
 }
 
 fn put(i: u64) -> KvUpdate {

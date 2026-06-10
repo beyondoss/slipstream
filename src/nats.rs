@@ -1047,6 +1047,30 @@ impl KvWatcher for NatsKvWatcher {
         stream_watch(watcher, &tx).await
     }
 
+    async fn watch_prefixes(
+        &self,
+        prefixes: &[&str],
+        tx: Sender<KvUpdate>,
+    ) -> Result<(), KvError> {
+        if prefixes.is_empty() {
+            // Nothing to watch. Critically, do NOT fall through to `watch_many`
+            // with an empty filter set — an unfiltered ordered consumer would
+            // watch the WHOLE bucket, the opposite of a scoped watch.
+            return Ok(());
+        }
+        // ONE multi-filter consumer for every prefix (NATS 2.10 `filter_subjects`)
+        // rather than one consumer per prefix. `watch_many` builds a single ordered
+        // push consumer with `filter_subjects = [{p}> ...]` and yields the same
+        // `Entry` stream as `watch`, so `stream_watch` is reused verbatim. This is
+        // the per-stream-consumer-count fix: a node scoped to N prefixes costs 1
+        // consumer, not N.
+        let keys: Vec<String> = prefixes.iter().map(|p| format!("{p}>")).collect();
+        let watcher = timed(self.kv.watch_many(keys))
+            .await?
+            .map_err(|e| KvError::WatchError(e.to_string()))?;
+        stream_watch(watcher, &tx).await
+    }
+
     async fn watch_all_from(
         &self,
         cursor: &WatchCursor,
