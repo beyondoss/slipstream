@@ -450,7 +450,14 @@ mod fjall_backend {
     use slipstream::{FjallConfig, FjallSnapshot};
 
     fn open_no_sync(path: &Path) -> (WatchCursor, FjallSnapshot) {
-        FjallSnapshot::open(path, FjallConfig { sync: false, ..Default::default() }).expect("open fjall")
+        FjallSnapshot::open(
+            path,
+            FjallConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+        .expect("open fjall")
     }
 
     #[test]
@@ -537,12 +544,24 @@ mod fjall_backend {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("store");
         {
-            let (_r, mut s) =
-                FjallSnapshot::open(&path, FjallConfig { sync: true, ..Default::default() }).expect("open fjall sync");
+            let (_r, mut s) = FjallSnapshot::open(
+                &path,
+                FjallConfig {
+                    sync: true,
+                    ..Default::default()
+                },
+            )
+            .expect("open fjall sync");
             fold(&mut s, &stream());
         }
-        let (cursor, s) =
-            FjallSnapshot::open(&path, FjallConfig { sync: true, ..Default::default() }).expect("reopen fjall sync");
+        let (cursor, s) = FjallSnapshot::open(
+            &path,
+            FjallConfig {
+                sync: true,
+                ..Default::default()
+            },
+        )
+        .expect("reopen fjall sync");
         assert_eq!(cursor.as_u64(), Some(7));
         assert_eq!(dump(&s), expected_state());
     }
