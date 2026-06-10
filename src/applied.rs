@@ -465,6 +465,18 @@ mod tests {
             Ok(())
         }
 
+        async fn watch_prefixes(
+            &self,
+            _prefixes: &[&str],
+            tx: Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            // This mock scripts the applied-watch resumption tests, not prefix
+            // filtering; it delivers the same `full` script as `watch_prefix`.
+            // The real multi-filter scoping is proved in the NATS integration test.
+            self.deliver(&self.full, tx).await;
+            Ok(())
+        }
+
         async fn watch_all_from(
             &self,
             _cursor: &WatchCursor,
@@ -507,6 +519,14 @@ mod tests {
         }
 
         async fn watch_prefix(&self, _prefix: &str, _tx: Sender<KvUpdate>) -> Result<(), KvError> {
+            Err(KvError::WatchError("injected watch failure".into()))
+        }
+
+        async fn watch_prefixes(
+            &self,
+            _prefixes: &[&str],
+            _tx: Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
             Err(KvError::WatchError("injected watch failure".into()))
         }
     }

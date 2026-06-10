@@ -261,6 +261,17 @@ pub trait KvWatcher: Send + Sync {
     /// Watch keys matching a prefix.
     async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
+    /// Watch keys matching ANY of `prefixes`, delivered through one channel.
+    ///
+    /// The contract is exactly the union of the prefixes — no other keys. A
+    /// backend with native multi-filter consumers (NATS server 2.10+) serves all
+    /// `prefixes` from a SINGLE consumer; that matters because consumers are a
+    /// per-stream resource (measured at ~tens of KB of server state each, growing
+    /// super-linearly past a few thousand on one stream), so a watcher scoped to N
+    /// prefixes must not cost N consumers.
+    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>)
+    -> Result<(), KvError>;
+
     /// Resume watching all keys from a previously saved cursor position.
     ///
     /// Returns `KvError::CursorExpired` if the backend has compacted past the

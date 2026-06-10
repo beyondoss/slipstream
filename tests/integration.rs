@@ -569,6 +569,56 @@ async fn watch_prefix_filters_by_subject() {
     assert!(matches!(&updates[0], KvUpdate::Put(e) if e.key == "node.a"));
 }
 
+/// `watch_prefixes` must serve the UNION of several prefixes from a SINGLE
+/// multi-filter consumer (NATS 2.10 `filter_subjects`), not one consumer per
+/// prefix — because consumers are a per-stream resource (~tens of KB of server
+/// state each, super-linear past a few thousand on one stream). Proven two ways:
+/// the KV stream carries exactly one consumer, and a non-watched prefix is
+/// filtered server-side (never delivered), while both watched prefixes are.
+#[tokio::test]
+async fn watch_prefixes_unions_on_a_single_consumer() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("watchmany").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let _ = watcher.watch_prefixes(&["vpcA.", "vpcB."], tx).await;
+    });
+    // Sentinel must fall within one watched prefix to be echoed back.
+    establish_watch(writer.as_ref(), &mut rx, "vpcA.__ready__").await;
+
+    // PROOF 1 — one multi-filter consumer, not N. The KV bucket `watchmany`
+    // is JetStream stream `KV_watchmany`; assert it carries exactly one consumer.
+    let js = async_nats::jetstream::new(async_nats::connect(&nats.url).await.expect("raw connect"));
+    let mut stream = js.get_stream("KV_watchmany").await.expect("get kv stream");
+    let info = stream.info().await.expect("stream info");
+    assert_eq!(
+        info.state.consumer_count, 1,
+        "watch_prefixes must use ONE multi-filter consumer, found {}",
+        info.state.consumer_count
+    );
+
+    // PROOF 2 — union delivered, third prefix filtered server-side.
+    writer.put("vpcC.x", b"skip").await.expect("put vpcC"); // outside the union
+    writer.put("vpcA.a", b"keep").await.expect("put vpcA");
+    writer.put("vpcB.b", b"keep").await.expect("put vpcB");
+
+    let updates = collect_updates(&mut rx, 2).await;
+    let keys: std::collections::HashSet<String> =
+        updates.iter().map(|u| u.key().to_string()).collect();
+    assert!(
+        keys.contains("vpcA.a") && keys.contains("vpcB.b"),
+        "both watched prefixes must be delivered, got {keys:?}"
+    );
+    // vpcC.x must NEVER arrive — server-side filtered, not client-discarded.
+    assert!(
+        timeout(Duration::from_millis(500), rx.recv()).await.is_err(),
+        "a non-watched prefix leaked through watch_prefixes"
+    );
+}
+
 #[tokio::test]
 async fn watch_all_from_replays_only_the_delta() {
     let nats = TestNats::start().await;
