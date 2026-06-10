@@ -44,17 +44,37 @@ const META_PARTITION: &str = "meta";
 /// Key under [`META_PARTITION`] storing the resume cursor's raw version bytes.
 const CURSOR_KEY: &[u8] = b"cursor";
 
-/// Durability configuration for [`FjallSnapshot`].
+/// Durability and read-cache configuration for [`FjallSnapshot`].
 ///
 /// Defaults to NO_SYNC (`sync: false`) — same cache philosophy as the append
 /// log's no-fsync-per-checkpoint path.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FjallConfig {
     /// `fsync` every [`apply`](SnapshotStore::apply) commit when `true`. When
     /// `false` (the default), commits are not fsync'd (NO_SYNC): faster, and a
     /// tail lost to power loss is rebuilt by resuming the watch from the recovered
     /// cursor — the snapshot is a cache.
     pub sync: bool,
+
+    /// Block-cache capacity in bytes for the LSM. fjall's own default is 32 MiB,
+    /// which starves reads against a multi-hundred-MB fold: a working-set hydration
+    /// (a prefix range over one service's keys) then misses the cache and hits disk,
+    /// and the miss rate climbs as the fold grows (measured: 32 MiB → p50 174 us /
+    /// p99 1.45 ms at 4M routes; a 2 GiB cache → 7 us / 13 us). This default sizes
+    /// the cache to the hot set so hydrations stay cache-resident. `0` falls back to
+    /// fjall's 32 MiB default. Set this to roughly the resident working-set size.
+    pub cache_size_bytes: u64,
+}
+
+impl Default for FjallConfig {
+    fn default() -> Self {
+        Self {
+            sync: false,
+            // 1 GiB: holds index/data blocks for a ~1e6-service working set
+            // resident, matching the routing registries' default resident cap.
+            cache_size_bytes: 1024 * 1024 * 1024,
+        }
+    }
 }
 
 /// On-disk durable fold backed by fjall. See the [module docs](self).
@@ -75,7 +95,15 @@ impl FjallSnapshot {
     /// persisted resume cursor — [`WatchCursor::none`] when fresh — and the store.
     pub fn open(path: &Path, config: FjallConfig) -> Result<(WatchCursor, Self), SnapshotError> {
         std::fs::create_dir_all(path)?;
-        let db = Database::open(Config::new(path)).map_err(map_fjall)?;
+        let mut db_config = Config::new(path);
+        // Size the LSM block cache to the working set (default 1 GiB). fjall's own
+        // default is 32 MiB, far too small for the fold — see `FjallConfig::cache_size_bytes`.
+        if config.cache_size_bytes > 0 {
+            db_config.cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+                config.cache_size_bytes,
+            ));
+        }
+        let db = Database::open(db_config).map_err(map_fjall)?;
         let data = db
             .keyspace(DATA_PARTITION, KeyspaceCreateOptions::default)
             .map_err(map_fjall)?;
@@ -110,6 +138,67 @@ impl FjallSnapshot {
     /// The most recently applied resume cursor.
     pub fn cursor(&self) -> &WatchCursor {
         &self.cursor
+    }
+
+    /// A cheap, concurrent-read-safe handle to the fold's data partition.
+    ///
+    /// fjall serves readers concurrently with the writer, so a consumer can clone
+    /// this out *before* handing the fold to [`watch_applied`](crate::watch_applied)
+    /// (which takes the store by value, `apply` being `&mut self`) and then
+    /// `get`/`range` the fold from a separate serving task. That is the
+    /// working-set-serving pattern for a fold too large to hold resident: seed the
+    /// hot set, serve it from RAM, and `range` the cold tail from the fold on a
+    /// cache miss — without the serving path ever touching the writer.
+    pub fn reader(&self) -> FjallReader {
+        FjallReader {
+            data: self.data.clone(),
+        }
+    }
+}
+
+/// A concurrent read handle over a [`FjallSnapshot`]'s data partition, cloned via
+/// [`FjallSnapshot::reader`]. Reads share the same on-disk fold as the writer and
+/// are safe to run concurrently with it.
+#[derive(Clone)]
+pub struct FjallReader {
+    data: Keyspace,
+}
+
+impl FjallReader {
+    /// Live entry for `key`, or `None` if absent/deleted.
+    pub fn get(&self, key: &str) -> Result<Option<KvEntry>, SnapshotError> {
+        match self.data.get(key.as_bytes()).map_err(map_fjall)? {
+            Some(raw) => Ok(Some(decode_entry(key, &raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Stream every live entry whose key starts with `prefix`, ascending, without
+    /// buffering the whole match set — the memory-bounded scan for an on-disk fold.
+    pub fn for_each_in_range(
+        &self,
+        prefix: &str,
+        mut f: impl FnMut(KvEntry) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        for guard in self.data.prefix(prefix.as_bytes()) {
+            let (raw_key, raw_val) = guard.into_inner().map_err(map_fjall)?;
+            let key = std::str::from_utf8(&raw_key).map_err(|e| {
+                SnapshotError::InvalidFormat(format!("non-UTF-8 key in fjall store: {e}"))
+            })?;
+            f(decode_entry(key, &raw_val)?)?;
+        }
+        Ok(())
+    }
+
+    /// Buffered counterpart to [`for_each_in_range`](Self::for_each_in_range) for
+    /// bounded prefixes (e.g. one service's routes, or the whole `node.` map).
+    pub fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, SnapshotError> {
+        let mut out = Vec::new();
+        self.for_each_in_range(prefix, |e| {
+            out.push(e);
+            Ok(())
+        })?;
+        Ok(out)
     }
 }
 
