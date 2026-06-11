@@ -514,6 +514,7 @@ impl ImportStage {
 
     /// Rename the whole staged payload directory onto `dest` (directory-shaped
     /// backends: fjall, RocksDB).
+    #[cfg(any(feature = "fjall", feature = "rocksdb"))]
     pub(crate) fn finalize_dir(self) -> Result<(), SnapshotError> {
         check_dest_available(&self.dest)?;
         rename_into_place(&self.payload(), &self.dest)

@@ -50,15 +50,38 @@
 //! of [`watch_applied`] and aborts the watch — that is the caller's contract,
 //! the same as a panic in any other supplied closure.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
+use crate::artifact::ExportManifest;
 use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
-use crate::snapshot::SnapshotStore;
+use crate::snapshot::{SnapshotError, SnapshotStore};
+
+/// A request, sent into a running [`watch_applied`] loop, to export the fold it
+/// owns (see [`SnapshotStore::export_to`]).
+///
+/// `watch_applied` takes its snapshot store **by value**, so a consumer that
+/// wants periodic artifacts of a live fold cannot call `export_to` itself. It
+/// instead passes an `mpsc::Receiver<ExportRequest>` to [`watch_applied`] and
+/// sends requests through the paired sender. The loop handles a request
+/// between batch flushes — after flushing any pending batch — so the artifact's
+/// embedded cursor is exactly the applied cursor at the moment of export.
+///
+/// The export result (or error) comes back on `reply`; an export failure is
+/// reported there and the watch keeps running (the snapshot is a cache — a
+/// failed artifact is the requester's problem, not the fold's).
+pub struct ExportRequest {
+    /// Where the artifact directory will be created. Must not exist (or be an
+    /// empty directory); same filesystem as the fold for cheap hardlinks.
+    pub dest_dir: PathBuf,
+    /// Receives the sealed manifest on success. A dropped receiver is ignored.
+    pub reply: oneshot::Sender<Result<ExportManifest, SnapshotError>>,
+}
 
 /// What to watch: every key, or every key under a prefix.
 ///
@@ -139,6 +162,12 @@ pub async fn watch_applied<U, S, P, A, O>(
     scope: WatchScope,
     resume: Option<WatchCursor>,
     mut store: Option<S>,
+    // `Some(rx)` arms an export-request arm in the select loop: each
+    // [`ExportRequest`] is handled between flushes (pending batch flushed
+    // first), so the exported artifact's cursor is exactly the applied cursor.
+    // `None` (or dropping the paired sender) leaves the loop's behavior
+    // unchanged.
+    mut exports: Option<mpsc::Receiver<ExportRequest>>,
     config: BatchConfig,
     mut parse: P,
     mut apply: A,
@@ -288,6 +317,57 @@ where
             // Batch window elapsed.
             () = &mut sleep, if batch_deadline.is_some() => {
                 flush!();
+            }
+
+            // Export request. Placed after shutdown/window (they stay prompt)
+            // and before `rx.recv()` so a firehose of updates cannot starve an
+            // export indefinitely. The pending batch is flushed first, so the
+            // exported cursor is exactly the applied cursor; the export itself
+            // runs on a blocking task with the store moved in and taken back —
+            // the same offload the flush path uses.
+            req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
+                if exports.is_some() => {
+                match req {
+                    Some(ExportRequest { dest_dir, reply }) => {
+                        flush!();
+                        match store.take() {
+                            Some(mut st) => {
+                                match tokio::task::spawn_blocking(move || {
+                                    let res = st.export_to(&dest_dir);
+                                    (st, res)
+                                })
+                                .await
+                                {
+                                    // Hand the store back on any clean return; an
+                                    // export failure goes to the requester only —
+                                    // the watch keeps running (the snapshot is a
+                                    // cache). A panicked task lost the store,
+                                    // which breaks the resume guarantee: fatal,
+                                    // same as the flush path's apply panic.
+                                    Ok((st, res)) => {
+                                        store = Some(st);
+                                        let _ = reply.send(res);
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "snapshot export task panicked; aborting watch");
+                                        handle.abort();
+                                        return Err(KvError::WatchError(format!(
+                                            "snapshot export task panicked: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = reply.send(Err(SnapshotError::Backend(
+                                    "watch_applied runs without a snapshot store; nothing to export"
+                                        .into(),
+                                )));
+                            }
+                        }
+                    }
+                    // Sender dropped: disarm the arm for the rest of the run.
+                    None => exports = None,
+                }
             }
 
             update = rx.recv() => {
@@ -559,6 +639,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch| ab.lock().unwrap().push(batch),
@@ -593,6 +674,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| {
@@ -635,6 +717,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600), // effectively never
                 max,
@@ -674,6 +757,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600), // window won't fire
                 max: 100,
@@ -724,6 +808,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max,
@@ -770,6 +855,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             // Reject everything — simulates corrupt/irrelevant entries.
             |_u: &KvUpdate| -> Option<Vec<u8>> { None },
@@ -813,6 +899,7 @@ mod tests {
             WatchScope::All,
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -849,6 +936,7 @@ mod tests {
             WatchScope::All,
             None,
             Some(store),
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -896,6 +984,7 @@ mod tests {
             WatchScope::All,
             Some(WatchCursor::from_u64(9)), // resume past rev 9 — not expired
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -934,6 +1023,7 @@ mod tests {
             WatchScope::Prefix("node.".to_string()),
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -972,6 +1062,7 @@ mod tests {
             WatchScope::Prefix("node.".to_string()),
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -1001,6 +1092,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -1040,6 +1132,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             // Keep only keys under "keep."; reject everything else.
             |u: &KvUpdate| -> Option<Vec<u8>> {
@@ -1086,6 +1179,7 @@ mod tests {
             WatchScope::All,
             None,
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {
@@ -1113,6 +1207,198 @@ mod tests {
             0,
             "on_applied never fires"
         );
+    }
+
+    /// An [`ExportRequest`] flushes the pending batch first, so the artifact's
+    /// cursor is exactly the applied cursor — and the artifact is importable
+    /// with the batched entries in it.
+    #[tokio::test(start_paused = true)]
+    async fn export_request_flushes_pending_batch_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("fold.snap");
+        let artifact = dir.path().join("artifact");
+        let (_r, store) = AppendLogSnapshot::open(&store_path, u64::MAX).unwrap();
+
+        let updates = vec![put("a", b"1", 1), put("b", b"2", 2)];
+        let watcher = Arc::new(MockWatcher::new(updates, true)); // hold open
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            Some(store),
+            Some(ex_rx),
+            BatchConfig {
+                window: Duration::from_secs(3600), // window never fires
+                max: 100,
+            },
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |_| {},
+            sd_rx,
+        ));
+
+        // Let both updates land in the (unflushed) pending batch, then export.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: artifact.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let manifest = reply_rx.await.unwrap().expect("export succeeds");
+        assert_eq!(
+            manifest.cursor.as_u64(),
+            Some(2),
+            "pending batch flushed before export: artifact cursor is the applied cursor"
+        );
+
+        // The artifact is importable and holds both batched entries.
+        let (cursor, imported) =
+            AppendLogSnapshot::import(&artifact, &dir.path().join("imported.snap"), u64::MAX)
+                .unwrap();
+        assert_eq!(cursor.as_u64(), Some(2));
+        assert_eq!(imported.get("a").unwrap().unwrap().value, b"1");
+        assert_eq!(imported.get("b").unwrap().unwrap().value, b"2");
+
+        sd_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    /// An export request against a store-less watch replies with an error and
+    /// the watch keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn export_without_store_replies_error() {
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None::<AppendLogSnapshot>,
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |_| {},
+            sd_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: std::env::temp_dir().join("never-created"),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "no store → export errors via the reply"
+        );
+
+        // The watch is still alive and returns its applied cursor on shutdown.
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+        assert_eq!(cursor.as_u64(), Some(1));
+    }
+
+    /// An export failure (unavailable destination) is reported on the reply and
+    /// the watch keeps applying later updates.
+    #[tokio::test(start_paused = true)]
+    async fn export_error_does_not_kill_watch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("fold.snap");
+        let (_r, store) = AppendLogSnapshot::open(&store_path, u64::MAX).unwrap();
+
+        // Occupied destination → export fails.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("stray"), b"x").unwrap();
+
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let applied = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&applied);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            Some(store),
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |cur| a.store(cur.as_u64().unwrap(), Ordering::SeqCst),
+            sd_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: occupied,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        match reply_rx.await.unwrap() {
+            Err(crate::snapshot::SnapshotError::ArtifactInvalid(_)) => {}
+            other => panic!("expected ArtifactInvalid, got {other:?}"),
+        }
+
+        // Watch still folds: a clean shutdown returns the applied cursor.
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+        assert_eq!(cursor.as_u64(), Some(1), "watch survived the failed export");
+        assert_eq!(applied.load(Ordering::SeqCst), 1);
+    }
+
+    /// Dropping the export sender disarms the arm; the loop keeps batching and
+    /// flushing normally.
+    #[tokio::test(start_paused = true)]
+    async fn export_sender_dropped_disarms_channel() {
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel::<ExportRequest>(1);
+
+        let applied = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&applied);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None::<AppendLogSnapshot>,
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |cur| a.store(cur.as_u64().unwrap(), Ordering::SeqCst),
+            sd_rx,
+        ));
+
+        drop(ex_tx); // disarm
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "loop keeps flushing after the export sender is gone"
+        );
+
+        sd_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     /// With a low `compact_threshold`, the flush path's `spawn_blocking`
@@ -1144,6 +1430,7 @@ mod tests {
             WatchScope::All,
             None,
             Some(store),
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max: 1, // one update per flush → a compaction per update

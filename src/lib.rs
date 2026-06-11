@@ -36,7 +36,7 @@ mod snapshot_record;
 mod snapshot_rocksdb;
 mod stores;
 
-pub use applied::{BatchConfig, WatchScope, watch_applied};
+pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
 pub use kv::{
     KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,

@@ -90,6 +90,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
                         WatchScope::All,
                         None,
                         None::<slipstream::AppendLogSnapshot>,
+                        None,
                         BatchConfig {
                             window: Duration::from_millis(10),
                             max: 100,
