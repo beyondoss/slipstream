@@ -1,17 +1,26 @@
 # Slipstream
 
-Trait-based KV abstraction over NATS JetStream. Read, write, and watch distributed config. A cursor tracks position in the watch stream so services resume from the delta after any restart.
+Edge nodes need local copies of large distributed config — routing tables, TLS certificates, WASM configs — but replaying the full history from NATS on every restart is too slow. At a billion routes per node, it isn't feasible at all.
+
+Slipstream turns a NATS JetStream KV bucket into a **resumable, locally-cached config stream**. A *watch cursor* (a stream sequence number) marks exactly where a node last processed an update. On restart, load the local snapshot, hand the cursor back to NATS, and receive only the delta — not the full history.
+
+The core safety property: the cursor advances only **after** your `apply()` returns, never on receipt. A crash between delivery and application leaves the cursor behind the unapplied data; the next restart re-delivers rather than silently skipping it. The `watch_applied` combinator enforces this invariant so no caller can get it wrong.
+
+For folds that outgrow RAM, on-disk backends (`fjall` or `RocksDB`) hold the state. For nodes that can't replay bounded NATS logs, **export/import** bootstraps a new node from a peer's fold over object storage, resuming from the embedded cursor.
+
+## Install
 
 ```toml
 [dependencies]
-beyond-slipstream = "0.2"
+beyond-slipstream = "0.5"
 ```
 
 The crate core is pure-Rust. On-disk snapshot backends are opt-in cargo features (no C toolchain is pulled unless you enable one):
 
 ```toml
-beyond-slipstream = { version = "0.2", features = ["fjall"] }   # on-disk SnapshotStore, pure-Rust LSM
-beyond-slipstream = { version = "0.2", features = ["rocksdb"] } # on-disk SnapshotStore, RocksDB (needs a C++ toolchain + libclang to build)
+beyond-slipstream = { version = "0.5", features = ["fjall"] }   # on-disk SnapshotStore, pure-Rust LSM
+beyond-slipstream = { version = "0.5", features = ["rocksdb"] } # on-disk SnapshotStore, RocksDB (needs a C++ toolchain + libclang to build)
+beyond-slipstream = { version = "0.5", features = ["transport"] } # artifact export/import via object_store (S3, GCS, local)
 ```
 
 ## Concepts
