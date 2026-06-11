@@ -4,10 +4,13 @@
 //! throwaway `nats-server` where a real lease/watch loop is part of the claim.
 #![cfg(feature = "transport")]
 
+mod common;
+
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+
+use common::TestNats;
 
 use async_trait::async_trait;
 use slipstream::snapshot::{SnapshotError, SnapshotStore};
@@ -153,57 +156,6 @@ async fn missing_remote_artifact_is_artifact_invalid() {
 // --- run_export_round ------------------------------------------------------------
 // These need a real lease (NATS KV) and a live watch_applied loop.
 
-struct TestNats {
-    child: Child,
-    url: String,
-    _store_dir: TempDir,
-}
-
-impl TestNats {
-    async fn start() -> TestNats {
-        let bin = std::env::var("NATS_SERVER_BIN").unwrap_or_else(|_| "nats-server".to_string());
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let store_dir = tempfile::tempdir().unwrap();
-        let child = Command::new(&bin)
-            .args([
-                "--jetstream",
-                "--addr",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--store_dir",
-                store_dir.path().to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn `{bin}`: {e}. Run `mise install`."));
-        let url = format!("nats://127.0.0.1:{port}");
-        for _ in 0..100 {
-            if async_nats::connect(&url).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        TestNats {
-            child,
-            url,
-            _store_dir: store_dir,
-        }
-    }
-}
-
-impl Drop for TestNats {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// Everything a live export round needs: a fold being driven by watch_applied
 /// over a real NATS bucket, an export channel into it, and a lease store.
 struct LiveRound {
@@ -212,6 +164,7 @@ struct LiveRound {
     writer: Arc<dyn KvWriter>,
     lease_store: Arc<dyn slipstream::KvStore>,
     exports: mpsc::Sender<slipstream::ExportRequest>,
+    applied: Arc<std::sync::atomic::AtomicU64>,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<WatchCursor, slipstream::KvError>>,
     dir: TempDir,
@@ -249,6 +202,8 @@ async fn live_round() -> LiveRound {
     let (_r, fold) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
     let (ex_tx, ex_rx) = mpsc::channel(1);
     let (sd_tx, sd_rx) = watch::channel(false);
+    let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let applied_w = Arc::clone(&applied);
 
     let task = tokio::spawn(watch_applied(
         watcher,
@@ -262,7 +217,12 @@ async fn live_round() -> LiveRound {
             _ => None,
         },
         |_batch: Vec<String>| {},
-        |_| {},
+        move |cur: WatchCursor| {
+            applied_w.store(
+                cur.as_u64().unwrap_or(0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        },
         sd_rx,
     ));
 
@@ -272,16 +232,28 @@ async fn live_round() -> LiveRound {
         writer,
         lease_store,
         exports: ex_tx,
+        applied,
         shutdown: sd_tx,
         task,
         dir,
     }
 }
 
-/// Wait until the fold has applied at least one update (watch attached).
+/// Deterministically wait until the fold has applied an update: KV watches
+/// deliver new updates only, so writes that land before the consumer attaches
+/// are missed — probe with repeated puts until the applied cursor moves.
 async fn settle_watch(round: &LiveRound) {
-    round.writer.put("seed.key", b"seed").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            round.writer.put("seed.key", b"seed").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if round.applied.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("watch never attached");
 }
 
 /// The composed happy path: lease won → export through the live loop → upload
