@@ -99,7 +99,14 @@ pub struct ArtifactFile {
 // surface can hold a real WatchCursor while the JSON stays a stable hex string.
 // ---------------------------------------------------------------------------
 
+// `deny_unknown_fields` on both: the manifest is the trust boundary for a
+// remote-supplied artifact, and an unrecognized field is far more likely a
+// corrupted/hostile manifest or a schema mismatch than benign noise — reject
+// loudly rather than skip silently. Forward compatibility is governed by
+// `schema_version`, which is checked first in `manifest_from_slice`; a future
+// schema that adds fields must bump it.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestWire {
     schema_version: u32,
     backend: String,
@@ -112,6 +119,7 @@ struct ManifestWire {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileWire {
     path: String,
     size: u64,
@@ -279,21 +287,21 @@ fn validate_payload_path(p: &str) -> Result<(), SnapshotError> {
 // Payload hashing
 // ---------------------------------------------------------------------------
 
-/// Streaming BLAKE3 of one file, returning `(size, hex_digest)`.
-fn hash_file(path: &Path) -> Result<(u64, String), SnapshotError> {
+/// Streaming BLAKE3 of one file, returning `(size, hex_digest)` plus the open
+/// handle so the caller can `sync_all` without a second `open(2)`.
+fn hash_file(path: &Path, buf: &mut [u8]) -> Result<(File, u64, String), SnapshotError> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; HASH_BUF];
     let mut size = 0u64;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file.read(buf)?;
         if n == 0 {
             break;
         }
         size += n as u64;
         hasher.update(&buf[..n]);
     }
-    Ok((size, hasher.finalize().to_hex().to_string()))
+    Ok((file, size, hasher.finalize().to_hex().to_string()))
 }
 
 /// Every regular file under `root/data/`, relative `/`-separated paths, sorted.
@@ -329,12 +337,13 @@ fn list_payload_files(root: &Path) -> Result<Vec<PathBuf>, SnapshotError> {
 /// (files + directories), returning the manifest file list in sorted order.
 pub(crate) fn hash_payload(root: &Path) -> Result<Vec<ArtifactFile>, SnapshotError> {
     let mut files = Vec::new();
+    let mut buf = vec![0u8; HASH_BUF];
     for abs in list_payload_files(root)? {
-        let (size, blake3) = hash_file(&abs)?;
+        let (file, size, blake3) = hash_file(&abs, &mut buf)?;
         // Durability before the rename: the artifact's completeness contract is
         // "exists ⇒ verifiable", which only holds if the hashed bytes are the
         // on-disk bytes.
-        File::open(&abs)?.sync_all()?;
+        file.sync_all()?;
         let rel = abs
             .strip_prefix(root)
             .map_err(|_| SnapshotError::Backend("payload path escaped artifact root".into()))?;
@@ -400,7 +409,14 @@ pub(crate) fn check_dest_available(dest: &Path) -> Result<(), SnapshotError> {
 
 /// Remove `dest` if it is an (already-verified-empty) directory so a rename can
 /// land on its path, then rename `from` onto it and fsync the parent.
-fn rename_into_place(from: &Path, dest: &Path) -> Result<(), SnapshotError> {
+///
+/// The is_dir → remove_dir → rename sequence has a TOCTOU window: a concurrent
+/// writer can recreate `dest` between the remove and the rename. That race
+/// fails closed — `remove_dir` errors on a non-empty dir and `rename` errors
+/// when `dest` reappears as a file or non-empty dir — so the worst case is an
+/// error return, never a silent overwrite. Don't "fix" this with
+/// remove-then-retry; refusing the round is the intended behavior.
+pub(crate) fn rename_into_place(from: &Path, dest: &Path) -> Result<(), SnapshotError> {
     if dest.is_dir() {
         fs::remove_dir(dest)?;
     }
@@ -585,7 +601,9 @@ pub(crate) fn verify_and_stage_import(
     };
 
     // Copy-while-hashing: one read pass per file serves both the copy and the
-    // verification.
+    // verification. One buffer for the whole loop — a fresh 1 MiB zero-init per
+    // file would be O(files) wasted work on multi-hundred-file artifacts.
+    let mut buf = vec![0u8; HASH_BUF];
     for f in &manifest.files {
         let src_path = artifact_dir.join(&f.path);
         let dst_path = stage.dir.path().join(&f.path);
@@ -601,7 +619,6 @@ pub(crate) fn verify_and_stage_import(
         })?;
         let mut dst = File::create(&dst_path)?;
         let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; HASH_BUF];
         let mut size = 0u64;
         loop {
             let n = src.read(&mut buf)?;
@@ -756,6 +773,67 @@ mod tests {
                 other => panic!("path {bad:?}: expected ArtifactInvalid, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn rejects_malformed_manifest_json() {
+        // Truly unparseable bytes (not merely wrong field values) must surface
+        // as ArtifactInvalid, never an Io/Backend error or a panic.
+        let dir = TempDir::new().unwrap();
+        write_raw_manifest(dir.path(), "not json at all {{{");
+        match read_manifest(dir.path()) {
+            Err(SnapshotError::ArtifactInvalid(msg)) => {
+                assert!(msg.contains("malformed"), "{msg}");
+            }
+            other => panic!("expected ArtifactInvalid, got {other:?}"),
+        }
+    }
+
+    /// A symlink in the payload is refused at export: it would hash as its
+    /// target's bytes but restore as a link (or escape the payload entirely),
+    /// so `hash_payload` must reject it before a manifest is ever written.
+    #[cfg(unix)]
+    #[test]
+    fn hash_payload_rejects_symlink() {
+        let dir = TempDir::new().unwrap();
+        let payload = dir.path().join(PAYLOAD_DIR);
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join("real"), b"data").unwrap();
+        let target = dir.path().join("outside");
+        fs::write(&target, b"outside the payload").unwrap();
+        std::os::unix::fs::symlink(&target, payload.join("link")).unwrap();
+
+        match hash_payload(dir.path()) {
+            Err(SnapshotError::ArtifactInvalid(msg)) => {
+                assert!(msg.contains("non-regular"), "{msg}");
+            }
+            other => panic!("expected ArtifactInvalid, got {other:?}"),
+        }
+    }
+
+    /// The TOCTOU window documented on `rename_into_place`: the destination
+    /// appears (non-empty) between `ExportStage::new` and `seal_and_finalize`.
+    /// The race must fail closed — an error return, never a silent overwrite.
+    #[test]
+    fn export_stage_fails_closed_when_dest_appears_before_seal() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("artifact");
+        let stage = ExportStage::new(&dest).unwrap();
+        fs::create_dir(stage.payload()).unwrap();
+        fs::write(stage.payload().join("fold.snap"), b"data").unwrap();
+
+        // A concurrent writer lands a non-empty directory at the destination.
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("stray"), b"x").unwrap();
+
+        let err = stage
+            .seal_and_finalize("append-log", "2", &WatchCursor::from_u64(1))
+            .unwrap_err();
+        assert!(matches!(err, SnapshotError::ArtifactInvalid(_)));
+        assert!(
+            dest.join("stray").exists(),
+            "occupied destination is untouched"
+        );
     }
 
     #[test]

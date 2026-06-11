@@ -156,6 +156,59 @@ async fn missing_remote_artifact_is_artifact_invalid() {
     }
 }
 
+/// A sibling-manifest object larger than the 1 MiB cap is rejected before
+/// being buffered whole — the OOM guard against a hostile or corrupted object
+/// at the manifest key.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_remote_manifest_is_rejected() {
+    let (transport, bucket) = local_transport();
+    // Plant the oversized object directly in the "bucket" at the sibling key.
+    let sibling_dir = bucket.path().join("slipstream-artifacts");
+    std::fs::create_dir_all(&sibling_dir).unwrap();
+    std::fs::write(
+        sibling_dir.join("oversized.manifest.json"),
+        vec![b'x'; (1 << 20) + 1],
+    )
+    .unwrap();
+
+    match transport.manifest("oversized").await {
+        Err(SnapshotError::ArtifactInvalid(msg)) => assert!(msg.contains("exceeds"), "{msg}"),
+        other => panic!("expected ArtifactInvalid, got {other:?}"),
+    }
+}
+
+/// Both URL-parse failure modes surface as transport errors, not panics: a
+/// string that is not a URL at all, and a URL whose scheme `object_store`
+/// doesn't recognize.
+#[test]
+fn from_url_opts_rejects_bad_urls() {
+    // Garbage that fails URL parsing, and a well-formed URL whose scheme
+    // object_store doesn't recognize.
+    for bad in ["not a url", "bogus://bucket/prefix"] {
+        match ObjectStoreTransport::from_url_opts(bad, std::iter::empty::<(&str, &str)>()) {
+            Err(SnapshotError::Backend(_)) => {}
+            Err(other) => panic!("url {bad:?}: expected Backend, got {other:?}"),
+            Ok(_) => panic!("url {bad:?} must not build a transport"),
+        }
+    }
+}
+
+/// A destination with no parent directory (a bare relative path) is refused
+/// before any remote I/O — there is nowhere to stage the download beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn download_rejects_dest_without_parent() {
+    let (transport, _bucket) = local_transport();
+    match transport
+        .download("anything", Path::new("slipstream-bare-dest"))
+        .await
+    {
+        Err(SnapshotError::ArtifactInvalid(msg)) => {
+            assert!(msg.contains("no parent"), "{msg}");
+        }
+        other => panic!("expected ArtifactInvalid, got {other:?}"),
+    }
+}
+
 // --- run_export_round ------------------------------------------------------------
 // These need a real lease (NATS KV) and a live watch_applied loop.
 
@@ -212,6 +265,7 @@ async fn live_round() -> LiveRound {
         watcher,
         WatchScope::All,
         None,
+        None, // reader: cursor-expired resync not exercised here
         Some(fold),
         Some(ex_rx),
         BatchConfig::default(),
@@ -381,4 +435,172 @@ async fn run_export_round_upload_failure_abandons_lease() {
 
     round.shutdown.send(true).unwrap();
     round.task.await.unwrap().unwrap();
+}
+
+/// The watch loop is gone before the round begins (panicked / shut down): the
+/// round fails with an error naming the loop, nothing is left in scratch, and
+/// the lease is abandoned so a replacement node can win the round immediately
+/// instead of waiting out the ttl.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_export_round_dead_loop_abandons_lease() {
+    let round = live_round().await;
+    settle_watch(&round).await;
+
+    // Kill the loop definitively; its export receiver drops with it.
+    round.shutdown.send(true).unwrap();
+    round.task.await.unwrap().unwrap();
+
+    let (transport, _bucket) = local_transport();
+    let scratch = round.dir.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let lease = ExportLease::new(round.lease_store.as_ref(), "round", "node-a").unwrap();
+
+    let err = run_export_round(
+        &lease,
+        Duration::from_secs(600), // long ttl: only abandon makes re-acquire possible
+        &round.exports,
+        &transport,
+        "latest",
+        &scratch,
+    )
+    .await
+    .expect_err("a dead watch loop must fail the round");
+    match err {
+        SnapshotError::Backend(msg) => assert!(msg.contains("watch loop"), "{msg}"),
+        other => panic!("expected Backend, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_dir(&scratch).unwrap().count(),
+        0,
+        "scratch cleaned up after the failed round"
+    );
+
+    // The lease was abandoned: a replacement node wins immediately, long
+    // before the 600 s ttl.
+    let replacement = ExportLease::new(round.lease_store.as_ref(), "round", "node-b").unwrap();
+    assert!(
+        replacement
+            .try_acquire(Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some(),
+        "abandoned lease frees the round for a replacement node"
+    );
+}
+
+// --- import_remote error paths for the LSM backends (local transport) --------
+// The MinIO tier only exercises these backends with a GOOD artifact; these
+// prove the verify gate fires for a tampered one without needing MinIO.
+
+/// Export a fold, flip a byte in its largest payload file, upload it, and
+/// assert the remote import rejects it with nothing at the destination and a
+/// clean scratch dir. Generic over the backend's export + import_remote.
+#[cfg(any(feature = "fjall", feature = "rocksdb"))]
+async fn assert_import_remote_rejects_tampered(
+    artifact: &std::path::Path,
+    manifest: &ExportManifest,
+    transport: &ObjectStoreTransport,
+) {
+    // Tamper with the largest payload file (most likely to hold real data).
+    let victim = manifest
+        .files
+        .iter()
+        .max_by_key(|f| f.size)
+        .expect("at least one payload file");
+    let victim_path = artifact.join(&victim.path);
+    let mut bytes = std::fs::read(&victim_path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&victim_path, &bytes).unwrap();
+
+    // upload() validates only the manifest, so the tampered payload ships.
+    transport.upload("tampered", artifact).await.unwrap();
+}
+
+#[cfg(feature = "fjall")]
+mod fjall_remote {
+    use super::*;
+    use slipstream::snapshot::SnapshotStore;
+    use slipstream::{FjallConfig, FjallSnapshot};
+
+    /// `import_remote` re-verifies every payload hash: a tampered artifact
+    /// shipped through the (untrusted) transport is rejected, nothing lands at
+    /// the destination, and the downloaded copy is cleaned from scratch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fjall_import_remote_rejects_tampered_artifact() {
+        let (transport, _bucket) = local_transport();
+        let dir = TempDir::new().unwrap();
+        let cfg = FjallConfig {
+            sync: false,
+            ..Default::default()
+        };
+
+        let (_r, mut fold) = FjallSnapshot::open(&dir.path().join("fold"), cfg).unwrap();
+        fold.apply(
+            &[put("a", b"1", 1), put("b", b"2", 2), put("c", b"3", 3)],
+            &WatchCursor::from_u64(3),
+        )
+        .unwrap();
+        let artifact = dir.path().join("artifact");
+        let manifest = fold.export_to(&artifact).unwrap();
+        assert_import_remote_rejects_tampered(&artifact, &manifest, &transport).await;
+
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let dest = dir.path().join("imported");
+        match FjallSnapshot::import_remote(&transport, "tampered", &scratch, &dest, cfg).await {
+            Err(SnapshotError::ArtifactInvalid(_)) => {}
+            Err(other) => panic!("expected ArtifactInvalid, got {other:?}"),
+            Ok(_) => panic!("tampered artifact must not import"),
+        }
+        assert!(!dest.exists(), "nothing lands at the destination");
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "downloaded artifact cleaned from scratch"
+        );
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+mod rocksdb_remote {
+    use super::*;
+    use slipstream::snapshot::SnapshotStore;
+    use slipstream::{RocksDbConfig, RocksDbSnapshot};
+
+    /// RocksDB twin of the fjall test above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rocksdb_import_remote_rejects_tampered_artifact() {
+        let (transport, _bucket) = local_transport();
+        let dir = TempDir::new().unwrap();
+        let cfg = RocksDbConfig {
+            sync: false,
+            ..Default::default()
+        };
+
+        let (_r, mut fold) = RocksDbSnapshot::open(&dir.path().join("fold"), cfg).unwrap();
+        fold.apply(
+            &[put("a", b"1", 1), put("b", b"2", 2), put("c", b"3", 3)],
+            &WatchCursor::from_u64(3),
+        )
+        .unwrap();
+        let artifact = dir.path().join("artifact");
+        let manifest = fold.export_to(&artifact).unwrap();
+        assert_import_remote_rejects_tampered(&artifact, &manifest, &transport).await;
+
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let dest = dir.path().join("imported");
+        match RocksDbSnapshot::import_remote(&transport, "tampered", &scratch, &dest, cfg).await {
+            Err(SnapshotError::ArtifactInvalid(_)) => {}
+            Err(other) => panic!("expected ArtifactInvalid, got {other:?}"),
+            Ok(_) => panic!("tampered artifact must not import"),
+        }
+        assert!(!dest.exists(), "nothing lands at the destination");
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "downloaded artifact cleaned from scratch"
+        );
+    }
 }

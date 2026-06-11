@@ -82,6 +82,7 @@ fn spawn_node<S: SnapshotStore + Send + 'static>(
         watcher,
         WatchScope::All,
         resume,
+        None, // reader: cursor-expired resync not exercised here
         Some(fold),
         Some(ex_rx),
         BatchConfig::default(),

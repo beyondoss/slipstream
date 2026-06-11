@@ -124,6 +124,17 @@ pub async fn nats_connect(
     opts.connect(dial_url).await
 }
 
+/// Render an untrusted server payload for logging: borrowed as-is when valid
+/// UTF-8, lowercase hex otherwise. `from_utf8_lossy` would mash every invalid
+/// byte into U+FFFD — exactly the bytes an incident needs to see — so the
+/// fallback preserves them losslessly instead.
+fn payload_for_log(payload: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(payload) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => std::borrow::Cow::Owned(format!("0x{}", crate::artifact::hex_encode(payload))),
+    }
+}
+
 /// Configuration for NATS connection.
 ///
 /// `Debug` is hand-written, not derived: `creds` holds decoded credential
@@ -205,8 +216,7 @@ pub(crate) async fn create_kv_bucket_raw(
         .await
         .map_err(|e| KvError::ConnectionFailed(format!("failed to send create request: {}", e)))?;
 
-    let response_str = String::from_utf8_lossy(&response.payload);
-    debug!(bucket, response = %response_str, "raw JetStream response");
+    debug!(bucket, response = %payload_for_log(&response.payload), "raw JetStream response");
 
     match classify_raw_create_response(&response.payload) {
         RawCreateOutcome::AlreadyExists => {
@@ -259,7 +269,7 @@ fn classify_raw_create_response(payload: &[u8]) -> RawCreateOutcome {
     // Do not remove that re-verify without making this path return `Failed`.
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(payload) else {
         warn!(
-            response = %String::from_utf8_lossy(payload),
+            response = %payload_for_log(payload),
             "unparseable STREAM.CREATE response; assuming created (caller re-verifies via get_key_value)"
         );
         return RawCreateOutcome::Created;
@@ -657,6 +667,9 @@ impl KvStore for NatsKvStore {
     fn watcher(&self) -> Option<Arc<dyn KvWatcher>> {
         Some(Arc::new(NatsKvWatcher {
             kv: self.kv.clone(),
+            client: self.client.clone(),
+            js: self.js.clone(),
+            bucket: self.name.clone(),
         }))
     }
 
@@ -1004,34 +1017,89 @@ async fn stream_watch(
 /// If these messages ever change, `cursor_expired_matches_known_nats_error_strings`
 /// is the canary that fails loudly on the next dependency bump.
 fn is_cursor_expired_error(err: &str) -> bool {
-    // Case-insensitive substring match without allocating a lowercased copy of
-    // the (cold-path) error string. The needles are already lowercase.
-    const NEEDLES: [&str; 4] = [
-        "start sequence",
-        "first sequence",
-        "sequence not found",
-        "too old",
-    ];
-    let haystack = err.as_bytes();
-    NEEDLES.iter().any(|needle| {
-        let n = needle.as_bytes();
-        haystack.len() >= n.len() && haystack.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
-    })
+    use std::sync::OnceLock;
+    // One Aho-Corasick automaton over all needles: a single pass over the error
+    // string regardless of how many needles accumulate as NATS versions reword
+    // their messages, vs. one `windows()` scan per needle. Case-insensitivity is
+    // baked into the automaton, so no lowercased copy is allocated either.
+    static MATCHER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    MATCHER
+        .get_or_init(|| {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([
+                    "start sequence",
+                    "first sequence",
+                    "sequence not found",
+                    "too old",
+                ])
+                .expect("static needle set always compiles")
+        })
+        .is_match(err)
 }
 
 struct NatsKvWatcher {
     kv: Store,
+    // `watch_prefixes_from` has no async-nats equivalent (there is no
+    // `watch_many_from_revision`), so it hand-builds the multi-filter ordered
+    // consumer itself — which needs the raw client (inbox allocation), the
+    // JetStream context (stream lookup), and the bucket name (subject filters),
+    // same as the reader's scan path.
+    client: async_nats::Client,
+    js: async_nats::jetstream::Context,
+    bucket: String,
+}
+
+/// Decode a raw KV stream message (as delivered by a hand-built ordered push
+/// consumer) into a [`KvUpdate`] — the same mapping `async-nats`'s `kv::Watch`
+/// performs internally for the `watch_*` paths: key from the subject (stripping
+/// the `$KV.{bucket}.` prefix), operation from the `KV-Operation` header
+/// (absent = Put), revision from the stream sequence in the ACK reply subject.
+///
+/// Returns `None` for a subject outside the bucket's keyspace, which a
+/// subject-filtered consumer should never deliver — skipped rather than
+/// surfaced, matching `kv::Watch`'s behavior.
+fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<KvUpdate> {
+    let key = msg.subject.strip_prefix(kv_prefix)?.to_string();
+    let revision = msg
+        .reply
+        .as_deref()
+        .and_then(stream_sequence_from_ack)
+        .unwrap_or(0);
+    let version = VersionToken::from_u64(revision);
+    let operation = msg
+        .headers
+        .as_ref()
+        .and_then(|h| h.get("KV-Operation"))
+        .map(|v| v.as_str());
+    Some(match operation {
+        Some("DEL") => KvUpdate::Delete { key, version },
+        Some("PURGE") => KvUpdate::Purge { key, version },
+        // No header (or an explicit "PUT") is a put — the common case carries
+        // no KV-Operation header at all.
+        _ => KvUpdate::Put(KvEntry {
+            key,
+            value: msg.payload.to_vec(),
+            version,
+        }),
+    })
 }
 
 #[async_trait]
 impl KvWatcher for NatsKvWatcher {
     async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError> {
+        // `watch_with_history` (DeliverPolicy::LastPerSubject), NOT `watch_all`
+        // (DeliverPolicy::New): the trait contract is state-sync — current value
+        // of every key first, then live updates. async-nats's `watch_all` only
+        // delivers messages published AFTER the consumer exists, which would
+        // leave a no-cursor consumer empty until keys happen to change.
+        //
         // Bound the watch *setup* with `timed()` for the same reason every KV op
         // is bounded: a half-dead (CLOSE_WAIT) NATS connection parks this await
         // forever instead of failing. The streaming drain in `stream_watch` is
         // intentionally unbounded (a watch is long-lived), but establishing it
         // must not be able to hang a reconnecting caller.
-        let watcher = timed(self.kv.watch_all())
+        let watcher = timed(self.kv.watch_with_history(">"))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
         stream_watch(watcher, &tx).await
@@ -1040,8 +1108,9 @@ impl KvWatcher for NatsKvWatcher {
     async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError> {
         // Use native NATS subject-based filtering. KV key "node.abc" maps to
         // subject "$KV.BUCKET.node.abc", and ">" is the multi-level wildcard.
+        // `_with_history` for the same state-sync contract as `watch_all`.
         let nats_key = format!("{prefix}>");
-        let watcher = timed(self.kv.watch(&nats_key))
+        let watcher = timed(self.kv.watch_with_history(&nats_key))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
         stream_watch(watcher, &tx).await
@@ -1055,13 +1124,14 @@ impl KvWatcher for NatsKvWatcher {
             return Ok(());
         }
         // ONE multi-filter consumer for every prefix (NATS 2.10 `filter_subjects`)
-        // rather than one consumer per prefix. `watch_many` builds a single ordered
-        // push consumer with `filter_subjects = [{p}> ...]` and yields the same
-        // `Entry` stream as `watch`, so `stream_watch` is reused verbatim. This is
-        // the per-stream-consumer-count fix: a node scoped to N prefixes costs 1
-        // consumer, not N.
+        // rather than one consumer per prefix. `watch_many_with_history` builds a
+        // single ordered push consumer with `filter_subjects = [{p}> ...]` and
+        // yields the same `Entry` stream as `watch`, so `stream_watch` is reused
+        // verbatim. This is the per-stream-consumer-count fix: a node scoped to N
+        // prefixes costs 1 consumer, not N. `_with_history` for the same
+        // state-sync contract as `watch_all`.
         let keys: Vec<String> = prefixes.iter().map(|p| format!("{p}>")).collect();
-        let watcher = timed(self.kv.watch_many(keys))
+        let watcher = timed(self.kv.watch_many_with_history(keys))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
         stream_watch(watcher, &tx).await
@@ -1119,6 +1189,100 @@ impl KvWatcher for NatsKvWatcher {
 
         info!(revision, prefix, "resumed prefix watch from cursor");
         stream_watch(watcher, &tx).await
+    }
+
+    async fn watch_prefixes_from(
+        &self,
+        prefixes: &[&str],
+        cursor: &WatchCursor,
+        tx: Sender<KvUpdate>,
+    ) -> Result<(), KvError> {
+        use async_nats::jetstream::consumer::{DeliverPolicy, ReplayPolicy, push};
+
+        if prefixes.is_empty() {
+            // Same guard as watch_prefixes: an empty filter set must not become
+            // an unfiltered whole-bucket consumer.
+            return Ok(());
+        }
+        let revision = match cursor.as_u64() {
+            Some(rev) if rev > 0 => rev,
+            _ => return self.watch_prefixes(prefixes, tx).await,
+        };
+
+        // async-nats has `watch_many` (multi-filter) and `watch_from_revision`
+        // (seek) but no combination of the two, so build the multi-filter
+        // ordered push consumer ourselves — the exact consumer
+        // `watch_many_with_deliver_policy` would build, with
+        // `ByStartSequence(cursor+1)` for the delta seek. The ordered-consumer
+        // machinery (gap detection, auto-recreate from the last delivered
+        // sequence) comes with `OrderedConfig` for free.
+        let bucket = self.bucket.as_str();
+        let kv_prefix = format!("$KV.{bucket}.");
+        let filter_subjects: Vec<String> = prefixes
+            .iter()
+            .map(|p| format!("{kv_prefix}{p}>"))
+            .collect();
+
+        let stream = timed(self.js.get_stream(format!("KV_{bucket}")))
+            .await?
+            .map_err(|e| KvError::WatchError(format!("get KV stream: {e}")))?;
+
+        let consumer = match timed(stream.create_consumer(push::OrderedConfig {
+            deliver_subject: self.client.new_inbox(),
+            description: Some("kv multi-prefix resume consumer".to_string()),
+            filter_subjects,
+            replay_policy: ReplayPolicy::Instant,
+            deliver_policy: DeliverPolicy::ByStartSequence {
+                start_sequence: revision + 1,
+            },
+            ..Default::default()
+        }))
+        .await?
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // Same expiry classification as watch_all_from: a start sequence
+                // the stream has compacted past surfaces as a consumer-create
+                // error whose message names the sequence problem.
+                let err_str = e.to_string();
+                if is_cursor_expired_error(&err_str) {
+                    warn!(revision, ?prefixes, error = %err_str, "cursor expired for multi-prefix watch, caller should fall back");
+                    return Err(KvError::CursorExpired);
+                }
+                return Err(KvError::WatchError(err_str));
+            }
+        };
+
+        let mut messages = timed(consumer.messages())
+            .await?
+            .map_err(|e| KvError::WatchError(e.to_string()))?;
+
+        info!(
+            revision,
+            ?prefixes,
+            "resumed multi-prefix watch from cursor"
+        );
+        while let Some(msg) = messages.next().await {
+            match msg {
+                Ok(msg) => {
+                    // A subject-filtered consumer only delivers in-keyspace
+                    // subjects; `None` here would be a server bug, skipped to
+                    // match kv::Watch's tolerance.
+                    let Some(update) = kv_message_to_update(&msg, &kv_prefix) else {
+                        continue;
+                    };
+                    if tx.send(update).await.is_err() {
+                        debug!("watch receiver closed");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "NATS KV multi-prefix watch error");
+                    return Err(KvError::WatchError(e.to_string()));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1206,7 +1370,11 @@ impl std::fmt::Debug for NatsConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NatsConnection")
             .field("url", &self.config.url)
-            .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            // `Acquire` to match every other read of `healthy` — a `Relaxed`
+            // outlier here reads like a deliberate exception during an atomics
+            // audit, and the fmt path is far too cold for the ordering to cost
+            // anything.
+            .field("healthy", &self.healthy.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -1340,6 +1508,78 @@ mod tests {
         assert!(!is_cursor_expired_error("connection refused"));
         assert!(!is_cursor_expired_error("permission denied"));
         assert!(!is_cursor_expired_error("stream not found"));
+    }
+
+    fn raw_kv_msg(
+        subject: &str,
+        reply: Option<&str>,
+        payload: &[u8],
+        op: Option<&str>,
+    ) -> async_nats::Message {
+        let headers = op.map(|op| {
+            let mut h = async_nats::HeaderMap::new();
+            h.insert("KV-Operation", op);
+            h
+        });
+        async_nats::Message {
+            subject: subject.to_string().into(),
+            reply: reply.map(|r| r.to_string().into()),
+            payload: payload.to_vec().into(),
+            headers,
+            status: None,
+            description: None,
+            length: 0,
+        }
+    }
+
+    const ACK_42: &str = "$JS.ACK.KV_certs.cons.1.42.7.1700000000000000000.0";
+
+    #[test]
+    fn kv_message_decodes_put_without_operation_header() {
+        // The common case: a put carries no KV-Operation header at all.
+        let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"v1", None);
+        match kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace") {
+            KvUpdate::Put(e) => {
+                assert_eq!(e.key, "node.a");
+                assert_eq!(e.value, b"v1");
+                assert_eq!(e.version.as_u64(), Some(42));
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_message_decodes_delete_and_purge_markers() {
+        let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", Some("DEL"));
+        assert!(matches!(
+            kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace"),
+            KvUpdate::Delete { ref key, ref version } if key == "node.a" && version.as_u64() == Some(42)
+        ));
+
+        let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", Some("PURGE"));
+        assert!(matches!(
+            kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace"),
+            KvUpdate::Purge { ref key, .. } if key == "node.a"
+        ));
+    }
+
+    #[test]
+    fn kv_message_outside_keyspace_is_skipped() {
+        // A subject-filtered consumer should never deliver this; the decode
+        // skips rather than mis-keys it.
+        let msg = raw_kv_msg("$KV.other.node.a", Some(ACK_42), b"v", None);
+        assert!(kv_message_to_update(&msg, "$KV.certs.").is_none());
+    }
+
+    #[test]
+    fn kv_message_without_reply_gets_revision_zero() {
+        // No ACK reply subject → revision unparseable → 0, the same "unknown
+        // version" convention scan() uses.
+        let msg = raw_kv_msg("$KV.certs.node.a", None, b"v", None);
+        match kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace") {
+            KvUpdate::Put(e) => assert_eq!(e.version.as_u64(), Some(0)),
+            other => panic!("expected Put, got {other:?}"),
+        }
     }
 
     #[test]

@@ -363,7 +363,9 @@ pub trait SnapshotStore: Sized + Send {
     /// Buffers the whole match set into a `Vec`. Convenient for the bounded
     /// prefixes an in-RAM consumer scans, but a broad prefix against an on-disk
     /// fold (the 1B-route case an on-disk backend exists for) materializes every
-    /// match at once — use [`for_each_in_range`](Self::for_each_in_range) there.
+    /// match at once — and an empty `prefix` is an unbounded full scan that
+    /// buffers the *entire* fold. Use
+    /// [`for_each_in_range`](Self::for_each_in_range) for either.
     fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, SnapshotError>;
 
     /// Stream every live entry whose key starts with `prefix`, in ascending key

@@ -123,11 +123,12 @@ async fn wait_until_ready(url: &str) {
 
 /// Deterministically wait until a freshly spawned watch is live.
 ///
-/// NATS KV watches deliver updates only (no initial-state replay), and the
-/// ephemeral consumer takes a moment to attach — so any write issued before the
-/// subscription is established is silently missed. We close that race by writing
-/// `sentinel` (which must fall within the watch's filter) on a retry loop until
-/// the watch echoes it back, then drain any duplicate echoes.
+/// Watches deliver the current state first (the re-list), then live updates —
+/// but the consumer still takes a moment to attach, and a test that writes
+/// before attachment can't tell where its write landed in that order. We make
+/// the timeline deterministic by writing `sentinel` (which must fall within the
+/// watch's filter) on a retry loop until the watch echoes it back, then drain
+/// any buffered re-list entries and duplicate echoes.
 async fn establish_watch(writer: &dyn KvWriter, rx: &mut mpsc::Receiver<KvUpdate>, sentinel: &str) {
     loop {
         writer.put(sentinel, b"ready").await.expect("put sentinel");
@@ -621,6 +622,61 @@ async fn watch_prefixes_unions_on_a_single_consumer() {
     );
 }
 
+/// `watch_prefixes_from` — the hand-built multi-filter ordered consumer — must
+/// deliver exactly the post-cursor writes within the prefix union: delta-only
+/// (no re-list), union-scoped (server-side filtering), in revision order with
+/// correct versions parsed from the ACK subject.
+#[tokio::test]
+async fn watch_prefixes_from_replays_only_the_delta() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("watchmany-from").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    // Baseline state in both watched prefixes, plus the cursor.
+    writer.put("vpcA.a", b"1").await.expect("put A baseline");
+    let cursor_rev = writer.put("vpcB.b", b"2").await.expect("put B baseline");
+    let cursor = WatchCursor::from_u64(cursor_rev.as_u64().expect("u64 rev"));
+
+    // Post-cursor: two in-union writes, one outside the union.
+    writer.put("vpcC.x", b"skip").await.expect("put C"); // filtered
+    writer.put("vpcA.a2", b"3").await.expect("put A delta");
+    writer.put("vpcB.b2", b"4").await.expect("put B delta");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let _ = watcher
+            .watch_prefixes_from(&["vpcA.", "vpcB."], &cursor, tx)
+            .await;
+    });
+
+    // Exactly the two post-cursor in-union writes, in revision order, with
+    // their real revisions — and neither the baseline (no re-list on a delta
+    // resume) nor the out-of-union write.
+    let updates = collect_updates(&mut rx, 2).await;
+    let keys: Vec<&str> = updates.iter().map(|u| u.key()).collect();
+    assert_eq!(
+        keys,
+        vec!["vpcA.a2", "vpcB.b2"],
+        "delta must be exactly the post-cursor in-union writes"
+    );
+    for u in &updates {
+        let rev = u.version().as_u64().expect("u64 revision");
+        assert!(
+            rev > cursor_rev.as_u64().unwrap(),
+            "delivered revision {rev} must be past the cursor"
+        );
+    }
+
+    // The out-of-union key must never arrive (server-side filtered).
+    assert!(
+        timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "a non-watched prefix leaked through watch_prefixes_from"
+    );
+}
+
 #[tokio::test]
 async fn watch_all_from_replays_only_the_delta() {
     let nats = TestNats::start().await;
@@ -676,16 +732,17 @@ async fn watch_prefix_from_replays_only_the_delta() {
     assert!(matches!(&updates[0], KvUpdate::Put(e) if e.key == "node.b"));
 }
 
-/// Demonstrates the seed-then-watch race a snapshot consumer must avoid, and that resuming from the
-/// snapshot revision closes it.
+/// The seed-then-watch race, closed by state-sync watches.
 ///
 /// A consumer that seeds via `scan()` and then subscribes via `watch_prefix()` has a window between
-/// the two calls. `watch_prefix` uses NATS `DeliverPolicy::New` (no initial-state replay), so a
-/// write that lands in that window is in neither the snapshot nor the watch stream — it is silently
-/// lost until the next full reseed. `watch_prefix_from(snapshot_revision)` instead replays
-/// everything after the snapshot, so the gap write is delivered.
+/// the two calls. `watch_prefix` used to ride NATS `DeliverPolicy::New` (live updates only), so a
+/// write landing in that window was in neither the snapshot nor the watch stream — silently lost
+/// until the next full reseed. `watch_prefix` now delivers a state-sync re-list (the current value
+/// of every matching key, in revision order) before live updates, so the gap write is re-delivered
+/// by the re-list itself. `watch_prefix_from(snapshot_revision)` remains the delta-only variant:
+/// everything after the snapshot, nothing before it.
 #[tokio::test]
-async fn seed_then_watch_prefix_loses_writes_in_the_gap() {
+async fn watch_prefix_relist_covers_seed_then_watch_gap() {
     let nats = TestNats::start().await;
     let (_conn, store) = nats.store("seed-race").await;
     let writer = store.writer().expect("writer");
@@ -706,30 +763,35 @@ async fn seed_then_watch_prefix_loses_writes_in_the_gap() {
     // 2) A write lands in the race window: after the scan, before any watch attaches.
     writer.put("blackhole.2", b"fraud").await.expect("put 2");
 
-    // --- The bug: watch_prefix (DeliverPolicy::New) ---
+    // --- watch_prefix: the re-list carries BOTH keys, gap write included ---
     {
         let (tx, mut rx) = mpsc::channel(64);
         let w = watcher.clone();
         tokio::spawn(async move {
             let _ = w.watch_prefix("blackhole.", tx).await;
         });
-        // Handshake until the watch is provably attached and live (drains the sentinel echoes).
-        establish_watch(writer.as_ref(), &mut rx, "blackhole.sentinel").await;
 
-        // The watch is live now, so a *fresh* write is delivered...
+        // No attach handshake needed: the re-list is delivered regardless of
+        // subscription timing, in revision order.
+        let got = collect_updates(&mut rx, 2).await;
+        let keys: Vec<&str> = got.iter().map(|u| u.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["blackhole.1", "blackhole.2"],
+            "watch_prefix's re-list must deliver current state including the gap write"
+        );
+
+        // ...and live updates still flow after the re-list.
         writer.put("blackhole.3", b"spend").await.expect("put 3");
         let got = collect_updates(&mut rx, 1).await;
-        // ...but the first thing we see is blackhole.3, not blackhole.2: the gap write was dropped.
-        // (blackhole.2 has a lower revision; had the watch carried it, it would arrive first.)
         assert!(
             matches!(&got[0], KvUpdate::Put(e) if e.key == "blackhole.3"),
-            "watch_prefix delivered a post-subscribe write but silently dropped the gap write \
-             blackhole.2; got {:?}",
+            "live updates must follow the re-list; got {:?}",
             got[0].key()
         );
     }
 
-    // --- The fix: watch_prefix_from(snapshot revision) ---
+    // --- watch_prefix_from(snapshot revision): delta-only, no re-list ---
     {
         let (tx, mut rx) = mpsc::channel(64);
         let cursor = WatchCursor::from_u64(baseline_rev);
@@ -738,7 +800,7 @@ async fn seed_then_watch_prefix_loses_writes_in_the_gap() {
             let _ = w.watch_prefix_from("blackhole.", &cursor, tx).await;
         });
         // Resuming from the snapshot revision replays everything after it; the first such entry is
-        // exactly the gap write that watch_prefix lost.
+        // exactly the gap write — and NOT blackhole.1, which the snapshot already has.
         let got = collect_updates(&mut rx, 1).await;
         assert!(
             matches!(&got[0], KvUpdate::Put(e) if e.key == "blackhole.2"),
@@ -1227,6 +1289,7 @@ fn spawn_applied(
         watcher,
         WatchScope::All,
         baseline,
+        None, // reader: cursor-expired resync not exercised here
         snapshot,
         None,
         BatchConfig::default(),

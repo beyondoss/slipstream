@@ -121,6 +121,10 @@ use slipstream::{KvUpdate, KvWatcher};
 let watcher = store.watcher().expect("store supports streaming");
 let (tx, mut rx) = tokio::sync::mpsc::channel(128);
 
+// Watches are state-sync streams: the current value of every matching key is
+// delivered first (as puts), then live updates. No separate scan needed — and
+// no scan-to-watch race window.
+//
 // watch_all blocks until the stream ends — run it in a separate task
 tokio::spawn(async move {
     watcher.watch_all(tx).await.unwrap();
@@ -154,7 +158,9 @@ match watcher.watch_all_from(&cursor, tx.clone()).await {
 }
 ```
 
-`watch_prefix_from()` works the same way for prefix-filtered streams.
+`watch_prefix_from()` works the same way for prefix-filtered streams, and
+`watch_prefixes_from()` resumes the union of several prefixes on one
+multi-filter consumer.
 
 ## Snapshot
 
@@ -254,7 +260,10 @@ let (resume, store) = AppendLogSnapshot::load(Path::new("/var/lib/svc/state.snap
 // let (resume, store) = RocksDbSnapshot::open(dir, RocksDbConfig { sync: false, ..Default::default() })?;
 
 let final_cursor = watch_applied(
-    watcher, WatchScope::All, Some(resume), Some(store), BatchConfig::default(),
+    watcher, WatchScope::All, Some(resume),
+    Some(reader),       // arms the cursor-expired stale-key resync; None to skip
+    Some(store), None,  // store; export-request channel
+    BatchConfig::default(),
     parse, apply, on_applied, shutdown,
 ).await?;
 ```
@@ -270,9 +279,12 @@ use slipstream::{watch_applied, AppendLogSnapshot, BatchConfig, KvUpdate, WatchC
 
 let final_cursor = watch_applied(
     watcher,
-    WatchScope::All,                  // or WatchScope::Prefix("node.".into())
+    WatchScope::All,                  // or Prefix("node.".into()) / Prefixes(vec![...])
     Some(resume),                     // Option<WatchCursor> — resume here, or None
+    Some(reader),                     // Option<Arc<dyn KvReader>> — arms the
+                                      //   cursor-expired stale-key resync, or None
     Some(store),                      // any SnapshotStore (e.g. AppendLogSnapshot), or None
+    None,                             // Option<mpsc::Receiver<ExportRequest>> — live exports
     BatchConfig::default(),           // 10ms window, 100 updates per batch
     |update: &KvUpdate| parse(update),        // KvUpdate -> Option<U>; None just drops it
     |batch: Vec<U>| cache.apply_batch(batch), // your only domain logic
@@ -286,7 +298,7 @@ A batch closes when `window` elapses or it hits `max` updates, whichever comes f
 Persist the cursor on receipt instead and a crash between receive and apply loses data: the cursor reads "caught up to rev N" while rev N sits in an unapplied buffer, and the next resume starts past it. `watch_applied` checkpoints at the applied cursor, so a persisted cursor always means every update up to it has been applied.
 
 - `parse` returning `None` (corrupt bytes, irrelevant key) still advances the cursor — nothing to apply means nothing to skip.
-- On `CursorExpired`, it falls back to a full watch automatically.
+- On `CursorExpired`, it falls back to a full watch automatically. With a `reader` wired, it first diffs the fold against the bucket's live keys and applies synthetic deletes for keys that vanished during the gap (their delete markers were evicted with the cursor) — the one case the fallback re-list can't cover.
 - It returns the final applied cursor on shutdown or stream close.
 
 `apply` runs inline. If it panics, the panic aborts the watch.
@@ -301,6 +313,7 @@ Persist the cursor on receipt instead and a crash between receive and apply lose
 | `delete()`        | Writes empty value (soft delete). Always returns `Ok(true)`      |
 | `KvUpdate::Purge` | Hard delete: all history removed from stream                     |
 | `scan()`          | `DeliverPolicy::LastPerSubject`: one entry per key, one consumer |
+| `watch_*()`       | `DeliverPolicy::LastPerSubject`: current state, then live updates |
 | `watch_prefix()`  | Native NATS subject filter (`{prefix}>` wildcard)                |
 
 ## Feature detection

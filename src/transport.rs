@@ -33,7 +33,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::applied::ExportRequest;
-use crate::artifact::{ExportManifest, MANIFEST_FILE, check_dest_available, manifest_from_slice};
+use crate::artifact::{
+    ExportManifest, MANIFEST_FILE, check_dest_available, manifest_from_slice, rename_into_place,
+};
 use crate::export_lease::ExportLease;
 use crate::kv::WatchCursor;
 use crate::snapshot::SnapshotError;
@@ -45,6 +47,40 @@ const CHUNK: usize = 8 << 20;
 /// Concurrent in-flight multipart parts (bounds upload memory to
 /// `CHUNK × MAX_CONCURRENT_PARTS`).
 const MAX_CONCURRENT_PARTS: usize = 8;
+
+/// Cap on a sibling-manifest object's size. The transport is untrusted, and a
+/// manifest read buffers the whole object — without a cap, a hostile or
+/// corrupted object at the manifest key is an OOM vector. Real manifests are
+/// a few KB per payload file; 1 MiB is orders of magnitude of headroom.
+const MAX_MANIFEST_BYTES: usize = 1 << 20;
+
+/// Per-await timeout on every object-store operation (each request, chunk, or
+/// part — not the whole transfer, which is legitimately unbounded for large
+/// artifacts). A half-dead TCP connection otherwise parks the `await` forever;
+/// same hazard and same 30 s bound as the NATS layer's `timed()`.
+const OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound one object-store await by `limit`.
+async fn timed_by<T>(
+    what: &str,
+    limit: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, SnapshotError> {
+    tokio::time::timeout(limit, fut).await.map_err(|_| {
+        SnapshotError::Backend(format!(
+            "object store: {what} timed out after {}s",
+            limit.as_secs()
+        ))
+    })
+}
+
+/// Bound one object-store await by [`OP_TIMEOUT`].
+async fn timed<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, SnapshotError> {
+    timed_by(what, OP_TIMEOUT, fut).await
+}
 
 /// Ship artifacts to durable storage and fetch them back. See the module docs
 /// for the wire format.
@@ -117,6 +153,25 @@ impl ObjectStoreTransport {
     fn manifest_path(&self, key: &str) -> ObjPath {
         ObjPath::from(format!("{}/{key}.manifest.json", self.prefix))
     }
+
+    /// Fetch the sibling manifest object, enforcing [`MAX_MANIFEST_BYTES`].
+    async fn fetch_manifest_bytes(&self, key: &str) -> Result<Vec<u8>, SnapshotError> {
+        let mut stream = timed("manifest get", self.store.get(&self.manifest_path(key)))
+            .await?
+            .map_err(map_obj)?
+            .into_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = timed("manifest read", stream.next()).await? {
+            let chunk = chunk.map_err(map_obj)?;
+            if buf.len() + chunk.len() > MAX_MANIFEST_BYTES {
+                return Err(SnapshotError::ArtifactInvalid(format!(
+                    "remote manifest for {key:?} exceeds {MAX_MANIFEST_BYTES} bytes"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
 }
 
 #[async_trait]
@@ -133,11 +188,23 @@ impl ArtifactTransport for ObjectStoreTransport {
         // Tar the artifact into a temp file on a blocking task. A temp file
         // (rather than streaming the tar straight into the upload) keeps the
         // blocking tar writer and the async multipart writer decoupled; the
-        // disk cost is one tar's worth, transient.
+        // disk cost is one tar's worth, transient. Staged BESIDE the artifact,
+        // not in the system temp dir — /tmp is often a size-bounded tmpfs that
+        // a multi-GB artifact tar would exhaust.
         let src = artifact_dir.to_path_buf();
+        let tar_parent = artifact_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                SnapshotError::ArtifactInvalid(format!(
+                    "artifact {} has no parent directory to stage the tar in",
+                    artifact_dir.display()
+                ))
+            })?
+            .to_path_buf();
         let tar_file = tokio::task::spawn_blocking(
             move || -> Result<tempfile::NamedTempFile, SnapshotError> {
-                let tmp = tempfile::NamedTempFile::new()?;
+                let tmp = tempfile::NamedTempFile::new_in(&tar_parent)?;
                 let mut builder = tar::Builder::new(std::io::BufWriter::new(tmp.reopen()?));
                 builder.append_dir_all(".", &src)?;
                 builder
@@ -154,11 +221,12 @@ impl ArtifactTransport for ObjectStoreTransport {
         let mut file = tokio::fs::File::open(tar_file.path())
             .await
             .map_err(SnapshotError::Io)?;
-        let upload = self
-            .store
-            .put_multipart(&self.payload_path(key))
-            .await
-            .map_err(map_obj)?;
+        let upload = timed(
+            "multipart create",
+            self.store.put_multipart(&self.payload_path(key)),
+        )
+        .await?
+        .map_err(map_obj)?;
         let mut wm = WriteMultipart::new_with_chunk_size(upload, CHUNK);
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -167,30 +235,35 @@ impl ArtifactTransport for ObjectStoreTransport {
             if n == 0 {
                 break;
             }
-            wm.wait_for_capacity(MAX_CONCURRENT_PARTS)
-                .await
+            timed("part upload", wm.wait_for_capacity(MAX_CONCURRENT_PARTS))
+                .await?
                 .map_err(map_obj)?;
             wm.write(&buf[..n]);
         }
-        wm.finish().await.map_err(map_obj)?;
+        // finish() drains every in-flight part (up to MAX_CONCURRENT_PARTS ×
+        // CHUNK bytes) plus the completion request, so it gets a proportionally
+        // larger stall bound than a single-request await.
+        timed_by(
+            "multipart finish",
+            OP_TIMEOUT * MAX_CONCURRENT_PARTS as u32,
+            wm.finish(),
+        )
+        .await?
+        .map_err(map_obj)?;
 
         // Manifest sibling LAST: its presence marks the payload complete.
-        self.store
-            .put(&self.manifest_path(key), PutPayload::from(manifest_bytes))
-            .await
-            .map_err(map_obj)?;
+        timed(
+            "manifest put",
+            self.store
+                .put(&self.manifest_path(key), PutPayload::from(manifest_bytes)),
+        )
+        .await?
+        .map_err(map_obj)?;
         Ok(())
     }
 
     async fn manifest(&self, key: &str) -> Result<ExportManifest, SnapshotError> {
-        let bytes = self
-            .store
-            .get(&self.manifest_path(key))
-            .await
-            .map_err(map_obj)?
-            .bytes()
-            .await
-            .map_err(map_obj)?;
+        let bytes = self.fetch_manifest_bytes(key).await?;
         manifest_from_slice(&bytes)
     }
 
@@ -208,14 +281,7 @@ impl ArtifactTransport for ObjectStoreTransport {
 
         // Sibling manifest first — it is the completeness marker and the value
         // we cross-check the tar against.
-        let sibling = self
-            .store
-            .get(&self.manifest_path(key))
-            .await
-            .map_err(map_obj)?
-            .bytes()
-            .await
-            .map_err(map_obj)?;
+        let sibling = self.fetch_manifest_bytes(key).await?;
         let manifest = manifest_from_slice(&sibling)?;
 
         // Stream the tar to a temp file.
@@ -223,13 +289,11 @@ impl ArtifactTransport for ObjectStoreTransport {
         let mut tar_writer = tokio::fs::File::create(tar_tmp.path())
             .await
             .map_err(SnapshotError::Io)?;
-        let mut stream = self
-            .store
-            .get(&self.payload_path(key))
-            .await
+        let mut stream = timed("payload get", self.store.get(&self.payload_path(key)))
+            .await?
             .map_err(map_obj)?
             .into_stream();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = timed("payload read", stream.next()).await? {
             let chunk = chunk.map_err(map_obj)?;
             tar_writer
                 .write_all(&chunk)
@@ -250,6 +314,11 @@ impl ArtifactTransport for ObjectStoreTransport {
                 .tempdir_in(&parent)?;
             let file = std::fs::File::open(tar_tmp.path())?;
             let mut archive = tar::Archive::new(std::io::BufReader::new(file));
+            // The tar came from an untrusted transport: never adopt its mode
+            // bits (a crafted archive could plant world-writable or setuid
+            // entries) or mtimes — content is what import verifies.
+            archive.set_preserve_permissions(false);
+            archive.set_preserve_mtime(false);
             // tar's unpack refuses entries that escape the destination, on top
             // of the manifest path validation import performs again.
             archive.unpack(stage.path())?;
@@ -259,18 +328,15 @@ impl ArtifactTransport for ObjectStoreTransport {
                     "downloaded artifact tar has no embedded manifest".into(),
                 )
             })?;
-            if embedded != sibling.as_ref() {
+            if embedded != sibling {
                 return Err(SnapshotError::ArtifactInvalid(
                     "embedded manifest disagrees with the sibling manifest object".into(),
                 ));
             }
 
             check_dest_available(&dest)?;
-            if dest.is_dir() {
-                std::fs::remove_dir(&dest)?;
-            }
             let root = stage.keep();
-            std::fs::rename(&root, &dest)?;
+            rename_into_place(&root, &dest)?;
             Ok(())
         })
         .await

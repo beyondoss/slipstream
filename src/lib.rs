@@ -22,6 +22,7 @@
 //! ```
 
 #![deny(unsafe_code)]
+#![deny(unused_must_use)]
 
 mod applied;
 mod artifact;

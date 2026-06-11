@@ -124,8 +124,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beyond-slipstream"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "aho-corasick",
  "async-nats",
  "async-trait",
  "base64",

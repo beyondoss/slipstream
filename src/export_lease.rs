@@ -82,6 +82,10 @@ pub struct LeaseGuard {
     key: String,
     record: LeaseRecord,
     version: VersionToken,
+    /// Set by [`complete`](Self::complete) / [`abandon`](Self::abandon). A
+    /// guard dropped without either (early `?`, cancelled future) leaks the
+    /// round — the fleet waits out the ttl — so [`Drop`] logs it.
+    resolved: bool,
 }
 
 impl ExportLease {
@@ -168,10 +172,19 @@ impl ExportLease {
     }
 
     /// Read the current lease record, if any — the fleet-visible "last export"
-    /// state. `None` when no round has ever run (or the key was tombstoned).
+    /// state. `None` when no round has ever run (or the key was tombstoned);
+    /// [`KvError::SerializationError`] when the key holds unparseable bytes —
+    /// distinct from `None` so an operator can see "present but corrupt" (a
+    /// state [`try_acquire`](Self::try_acquire) will repair by takeover) rather
+    /// than a false "never ran".
     pub async fn current(&self) -> Result<Option<LeaseRecord>, KvError> {
         match self.reader.get(&self.key).await? {
-            Some(entry) => Ok(serde_json::from_slice(&entry.value).ok()),
+            Some(entry) => serde_json::from_slice(&entry.value).map(Some).map_err(|e| {
+                KvError::SerializationError(format!(
+                    "lease key {:?} holds an unparseable value: {e}",
+                    self.key
+                ))
+            }),
             None => Ok(None),
         }
     }
@@ -182,6 +195,7 @@ impl ExportLease {
             key: self.key.clone(),
             record,
             version,
+            resolved: false,
         }
     }
 }
@@ -200,7 +214,8 @@ impl LeaseGuard {
     /// Best-effort: a CAS conflict (someone already took over) or write error
     /// is logged, not surfaced — worst case the round waits out its ttl, which
     /// is the no-abandon behavior anyway.
-    pub async fn abandon(self) {
+    pub async fn abandon(mut self) {
+        self.resolved = true;
         match self
             .writer
             .delete_with_version(&self.key, &self.version)
@@ -228,6 +243,7 @@ impl LeaseGuard {
     /// taken over (this round overran its ttl) and is logged, not surfaced —
     /// the artifact is already safe wherever the caller put it.
     pub async fn complete(mut self, cursor: &WatchCursor) -> Result<(), KvError> {
+        self.resolved = true;
         self.record.completed_cursor_hex = Some(hex_encode(cursor.version().as_bytes()));
         self.record.completed_at_unix = Some(unix_now());
         let bytes = serde_json::to_vec(&self.record)
@@ -247,9 +263,33 @@ impl LeaseGuard {
     }
 }
 
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if !self.resolved {
+            warn!(
+                key = %self.key,
+                holder = %self.record.holder_id,
+                "LeaseGuard dropped without complete() or abandon(); the fleet waits out the lease ttl"
+            );
+        }
+    }
+}
+
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            // A pre-epoch clock means every lease this node writes is already
+            // expired (`expires_at = 0 + ttl` is in the past), so any node can
+            // steal it — duplicate exports every round, which the lease design
+            // tolerates (dedup, not correctness). That direction is deliberate:
+            // the alternative sentinel (`u64::MAX`) would mint a never-expiring
+            // lease that wedges the fleet until manual cleanup. But it must not
+            // be silent — duplicate artifacts with no log line is undebuggable.
+            warn!(
+                "system clock predates the Unix epoch; lease expiry math degraded (expect duplicate export rounds until the clock is fixed)"
+            );
+            0
+        }
+    }
 }

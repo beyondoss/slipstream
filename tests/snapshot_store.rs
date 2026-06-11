@@ -526,6 +526,34 @@ fn check_import_rejects_undeclared_extra_file<S: SnapshotStore>(
     assert!(!dest.exists());
 }
 
+/// A symlink planted in the payload is rejected — it would hash as its
+/// target's bytes but restore as a link (or escape the staging area entirely),
+/// the tar-archive twin of zip-slip. The manifest path validation can't catch
+/// it (the path looks normal); the non-regular-file check must.
+#[cfg(unix)]
+fn check_import_rejects_symlink_in_payload<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _manifest, dir) = exported_stream_artifact(&open);
+    let target = dir.path().join("outside");
+    std::fs::write(&target, b"outside the artifact").unwrap();
+    std::os::unix::fs::symlink(&target, artifact.join("data").join("escape")).unwrap();
+
+    let dest = dir.path().join("imported");
+    match import(&artifact, &dest) {
+        Err(SnapshotError::ArtifactInvalid(msg)) => {
+            assert!(
+                msg.contains("non-regular"),
+                "rejection names the link: {msg}"
+            );
+        }
+        Err(other) => panic!("expected ArtifactInvalid, got {other:?}"),
+        Ok(_) => panic!("artifact with a payload symlink must not import"),
+    }
+    assert!(!dest.exists(), "nothing lands at the destination");
+}
+
 /// Rewrite one top-level manifest field (checksums untouched) and re-import.
 fn with_doctored_manifest(artifact: &Path, field: &str, value: serde_json::Value) {
     let raw = std::fs::read(artifact.join(MANIFEST_FILE)).unwrap();
@@ -742,6 +770,12 @@ fn append_log_import_rejects_undeclared_extra_file() {
     check_import_rejects_undeclared_extra_file(open_append_log, import_append_log);
 }
 
+#[cfg(unix)]
+#[test]
+fn append_log_import_rejects_symlink_in_payload() {
+    check_import_rejects_symlink_in_payload(open_append_log, import_append_log);
+}
+
 #[test]
 fn append_log_import_rejects_wrong_backend() {
     check_import_rejects_wrong_backend(open_append_log, import_append_log);
@@ -895,6 +929,12 @@ mod fjall_backend {
     #[test]
     fn fjall_import_rejects_undeclared_extra_file() {
         check_import_rejects_undeclared_extra_file(open_no_sync, import_fjall);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fjall_import_rejects_symlink_in_payload() {
+        check_import_rejects_symlink_in_payload(open_no_sync, import_fjall);
     }
 
     #[test]
@@ -1107,6 +1147,12 @@ mod rocksdb_backend {
     #[test]
     fn rocksdb_import_rejects_undeclared_extra_file() {
         check_import_rejects_undeclared_extra_file(open_no_sync, import_rocksdb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rocksdb_import_rejects_symlink_in_payload() {
+        check_import_rejects_symlink_in_payload(open_no_sync, import_rocksdb);
     }
 
     #[test]

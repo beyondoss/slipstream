@@ -15,8 +15,10 @@ Disk ──► load(path) ──► replay_log() ──► HashMap<key, KvEntry>
                                              /              \
                                            Yes               No
                                             │                 │
-                              watch_all(tx) + stale_keys()   delta stream
-                                            └───────┬─────────┘
+                            stale-key resync (synthetic      delta stream
+                            deletes) + watch_all(tx)              │
+                            (state-sync re-list)                  │
+                                            └───────┬─────────────┘
                                                     │
                                    KvUpdate → cache.apply() + snap.write_update()
                                                     │
@@ -54,6 +56,8 @@ watch_all_from(cursor, tx)
                    delta stream          caller falls back to watch_all(tx)
 ```
 
+Every non-`_from` watch is a **state-sync** stream (NATS `DeliverPolicy::LastPerSubject`): the current value of every matching key is delivered first — the re-list — then live updates. A no-cursor consumer therefore converges on full bucket state from the watch alone, with no separate scan and no scan-to-watch race window. The `_from` variants skip the re-list and deliver only the delta.
+
 ## Concepts & Terminology
 
 | Term                     | Definition                                                           | NOT                                              |
@@ -73,7 +77,8 @@ watch_all_from(cursor, tx)
 | `AppendLogSnapshot`      | Default `SnapshotStore`: append-only log + in-RAM fold (pure-Rust)   | Not for folds larger than RAM                     |
 | `FjallSnapshot`          | On-disk `SnapshotStore` (fjall LSM, `feature = "fjall"`) for large folds | Not in the pure-Rust core; opt-in feature        |
 | `RocksDbSnapshot`        | On-disk `SnapshotStore` (RocksDB, `feature = "rocksdb"`) for large folds | Not pure-Rust; opt-in feature with a C++ build dep |
-| `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore` | Not a raw watch; the cursor follows `apply`, not receipt |
+| `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore`; resyncs stale keys on cursor expiry | Not a raw watch; the cursor follows `apply`, not receipt |
+| `WatchScope`             | What `watch_applied` watches: `All`, `Prefix`, or `Prefixes` (multi-filter union) | Not N consumers; `Prefixes` costs one consumer    |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, …)        | Not enforced; purely advisory                    |
 
 ## Layer Architecture
@@ -113,7 +118,7 @@ watch_all_from(cursor, tx)
 
 The cursor is the NATS stream sequence number at the last checkpoint. On restart, pass it to `watch_all_from()` to subscribe at `cursor+1` — only the delta arrives, not the full history.
 
-When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The caller falls back to `watch_all()` and should call `Snapshot::stale_keys()` to emit synthetic `Delete` events for keys that disappeared during the gap:
+When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The fallback `watch_all()` re-list re-delivers the current value of every live key, but it cannot cover keys **deleted during the gap whose delete markers were also evicted** — those need synthetic `Delete` events diffed from prior state. `watch_applied` does this automatically when given a reader (see below). A raw-API caller hand-rolls the same diff with `Snapshot::stale_keys()`:
 
 ```rust
 match watcher.watch_all_from(&snap.cursor, tx).await {
@@ -147,7 +152,9 @@ This is the lesson of Saltzer, Reed & Clark, *End-to-End Arguments in System Des
 
 **Snapshot consistency.** Raw `KvUpdate`s stream to the snapshot log as they arrive, but the *checkpoint* cursor is the post-apply cursor. A crash after a raw record is written but before its `apply`/checkpoint leaves the log holding data *ahead* of its cursor — which is safe: the cursor never names a revision whose `apply` had not returned, so resume re-delivers and re-applies that tail rather than skipping it. Compaction runs off the hot path via `spawn_blocking`, as everywhere else in the snapshot subsystem.
 
-**Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning). On `CursorExpired` from the resume path the combinator logs and falls back to the full-scope watch (`watch_all` / `watch_prefix`); v1 replays the full re-list as a stream of puts (a deeper "resync" signal that diffs against prior state is a documented TODO).
+**Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning).
+
+**Cursor-expired resync.** On `CursorExpired` from the resume path the combinator falls back to the full-scope watch (`watch_all` / `watch_prefix` / `watch_prefixes`), whose state-sync re-list re-delivers every live key as puts. The re-list cannot cover keys deleted during the gap whose markers were evicted with the cursor, so — when the combinator is given a `KvReader` and a store — it closes that hole first: the watch task lists the bucket's live keys, hands them to the main loop, and waits for an ack; the main loop flushes, diffs the fold's in-scope keys against the listing, and runs a synthetic `KvUpdate::Delete` (unknown version — never advances the cursor) through `parse`/`apply`/store for each key that vanished; only then does the fallback watch start. That ack ordering is the invariant: a synthetic delete always precedes the re-list put for the same key, so delete-then-recreate during the gap converges. Without a reader the fallback is re-list-only and logs the possible stale keys.
 
 This is the layer the tunnel router (swap route table) and edge origin watcher (rebuild hashrings) both collapse onto: `parse` extracts the domain registration, `apply` swaps the live state, `on_applied` persists the cursor.
 
@@ -307,6 +314,14 @@ The double-check pattern in `connect()` guards a concurrent connect race: a seco
 
 The raw `KvWatcher` + `WatchCursor` + `SnapshotWriter` pieces let callers hand-roll the batch/apply/advance loop — and every known caller advanced the cursor on *receipt* rather than after *apply*, silently skipping un-applied updates on crash+resume. That is a footgun in the library's core guarantee, not a caller bug to be fixed N times. Encoding cursor-after-apply once, behind a combinator that callers can't get wrong, is cheaper and safer than documentation. `apply` stays the only domain logic; the cursor/snapshot/`on_applied` bookkeeping is the library's. See [Applied-Cursor Watch](#applied-cursor-watch-watch_applied).
 
+### Why do watches deliver current state first (state-sync semantics)?
+
+async-nats's bare `watch`/`watch_all`/`watch_many` ride `DeliverPolicy::New` — live updates only. A consumer built on that needs a separate `scan()` to seed, and any write landing between the scan and the watch attach is in neither — silently lost until the next reseed (the seed-then-watch race, demonstrated in `watch_prefix_relist_covers_seed_then_watch_gap`). Mapping every non-`_from` watch to `_with_history` (`LastPerSubject`) makes the watch itself deliver the seed, in revision order, with no race window: one primitive, correct by construction. The cost is a full re-list on every no-cursor watch start — which is what a no-cursor start *means*; consumers that have state resume with a `_from` variant and skip it.
+
+### Why does the cursor-expired resync list keys instead of re-scanning values?
+
+The fallback watch's re-list already carries every live key's value, so the resync only needs to learn which keys *no longer exist* — `reader.keys()` (headers only, no value bytes) is sufficient and cheap. The synthetic deletes carry an unknown version and never advance the cursor: the fold's persisted cursor stays at its (expired) position until real re-list revisions move it, so a crash mid-resync just re-runs the same idempotent diff on the next start. Ordering, not versioning, provides correctness: the resync acks before the fallback watch is established, so a synthetic delete can never land after the re-list put that resurrects the same key.
+
 ### Why KvError: Clone instead of Box<dyn Error>?
 
 A failed connect future may be observed by multiple concurrent callers waiting on a shared result. `Clone` lets the error fan out to N waiters without `Arc`. The cost: `std::io::Error` and `async-nats` error types are not `Clone`, so their structured cause chain is flattened into a pre-rendered `String` at the boundary. The trade-off is explicit: no `#[source]` chain, but the message carries context instead.
@@ -364,8 +379,11 @@ Per-message TTLs need a new-enough NATS server, a bucket flag, and a backend tha
 | `delete_with_version()`  | `kv.update(key, [], rev)` — CAS write of empty value as tombstone               |
 | `KvUpdate::Purge`        | `KV-Operation: PURGE` — all history removed; treated same as Delete in snapshot |
 | `scan()` / `keys()`      | Ephemeral push consumer with `DeliverPolicy::LastPerSubject`                    |
-| `watch_prefix()`         | `kv.watch("{prefix}>")` — server-side subject-filter wildcard                  |
+| `watch_all()`            | `kv.watch_with_history(">")` — `LastPerSubject`: state-sync re-list, then live |
+| `watch_prefix()`         | `kv.watch_with_history("{prefix}>")` — server-side subject filter, same re-list |
+| `watch_prefixes()`       | `kv.watch_many_with_history([..])` — ONE multi-filter consumer (NATS 2.10)      |
 | `watch_all_from(cursor)` | `kv.watch_all_from_revision(cursor+1)` — server-side delta delivery            |
+| `watch_prefixes_from()`  | Hand-built ordered push consumer: `filter_subjects` + `ByStartSequence(cursor+1)` (async-nats has no `watch_many_from_revision`) |
 
 ## Trust Model
 
@@ -388,7 +406,7 @@ Per-message TTLs need a new-enough NATS server, a bucket flag, and a backend tha
 
 | Failure                         | Recovery                                                       |
 | ------------------------------- | -------------------------------------------------------------- |
-| `CursorExpired`                 | Fall back to `watch_all()`; use `stale_keys()` for deletes     |
+| `CursorExpired`                 | `watch_applied` resyncs (synthetic deletes) + falls back to the state-sync re-list; raw callers use `stale_keys()` |
 | `WatchError`                    | Re-subscribe; watch stream dropped (NATS restart, reconnect)   |
 | `Timeout` on any op             | CLOSE_WAIT connection; call `shutdown()` + `connect()`         |
 | `RevisionMismatch` on CAS       | Re-read with `entry()`, resolve conflict, retry                |
@@ -415,7 +433,7 @@ Per-message TTLs need a new-enough NATS server, a bucket flag, and a backend tha
 | `src/snapshot_fjall.rs` | `FjallSnapshot`: on-disk `SnapshotStore` backed by fjall (`feature = "fjall"`)  |
 | `src/snapshot_rocksdb.rs` | `RocksDbSnapshot`: on-disk `SnapshotStore` backed by RocksDB (`feature = "rocksdb"`) |
 | `src/snapshot_record.rs` | Shared `[ver_len][version][value]` value-record codec for the LSM backends |
-| `src/applied.rs`  | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig` |
+| `src/applied.rs`  | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expired stale-key resync |
 | `src/lib.rs`      | Re-exports all public types; no logic                                                |
 | `benches/`        | Criterion benchmarks for snapshot write/checkpoint/load throughput and batch throughput |
 | `tests/`          | Integration tests (require live NATS)                                                |

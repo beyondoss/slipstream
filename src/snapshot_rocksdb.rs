@@ -398,7 +398,11 @@ impl RocksDbSnapshot {
     /// `dest_dir`; a bad artifact never becomes a fold. A crash mid-import
     /// leaves nothing at `dest_dir`; a crash after the final rename leaves a
     /// fully valid fold (a retried import then refuses the existing
-    /// destination — just [`open`](Self::open) it).
+    /// destination — just [`open`](Self::open) it). The same recovery applies
+    /// if `import` returns an error *after* the rename (the final open of
+    /// `dest_dir` failing, e.g. on a transient resource limit): the verified
+    /// fold is already in place, so call [`open`](Self::open) directly rather
+    /// than retrying `import`.
     ///
     /// Unlike the fjall/append-log imports, the manifest's `backend_version` is
     /// **not** gated: it records the rust-rocksdb binding version for
@@ -539,9 +543,11 @@ impl SnapshotStore for RocksDbSnapshot {
         // outraces its data.
         let mut wb = WriteBatch::default();
         // One scratch buffer reused across the whole batch. `put_cf` copies the
-        // bytes into the batch's internal representation before returning, so the
-        // buffer is free to be refilled for the next entry. That turns N per-`Put`
-        // assembly allocations into one amortized allocation.
+        // bytes into the batch's internal representation before returning, and
+        // `encode_value_into` clears `buf` before refilling it (its documented
+        // contract — stale bytes from the previous entry can never leak into the
+        // next value). That turns N per-`Put` assembly allocations into one
+        // amortized allocation.
         let mut scratch = Vec::new();
         for update in batch {
             match update {
