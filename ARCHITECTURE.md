@@ -72,6 +72,7 @@ watch_all_from(cursor, tx)
 | `SnapshotStore`          | Trait: the durable-fold contract — atomic `apply(batch, cursor)`, `load`, `get`, `range` | Not a serving index; stops at fold + cursor + query |
 | `AppendLogSnapshot`      | Default `SnapshotStore`: append-only log + in-RAM fold (pure-Rust)   | Not for folds larger than RAM                     |
 | `FjallSnapshot`          | On-disk `SnapshotStore` (fjall LSM, `feature = "fjall"`) for large folds | Not in the pure-Rust core; opt-in feature        |
+| `RocksDbSnapshot`        | On-disk `SnapshotStore` (RocksDB, `feature = "rocksdb"`) for large folds | Not pure-Rust; opt-in feature with a C++ build dep |
 | `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore` | Not a raw watch; the cursor follows `apply`, not receipt |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, …)        | Not enforced; purely advisory                    |
 
@@ -95,7 +96,8 @@ watch_all_from(cursor, tx)
                   snapshot.rs (orthogonal, optional)
 ┌─────────────────────────────────────────────────────────────┐
 │   SnapshotStore trait: apply(batch, cursor) │ load │ get │ range
-│   AppendLogSnapshot (default, in-RAM)  FjallSnapshot (feat)  │
+│   AppendLogSnapshot (default, in-RAM)                       │
+│   FjallSnapshot │ RocksDbSnapshot (feature-gated, on-disk)  │
 │          (append-only CRC log, tempfile+rename compact)     │
 └─────────────────────────────────────────────────────────────┘
                   applied.rs (combinator over KvWatcher + snapshot)
@@ -209,8 +211,9 @@ Three invariants bind every implementation:
 | ------- | ------ | ----- | ---------- |
 | `AppendLogSnapshot` (default) | `snapshot.rs` | Append-only CRC log + in-RAM `HashMap` fold | `checkpoint` flush (page cache); `fsync` only at `compact` |
 | `FjallSnapshot` (`feature = "fjall"`) | `snapshot_fjall.rs` | On-disk fjall LSM (`data` + `meta` partitions) | One atomic batch per `apply` (data + cursor); per-commit `fsync` configurable (NO_SYNC default) |
+| `RocksDbSnapshot` (`feature = "rocksdb"`) | `snapshot_rocksdb.rs` | On-disk RocksDB (`data` + `meta` column families), tuned for billion-key folds (hit-optimized ribbon filters, partitioned index, zstd bottommost — see the module's Tuning docs) | One atomic `WriteBatch` per `apply` (data + cursor); WAL always on, per-commit `fsync` configurable (NO_SYNC default) |
 
-`FjallSnapshot` keeps the cursor in the same fjall `Batch` as the data it names, so under NO_SYNC a crash can lose the un-synced tail but never desynchronize cursor from data — on reopen the recovered cursor is consistent and the watch re-folds the tail. The rest of this section describes the **append-log backend** (the default), whose on-disk format is below.
+The two LSM backends are interchangeable in contract and share the value-record codec (`snapshot_record.rs`); fjall keeps the crate pure-Rust, RocksDB trades a C++ build dependency for the battle-tested engine and its operational tooling (`ldb`, `sst_dump`). Both keep the cursor in the same atomic batch as the data it names, so under NO_SYNC a crash can lose the un-synced tail but never desynchronize cursor from data — on reopen the recovered cursor is consistent and the watch re-folds the tail. The rest of this section describes the **append-log backend** (the default), whose on-disk format is below.
 
 ### File Format
 
@@ -371,6 +374,8 @@ Checkpoints are frequent (every N watch events). An fsync per checkpoint would a
 | `src/nats.rs`     | NATS JetStream implementation; bucket creation, scan consumer lifecycle, timeout wrapping, Synadia Cloud workarounds |
 | `src/snapshot.rs` | `SnapshotStore` trait; append-only log + `AppendLogSnapshot` (default backend): `SnapshotWriter`, `load()`, `replay_log()`, `compact_to_file()` |
 | `src/snapshot_fjall.rs` | `FjallSnapshot`: on-disk `SnapshotStore` backed by fjall (`feature = "fjall"`)  |
+| `src/snapshot_rocksdb.rs` | `RocksDbSnapshot`: on-disk `SnapshotStore` backed by RocksDB (`feature = "rocksdb"`) |
+| `src/snapshot_record.rs` | Shared `[ver_len][version][value]` value-record codec for the LSM backends |
 | `src/applied.rs`  | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig` |
 | `src/lib.rs`      | Re-exports all public types; no logic                                                |
 | `benches/`        | Criterion benchmarks for snapshot write/checkpoint/load throughput and batch throughput |

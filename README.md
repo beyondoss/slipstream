@@ -10,7 +10,8 @@ beyond-slipstream = "0.2"
 The crate core is pure-Rust. On-disk snapshot backends are opt-in cargo features (no C toolchain is pulled unless you enable one):
 
 ```toml
-beyond-slipstream = { version = "0.2", features = ["fjall"] } # on-disk SnapshotStore for large folds
+beyond-slipstream = { version = "0.2", features = ["fjall"] }   # on-disk SnapshotStore, pure-Rust LSM
+beyond-slipstream = { version = "0.2", features = ["rocksdb"] } # on-disk SnapshotStore, RocksDB (needs a C++ toolchain + libclang to build)
 ```
 
 ## Concepts
@@ -31,6 +32,7 @@ beyond-slipstream = { version = "0.2", features = ["fjall"] } # on-disk Snapshot
 | `SnapshotStore`      | Trait: the durable-fold contract — `apply` (data + cursor, atomically), `load`, `get`, `range` |
 | `AppendLogSnapshot`  | Default `SnapshotStore`: the append-only log + an in-RAM fold (pure-Rust, small state) |
 | `FjallSnapshot`      | On-disk `SnapshotStore` for folds too large for RAM; queryable (`feature = "fjall"`) |
+| `RocksDbSnapshot`    | Same contract on RocksDB, for consumers who prefer the C++ LSM (`feature = "rocksdb"`) |
 | `watch_applied`      | Watch loop that advances the cursor only after your `apply` returns, folding into any `SnapshotStore` |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, global ordering) |
 
@@ -234,7 +236,8 @@ Every backend keeps the same invariants: the fold is a pure function of the log 
 | Backend | When | Notes |
 | ------- | ---- | ----- |
 | `AppendLogSnapshot` | **Default.** Fold fits in RAM (edge/tunnel-style services) | Pure-Rust, the append-only log above plus an in-RAM map serving `get`/`range`. No extra dependencies. |
-| `FjallSnapshot` | Fold too large for RAM (e.g. routing at ~1B keys) | On-disk [fjall](https://docs.rs/fjall) LSM, `feature = "fjall"`. Each `apply` is one atomic batch (data **and** cursor); durability (NO_SYNC vs fsync) is configurable. |
+| `FjallSnapshot` | Fold too large for RAM (e.g. routing at ~1B keys) | On-disk [fjall](https://docs.rs/fjall) LSM, `feature = "fjall"`. Pure-Rust. Each `apply` is one atomic batch (data **and** cursor); durability (NO_SYNC vs fsync) is configurable. |
+| `RocksDbSnapshot` | Same as `FjallSnapshot`, preferring the battle-tested C++ LSM and its tooling (`ldb`, `sst_dump`) | On-disk [RocksDB](https://docs.rs/rust-rocksdb), `feature = "rocksdb"`. Each `apply` is one atomic `WriteBatch` (data **and** cursor); WAL always on, per-commit fsync configurable. Tuned for billion-key route folds (hit-optimized ribbon filters, partitioned index, zstd bottommost, batched `multi_get`). Builds C++ (needs a toolchain + libclang). |
 
 Pick a backend, then hand it to [`watch_applied`](#applied-watch) — `load` returns the resume cursor alongside the store:
 
@@ -245,7 +248,10 @@ use slipstream::{AppendLogSnapshot, SnapshotStore};
 let (resume, store) = AppendLogSnapshot::load(Path::new("/var/lib/svc/state.snap"))?;
 
 // Or, behind `feature = "fjall"`, an on-disk fold for a large consumer:
-// let (resume, store) = FjallSnapshot::open(dir, FjallConfig { sync: false })?;
+// let (resume, store) = FjallSnapshot::open(dir, FjallConfig { sync: false, ..Default::default() })?;
+
+// Or the same on RocksDB, behind `feature = "rocksdb"`:
+// let (resume, store) = RocksDbSnapshot::open(dir, RocksDbConfig { sync: false, ..Default::default() })?;
 
 let final_cursor = watch_applied(
     watcher, WatchScope::All, Some(resume), Some(store), BatchConfig::default(),

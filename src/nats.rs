@@ -1047,11 +1047,7 @@ impl KvWatcher for NatsKvWatcher {
         stream_watch(watcher, &tx).await
     }
 
-    async fn watch_prefixes(
-        &self,
-        prefixes: &[&str],
-        tx: Sender<KvUpdate>,
-    ) -> Result<(), KvError> {
+    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>) -> Result<(), KvError> {
         if prefixes.is_empty() {
             // Nothing to watch. Critically, do NOT fall through to `watch_many`
             // with an empty filter set — an unfiltered ordered consumer would

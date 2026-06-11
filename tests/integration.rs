@@ -614,7 +614,9 @@ async fn watch_prefixes_unions_on_a_single_consumer() {
     );
     // vpcC.x must NEVER arrive — server-side filtered, not client-discarded.
     assert!(
-        timeout(Duration::from_millis(500), rx.recv()).await.is_err(),
+        timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
         "a non-watched prefix leaked through watch_prefixes"
     );
 }
