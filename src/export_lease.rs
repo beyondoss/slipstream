@@ -64,7 +64,7 @@ pub struct LeaseRecord {
 }
 
 /// Coordinates "at most one export per round" across every replica of a fold.
-/// See the [module docs](self).
+/// See the module docs for the CAS + embedded-expiry mechanism.
 pub struct ExportLease {
     reader: Arc<dyn KvReader>,
     writer: Arc<dyn KvWriter>,
@@ -122,8 +122,8 @@ impl ExportLease {
             completed_cursor_hex: None,
             completed_at_unix: None,
         };
-        let bytes = serde_json::to_vec(&record)
-            .map_err(|e| KvError::SerializationError(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&record).map_err(|e| KvError::SerializationError(e.to_string()))?;
 
         // Fast path: the round is open — create-only, one winner.
         match self.writer.create(&self.key, &bytes).await {

@@ -33,9 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::applied::ExportRequest;
-use crate::artifact::{
-    ExportManifest, MANIFEST_FILE, check_dest_available, manifest_from_slice,
-};
+use crate::artifact::{ExportManifest, MANIFEST_FILE, check_dest_available, manifest_from_slice};
 use crate::export_lease::ExportLease;
 use crate::kv::WatchCursor;
 use crate::snapshot::SnapshotError;
@@ -48,8 +46,8 @@ const CHUNK: usize = 8 << 20;
 /// `CHUNK × MAX_CONCURRENT_PARTS`).
 const MAX_CONCURRENT_PARTS: usize = 8;
 
-/// Ship artifacts to durable storage and fetch them back. See [module](self)
-/// docs for the wire format.
+/// Ship artifacts to durable storage and fetch them back. See the module docs
+/// for the wire format.
 #[async_trait]
 pub trait ArtifactTransport: Send + Sync {
     /// Tar `artifact_dir` and upload it at `key`, then upload the manifest as
@@ -137,13 +135,18 @@ impl ArtifactTransport for ObjectStoreTransport {
         // blocking tar writer and the async multipart writer decoupled; the
         // disk cost is one tar's worth, transient.
         let src = artifact_dir.to_path_buf();
-        let tar_file = tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile, SnapshotError> {
-            let tmp = tempfile::NamedTempFile::new()?;
-            let mut builder = tar::Builder::new(std::io::BufWriter::new(tmp.reopen()?));
-            builder.append_dir_all(".", &src)?;
-            builder.into_inner()?.into_inner().map_err(|e| SnapshotError::Io(e.into_error()))?;
-            Ok(tmp)
-        })
+        let tar_file = tokio::task::spawn_blocking(
+            move || -> Result<tempfile::NamedTempFile, SnapshotError> {
+                let tmp = tempfile::NamedTempFile::new()?;
+                let mut builder = tar::Builder::new(std::io::BufWriter::new(tmp.reopen()?));
+                builder.append_dir_all(".", &src)?;
+                builder
+                    .into_inner()?
+                    .into_inner()
+                    .map_err(|e| SnapshotError::Io(e.into_error()))?;
+                Ok(tmp)
+            },
+        )
         .await
         .map_err(|e| SnapshotError::Backend(format!("tar task panicked: {e}")))??;
 
@@ -228,7 +231,10 @@ impl ArtifactTransport for ObjectStoreTransport {
             .into_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(map_obj)?;
-            tar_writer.write_all(&chunk).await.map_err(SnapshotError::Io)?;
+            tar_writer
+                .write_all(&chunk)
+                .await
+                .map_err(SnapshotError::Io)?;
         }
         tar_writer.flush().await.map_err(SnapshotError::Io)?;
         drop(tar_writer);

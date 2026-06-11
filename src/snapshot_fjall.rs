@@ -534,9 +534,7 @@ impl SnapshotStore for FjallSnapshot {
         let stage = ExportStage::new(dest_dir)?;
         let payload = stage.payload();
 
-        self.db
-            .persist(PersistMode::SyncAll)
-            .map_err(map_fjall)?;
+        self.db.persist(PersistMode::SyncAll).map_err(map_fjall)?;
         self.quiesce();
 
         let mut attempt = 0;
@@ -549,10 +547,7 @@ impl SnapshotStore for FjallSnapshot {
                 {
                     // A straggler flush/compaction GC'd a file under the copy.
                     // Clear and re-copy from the now-quieter tree.
-                    tracing::warn!(
-                        attempt,
-                        "fjall export copy raced background GC; retrying"
-                    );
+                    tracing::warn!(attempt, "fjall export copy raced background GC; retrying");
                     std::fs::remove_dir_all(&payload)?;
                 }
                 Err(e) => return Err(e),

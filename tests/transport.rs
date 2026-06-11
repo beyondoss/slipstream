@@ -66,7 +66,10 @@ async fn upload_manifest_download_import_round_trip() {
     let (transport, _bucket) = local_transport();
     let (artifact, manifest, dir) = exported_artifact();
 
-    transport.upload("edge/us-east/latest", &artifact).await.unwrap();
+    transport
+        .upload("edge/us-east/latest", &artifact)
+        .await
+        .unwrap();
 
     // Manifest peek without a payload download.
     let peeked = transport.manifest("edge/us-east/latest").await.unwrap();

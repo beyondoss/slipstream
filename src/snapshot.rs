@@ -508,7 +508,11 @@ impl AppendLogSnapshot {
             })?;
 
         // This backend's artifact is exactly one payload file.
-        let expected = format!("{}/{}", crate::artifact::PAYLOAD_DIR, Self::ARTIFACT_PAYLOAD);
+        let expected = format!(
+            "{}/{}",
+            crate::artifact::PAYLOAD_DIR,
+            Self::ARTIFACT_PAYLOAD
+        );
         if manifest.files.len() != 1 || manifest.files[0].path != expected {
             return Err(SnapshotError::ArtifactInvalid(format!(
                 "append-log artifact must contain exactly {expected:?}"

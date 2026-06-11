@@ -52,18 +52,20 @@ impl TestNats {
                      Run `mise install` or set NATS_SERVER_BIN."
                 )
             });
-        let url = format!("nats://127.0.0.1:{port}");
+        // Build the guard FIRST: if readiness polling panics, Drop reaps the
+        // child instead of leaking a zombie.
+        let guard = TestNats {
+            child,
+            url: format!("nats://127.0.0.1:{port}"),
+            _store_dir: store_dir,
+        };
         for _ in 0..100 {
-            if async_nats::connect(&url).await.is_ok() {
-                return TestNats {
-                    child,
-                    url,
-                    _store_dir: store_dir,
-                };
+            if async_nats::connect(&guard.url).await.is_ok() {
+                return guard;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("nats-server at {url} never became ready");
+        panic!("nats-server at {} never became ready", guard.url);
     }
 }
 
@@ -118,7 +120,13 @@ impl TestMinio {
                 )
             });
 
-        let endpoint = format!("http://127.0.0.1:{api_port}");
+        // Build the guard FIRST so a panicking readiness loop reaps the child.
+        let guard = TestMinio {
+            child,
+            endpoint: format!("http://127.0.0.1:{api_port}"),
+            _data_dir: data_dir,
+        };
+        let endpoint = guard.endpoint.clone();
 
         // Create the test bucket with mc, retrying until the server is up.
         // A throwaway --config-dir keeps ~/.mc untouched.
@@ -161,13 +169,11 @@ impl TestMinio {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        assert!(ready, "minio at {endpoint} never became ready (mc mb failed)");
-
-        TestMinio {
-            child,
-            endpoint,
-            _data_dir: data_dir,
-        }
+        assert!(
+            ready,
+            "minio at {endpoint} never became ready (mc mb failed)"
+        );
+        guard
     }
 
     /// Builder options for `ObjectStoreTransport::from_url_opts` pointing at

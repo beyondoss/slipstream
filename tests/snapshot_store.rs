@@ -413,7 +413,11 @@ fn check_export_import_round_trip<S: SnapshotStore>(
 
     let dest = dir.path().join("imported");
     let (cursor, s) = import(&artifact, &dest).expect("import");
-    assert_eq!(cursor.as_u64(), Some(7), "imported cursor is the manifest's");
+    assert_eq!(
+        cursor.as_u64(),
+        Some(7),
+        "imported cursor is the manifest's"
+    );
     assert_eq!(cursor, manifest.cursor);
     assert_eq!(dump(&s), expected_state(), "imported state is identical");
 }
@@ -706,7 +710,10 @@ fn append_log_empty_value_round_trip() {
     check_empty_value_round_trip(open_append_log);
 }
 
-fn import_append_log(artifact: &Path, dest: &Path) -> Result<(WatchCursor, AppendLogSnapshot), SnapshotError> {
+fn import_append_log(
+    artifact: &Path,
+    dest: &Path,
+) -> Result<(WatchCursor, AppendLogSnapshot), SnapshotError> {
     AppendLogSnapshot::import(artifact, dest, u64::MAX)
 }
 

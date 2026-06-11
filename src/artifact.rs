@@ -136,7 +136,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -421,12 +421,14 @@ fn stage_dir_in(parent: &Path) -> Result<tempfile::TempDir, SnapshotError> {
 }
 
 fn dest_parent(dest: &Path) -> Result<&Path, SnapshotError> {
-    dest.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
-        invalid(format!(
-            "destination {} has no parent directory",
-            dest.display()
-        ))
-    })
+    dest.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "destination {} has no parent directory",
+                dest.display()
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -571,9 +573,7 @@ pub(crate) fn verify_and_stage_import(
             .to_str()
             .ok_or_else(|| invalid(format!("non-UTF-8 payload path: {}", rel.display())))?;
         if !declared.contains(rel) {
-            return Err(invalid(format!(
-                "payload contains undeclared file: {rel}"
-            )));
+            return Err(invalid(format!("payload contains undeclared file: {rel}")));
         }
     }
 
@@ -722,7 +722,10 @@ mod tests {
     #[test]
     fn rejects_wrong_schema_version() {
         let dir = TempDir::new().unwrap();
-        write_raw_manifest(dir.path(), &wire_json("", "[]", ARTIFACT_SCHEMA_VERSION + 1));
+        write_raw_manifest(
+            dir.path(),
+            &wire_json("", "[]", ARTIFACT_SCHEMA_VERSION + 1),
+        );
         match read_manifest(dir.path()) {
             Err(SnapshotError::ArtifactInvalid(msg)) => {
                 assert!(msg.contains("schema_version"), "{msg}");

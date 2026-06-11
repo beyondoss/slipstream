@@ -122,10 +122,10 @@ async fn wait_applied(node: &Node, at_least: u64) {
 /// (lease won, exported through the watch loop, uploaded to MinIO, completion
 /// published, artifact deleted) → node B downloads + imports + resumes →
 /// delta-only delivery → state equals the bucket.
-async fn full_bootstrap_loop<S>(
-    open: impl Fn(&Path) -> (WatchCursor, S),
-    import: fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError>,
-) where
+type ImportFn<S> = fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError>;
+
+async fn full_bootstrap_loop<S>(open: impl Fn(&Path) -> (WatchCursor, S), import: ImportFn<S>)
+where
     S: SnapshotStore + Send + 'static,
 {
     let (nats, minio) = tokio::join!(TestNats::start(), TestMinio::start());
@@ -197,7 +197,10 @@ async fn full_bootstrap_loop<S>(
     wait_applied(&node_a, final_rev).await;
 
     // Node B: manifest peek, download, import, resume.
-    let peeked = transport.manifest("edge/us-east/latest").await.expect("peek");
+    let peeked = transport
+        .manifest("edge/us-east/latest")
+        .await
+        .expect("peek");
     assert_eq!(peeked.cursor, manifest.cursor);
 
     let downloaded = dir.path().join("downloaded-artifact");
@@ -240,7 +243,10 @@ async fn full_bootstrap_loop<S>(
         .map(|e| (e.key, e.value))
         .collect();
     bucket_state.sort();
-    assert_eq!(fold_state, bucket_state, "bootstrapped fold equals the bucket");
+    assert_eq!(
+        fold_state, bucket_state,
+        "bootstrapped fold equals the bucket"
+    );
 }
 
 #[cfg(feature = "fjall")]
@@ -307,9 +313,13 @@ async fn minio_multipart_upload_round_trips() {
     for i in 0..2500u64 {
         // Pseudo-random bytes (LCG) so neither tar nor S3 sees compressible runs.
         let mut v = vec![0u8; 10 * 1024];
-        let mut x = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut x = i
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         for b in &mut v {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (x >> 33) as u8;
         }
         batch.push(KvUpdate::Put(slipstream::KvEntry {
@@ -328,7 +338,10 @@ async fn minio_multipart_upload_round_trips() {
         "artifact must exceed several part sizes (got {payload_bytes} bytes)"
     );
 
-    transport.upload("big/latest", &artifact).await.expect("multipart upload");
+    transport
+        .upload("big/latest", &artifact)
+        .await
+        .expect("multipart upload");
 
     let downloaded = dir.path().join("downloaded");
     transport

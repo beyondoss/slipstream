@@ -132,9 +132,11 @@ async fn wait_applied(node: &Node, at_least: u64) {
 /// 5. **Delta-only**: B was delivered exactly M updates, the first at
 ///    cursor+1 — no overlap, no gap, no full replay.
 /// 6. B's fold state equals the bucket (the truth).
+type ImportFn<S> = fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError>;
+
 async fn live_export_bootstrap_delta_only<S>(
     open: impl Fn(&Path) -> (WatchCursor, S),
-    import: fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError>,
+    import: ImportFn<S>,
 ) where
     S: SnapshotStore + Send + 'static,
 {
@@ -188,7 +190,10 @@ async fn live_export_bootstrap_delta_only<S>(
         .expect("send export request");
     let manifest = reply_rx.await.expect("reply").expect("export succeeds");
     let export_rev = manifest.cursor.as_u64().expect("cursor rev");
-    assert!(export_rev >= last_rev, "artifact covers the pre-export history");
+    assert!(
+        export_rev >= last_rev,
+        "artifact covers the pre-export history"
+    );
 
     // Post-export churn: exactly M updates (including a delete — tombstones
     // must ride the tail too).

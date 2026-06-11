@@ -1505,8 +1505,12 @@ async fn export_lease_one_winner_among_concurrent_acquirers() {
 
     let mut tasks = Vec::new();
     for i in 0..8 {
-        let lease = slipstream::ExportLease::new(store.as_ref(), "export.edge.us-east", format!("node-{i}"))
-            .expect("lease");
+        let lease = slipstream::ExportLease::new(
+            store.as_ref(),
+            "export.edge.us-east",
+            format!("node-{i}"),
+        )
+        .expect("lease");
         tasks.push(tokio::spawn(async move {
             lease
                 .try_acquire(Duration::from_secs(60))
@@ -1580,7 +1584,10 @@ async fn export_lease_expiry_allows_takeover() {
     assert_eq!(guard.record().holder_id, "node-b");
 
     let current = b.current().await.expect("read").expect("record exists");
-    assert_eq!(current.holder_id, "node-b", "takeover is visible fleet-wide");
+    assert_eq!(
+        current.holder_id, "node-b",
+        "takeover is visible fleet-wide"
+    );
 }
 
 /// `complete` publishes the exported cursor on the lease key — the
@@ -1590,7 +1597,8 @@ async fn export_lease_complete_publishes_outcome() {
     let nats = TestNats::start().await;
     let (_conn, store) = nats.store("lease-complete").await;
 
-    let lease = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-a").expect("lease");
+    let lease =
+        slipstream::ExportLease::new(store.as_ref(), "export.round", "node-a").expect("lease");
     let guard = lease
         .try_acquire(Duration::from_secs(60))
         .await
