@@ -36,6 +36,8 @@ mod snapshot_record;
 #[cfg(feature = "rocksdb")]
 mod snapshot_rocksdb;
 mod stores;
+#[cfg(feature = "transport")]
+mod transport;
 
 pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
@@ -50,3 +52,5 @@ pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
 #[cfg(feature = "rocksdb")]
 pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
 pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};
+#[cfg(feature = "transport")]
+pub use transport::{ArtifactTransport, ObjectStoreTransport, run_export_round};

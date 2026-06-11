@@ -26,9 +26,11 @@ blake3 = "1.8.5"
 crc32fast = "1"
 fjall = { version = "3", optional = true }
 futures = "0.3"
+object_store = { version = "0.13.2", optional = true, features = ["aws", "fs"] }
 rocksdb = { package = "rust-rocksdb", version = "0.50", optional = true, default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tar = { version = "0.4.46", optional = true }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -59,3 +61,6 @@ required-features = ["fjall", "rocksdb"]
 [features]
 fjall = ["dep:fjall"]
 rocksdb = ["dep:rocksdb"]
+# Artifact transport: tar wire format + object_store (S3/GCS/Azure/local-fs)
+# upload/download, plus run_export_round. tokio/fs streams downloads to disk.
+transport = ["dep:object_store", "dep:tar", "tokio/fs"]

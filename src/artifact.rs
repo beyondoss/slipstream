@@ -199,10 +199,6 @@ pub(crate) fn write_manifest(
 }
 
 /// Read and validate `MANIFEST.json` from an artifact directory.
-///
-/// Validates the schema version and every file path (relative, `/`-separated,
-/// no `..`, no `\`, under `data/`) so a hostile or corrupted manifest can never
-/// direct a copy outside the staging area (zip-slip).
 pub(crate) fn read_manifest(artifact_dir: &Path) -> Result<ExportManifest, SnapshotError> {
     let path = artifact_dir.join(MANIFEST_FILE);
     let data = fs::read(&path).map_err(|e| {
@@ -212,8 +208,17 @@ pub(crate) fn read_manifest(artifact_dir: &Path) -> Result<ExportManifest, Snaps
             SnapshotError::Io(e)
         }
     })?;
+    manifest_from_slice(&data)
+}
+
+/// Parse and validate manifest JSON bytes.
+///
+/// Validates the schema version and every file path (relative, `/`-separated,
+/// no `..`, no `\`, under `data/`) so a hostile or corrupted manifest can never
+/// direct a copy outside the staging area (zip-slip).
+pub(crate) fn manifest_from_slice(data: &[u8]) -> Result<ExportManifest, SnapshotError> {
     let wire: ManifestWire =
-        serde_json::from_slice(&data).map_err(|e| invalid(format!("malformed manifest: {e}")))?;
+        serde_json::from_slice(data).map_err(|e| invalid(format!("malformed manifest: {e}")))?;
 
     if wire.schema_version != ARTIFACT_SCHEMA_VERSION {
         return Err(invalid(format!(

@@ -192,6 +192,34 @@ impl LeaseGuard {
         &self.record
     }
 
+    /// Give the round back early: a failed export/upload should not suppress
+    /// the fleet for the rest of the ttl. CAS-deletes the lease (tombstone)
+    /// against this guard's version, so the next trigger on any node can win a
+    /// fresh round immediately.
+    ///
+    /// Best-effort: a CAS conflict (someone already took over) or write error
+    /// is logged, not surfaced — worst case the round waits out its ttl, which
+    /// is the no-abandon behavior anyway.
+    pub async fn abandon(self) {
+        match self
+            .writer
+            .delete_with_version(&self.key, &self.version)
+            .await
+        {
+            Ok(_) => {
+                debug!(key = %self.key, holder = %self.record.holder_id, "export lease abandoned");
+            }
+            Err(e) => {
+                warn!(
+                    key = %self.key,
+                    holder = %self.record.holder_id,
+                    error = %e,
+                    "failed to abandon export lease; next round waits for expiry"
+                );
+            }
+        }
+    }
+
     /// Publish the round's outcome: rewrite the lease value with the exported
     /// cursor and completion time (expiry unchanged — the round still runs its
     /// full period).
