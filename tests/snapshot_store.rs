@@ -2,13 +2,15 @@
 //!
 //! Every check is written generically over a backend and an `open` closure, then
 //! instantiated for each shipped backend: [`AppendLogSnapshot`] (always) and
-//! `FjallSnapshot` (behind `--features fjall`). New backends get the whole suite
-//! by adding two wrapper lines.
+//! `FjallSnapshot` (behind `--features fjall`), and `RocksDbSnapshot` (behind
+//! `--features rocksdb`). New backends get the whole suite by adding two
+//! wrapper lines.
 //!
 //! Run the full matrix with:
 //! ```text
 //! cargo test --test snapshot_store
 //! cargo test --test snapshot_store --features fjall
+//! cargo test --test snapshot_store --features rocksdb
 //! ```
 
 use std::path::Path;
@@ -360,13 +362,298 @@ fn check_empty_value_round_trip<S: SnapshotStore>(open: impl Fn(&Path) -> (Watch
 }
 
 /// Remove a store at `path`, whether it is a single file (append log) or a
-/// directory (fjall keyspace).
+/// directory (fjall keyspace, RocksDB database).
 fn wipe(path: &Path) {
     if path.is_dir() {
         std::fs::remove_dir_all(path).expect("rm store dir");
     } else if path.exists() {
         std::fs::remove_file(path).expect("rm store file");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Export / import — generic checks
+// ---------------------------------------------------------------------------
+
+use slipstream::snapshot::SnapshotError;
+use slipstream::{ExportManifest, MANIFEST_FILE};
+
+type ImportFn<S> = fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError>;
+
+/// Export a fold of [`stream`] and return `(artifact_dir, manifest, tempdir)`.
+fn exported_stream_artifact<S: SnapshotStore>(
+    open: &impl Fn(&Path) -> (WatchCursor, S),
+) -> (PathBuf, ExportManifest, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().join("store");
+    let artifact = dir.path().join("artifact");
+    let (_r, mut s) = open(&store_path);
+    fold(&mut s, &stream());
+    let manifest = s.export_to(&artifact).expect("export");
+    assert_eq!(
+        manifest.cursor,
+        s.cursor(),
+        "manifest cursor equals the live fold's cursor"
+    );
+    (artifact, manifest, dir)
+}
+
+use std::path::PathBuf;
+
+/// Round-trip: export a fold, import it elsewhere, and the imported store has
+/// the same cursor and byte-identical state.
+fn check_export_import_round_trip<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, manifest, dir) = exported_stream_artifact(&open);
+    assert_eq!(manifest.cursor.as_u64(), Some(7));
+    assert!(!manifest.files.is_empty(), "manifest lists payload files");
+    assert!(artifact.join(MANIFEST_FILE).is_file());
+
+    let dest = dir.path().join("imported");
+    let (cursor, s) = import(&artifact, &dest).expect("import");
+    assert_eq!(cursor.as_u64(), Some(7), "imported cursor is the manifest's");
+    assert_eq!(cursor, manifest.cursor);
+    assert_eq!(dump(&s), expected_state(), "imported state is identical");
+}
+
+/// The scaling property behind import: fold the post-cursor delta into the
+/// imported store and it converges to the continuous-fold reference — import +
+/// tail replay, never a full re-fold.
+fn check_import_resume_continues_fold<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let updates = stream();
+    let dir = TempDir::new().unwrap();
+
+    // Export mid-stream, after revs 1..=4.
+    let store_path = dir.path().join("store");
+    let artifact = dir.path().join("artifact");
+    let (_r, mut s) = open(&store_path);
+    fold(&mut s, &updates[..4]);
+    let manifest = s.export_to(&artifact).expect("export");
+    assert_eq!(manifest.cursor.as_u64(), Some(4));
+
+    // Import on "another node" and fold ONLY the tail (revs 5..=7).
+    let dest = dir.path().join("imported");
+    let (cursor, mut imported) = import(&artifact, &dest).expect("import");
+    assert_eq!(cursor.as_u64(), Some(4));
+    fold(&mut imported, &updates[4..]);
+
+    assert_eq!(
+        dump(&imported),
+        expected_state(),
+        "import + tail replay equals the continuous fold"
+    );
+}
+
+/// A flipped byte in the payload fails checksum verification, and nothing is
+/// ever created at the destination (stage-then-rename crash safety).
+fn check_import_rejects_tampered_payload<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, manifest, dir) = exported_stream_artifact(&open);
+
+    // Tamper with the largest payload file (most likely to hold real data).
+    let victim = manifest
+        .files
+        .iter()
+        .max_by_key(|f| f.size)
+        .expect("at least one payload file");
+    let victim_path = artifact.join(&victim.path);
+    let mut bytes = std::fs::read(&victim_path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&victim_path, &bytes).unwrap();
+
+    let dest = dir.path().join("imported");
+    match import(&artifact, &dest) {
+        Err(SnapshotError::ArtifactInvalid(msg)) => {
+            assert!(
+                msg.contains("checksum") || msg.contains("recover") || msg.contains("cursor"),
+                "rejection names the failure: {msg}"
+            );
+        }
+        Err(other) => panic!("expected ArtifactInvalid, got {other:?}"),
+        Ok(_) => panic!("tampered artifact must not import"),
+    }
+    assert!(!dest.exists(), "nothing lands at the destination");
+}
+
+/// A payload file missing from the artifact is rejected.
+fn check_import_rejects_missing_payload_file<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, manifest, dir) = exported_stream_artifact(&open);
+    std::fs::remove_file(artifact.join(&manifest.files[0].path)).unwrap();
+
+    let dest = dir.path().join("imported");
+    assert!(
+        matches!(
+            import(&artifact, &dest),
+            Err(SnapshotError::ArtifactInvalid(_))
+        ),
+        "missing payload file must be rejected"
+    );
+    assert!(!dest.exists());
+}
+
+/// A payload file the manifest never declared is rejected (it was never hashed
+/// at export, so it cannot be trusted).
+fn check_import_rejects_undeclared_extra_file<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _manifest, dir) = exported_stream_artifact(&open);
+    std::fs::write(artifact.join("data").join("smuggled"), b"x").unwrap();
+
+    let dest = dir.path().join("imported");
+    assert!(
+        matches!(
+            import(&artifact, &dest),
+            Err(SnapshotError::ArtifactInvalid(_))
+        ),
+        "undeclared extra payload file must be rejected"
+    );
+    assert!(!dest.exists());
+}
+
+/// Rewrite one top-level manifest field (checksums untouched) and re-import.
+fn with_doctored_manifest(artifact: &Path, field: &str, value: serde_json::Value) {
+    let raw = std::fs::read(artifact.join(MANIFEST_FILE)).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    json[field] = value;
+    std::fs::write(
+        artifact.join(MANIFEST_FILE),
+        serde_json::to_vec(&json).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Wrong backend identity in the manifest is rejected.
+fn check_import_rejects_wrong_backend<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _m, dir) = exported_stream_artifact(&open);
+    with_doctored_manifest(&artifact, "backend", "bogus-backend".into());
+    let dest = dir.path().join("imported");
+    assert!(matches!(
+        import(&artifact, &dest),
+        Err(SnapshotError::ArtifactInvalid(_))
+    ));
+    assert!(!dest.exists());
+}
+
+/// Unsupported artifact schema version is rejected.
+fn check_import_rejects_schema_version<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _m, dir) = exported_stream_artifact(&open);
+    with_doctored_manifest(&artifact, "schema_version", 999.into());
+    let dest = dir.path().join("imported");
+    assert!(matches!(
+        import(&artifact, &dest),
+        Err(SnapshotError::ArtifactInvalid(_))
+    ));
+    assert!(!dest.exists());
+}
+
+/// Mismatched on-disk format generation is rejected (strict backends only:
+/// append-log and fjall gate on it; RocksDB deliberately does not).
+fn check_import_rejects_backend_version<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _m, dir) = exported_stream_artifact(&open);
+    with_doctored_manifest(&artifact, "backend_version", "999".into());
+    let dest = dir.path().join("imported");
+    assert!(matches!(
+        import(&artifact, &dest),
+        Err(SnapshotError::ArtifactInvalid(_))
+    ));
+    assert!(!dest.exists());
+}
+
+/// A doctored cursor (valid hex, valid checksums) is caught by the post-open
+/// cursor-equality gate — the payload's recovered cursor is the authority.
+fn check_import_rejects_cursor_mismatch<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _m, dir) = exported_stream_artifact(&open);
+    // rev 999 as 8-byte big-endian hex — well-formed, just wrong.
+    with_doctored_manifest(&artifact, "cursor_hex", "00000000000003e7".into());
+    let dest = dir.path().join("imported");
+    match import(&artifact, &dest) {
+        Err(SnapshotError::ArtifactInvalid(msg)) => {
+            assert!(msg.contains("cursor"), "rejection names the cursor: {msg}");
+        }
+        Err(other) => panic!("expected ArtifactInvalid, got {other:?}"),
+        Ok(_) => panic!("cursor mismatch must not import"),
+    }
+    assert!(!dest.exists());
+}
+
+/// Import refuses a non-empty destination, and the artifact survives untouched
+/// (a retry against a fresh destination succeeds).
+fn check_import_rejects_nonempty_dest<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let (artifact, _m, dir) = exported_stream_artifact(&open);
+
+    let dest = dir.path().join("occupied");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("stray"), b"x").unwrap();
+    assert!(matches!(
+        import(&artifact, &dest),
+        Err(SnapshotError::ArtifactInvalid(_))
+    ));
+    assert!(dest.join("stray").exists(), "occupied dest untouched");
+
+    let fresh = dir.path().join("fresh");
+    let (cursor, s) = import(&artifact, &fresh).expect("artifact survives a refused import");
+    assert_eq!(cursor.as_u64(), Some(7));
+    assert_eq!(dump(&s), expected_state());
+}
+
+/// Export refuses a non-empty destination.
+fn check_export_rejects_nonempty_dest<S: SnapshotStore>(open: impl Fn(&Path) -> (WatchCursor, S)) {
+    let dir = TempDir::new().unwrap();
+    let (_r, mut s) = open(&dir.path().join("store"));
+    fold(&mut s, &stream());
+
+    let dest = dir.path().join("occupied");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("stray"), b"x").unwrap();
+    assert!(matches!(
+        s.export_to(&dest),
+        Err(SnapshotError::ArtifactInvalid(_))
+    ));
+    assert!(dest.join("stray").exists(), "occupied dest untouched");
+}
+
+/// An empty fold (nothing applied, no cursor) exports and imports cleanly.
+fn check_export_empty_store<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+    import: ImportFn<S>,
+) {
+    let dir = TempDir::new().unwrap();
+    let (_r, mut s) = open(&dir.path().join("store"));
+    let artifact = dir.path().join("artifact");
+    let manifest = s.export_to(&artifact).expect("export empty fold");
+    assert!(manifest.cursor.is_none(), "empty fold has no cursor");
+
+    let dest = dir.path().join("imported");
+    let (cursor, imported) = import(&artifact, &dest).expect("import empty fold");
+    assert!(cursor.is_none());
+    assert!(dump(&imported).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +704,70 @@ fn append_log_empty_batch_advances_cursor() {
 #[test]
 fn append_log_empty_value_round_trip() {
     check_empty_value_round_trip(open_append_log);
+}
+
+fn import_append_log(artifact: &Path, dest: &Path) -> Result<(WatchCursor, AppendLogSnapshot), SnapshotError> {
+    AppendLogSnapshot::import(artifact, dest, u64::MAX)
+}
+
+#[test]
+fn append_log_export_import_round_trip() {
+    check_export_import_round_trip(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_resume_continues_fold() {
+    check_import_resume_continues_fold(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_tampered_payload() {
+    check_import_rejects_tampered_payload(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_missing_payload_file() {
+    check_import_rejects_missing_payload_file(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_undeclared_extra_file() {
+    check_import_rejects_undeclared_extra_file(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_wrong_backend() {
+    check_import_rejects_wrong_backend(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_schema_version() {
+    check_import_rejects_schema_version(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_backend_version() {
+    check_import_rejects_backend_version(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_cursor_mismatch() {
+    check_import_rejects_cursor_mismatch(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_import_rejects_nonempty_dest() {
+    check_import_rejects_nonempty_dest(open_append_log, import_append_log);
+}
+
+#[test]
+fn append_log_export_rejects_nonempty_dest() {
+    check_export_rejects_nonempty_dest(open_append_log);
+}
+
+#[test]
+fn append_log_export_empty_store() {
+    check_export_empty_store(open_append_log, import_append_log);
 }
 
 /// Backwards-compat: a file written by the existing [`SnapshotWriter`] API loads
@@ -500,6 +851,91 @@ mod fjall_backend {
         check_empty_value_round_trip(open_no_sync);
     }
 
+    fn import_fjall(
+        artifact: &Path,
+        dest: &Path,
+    ) -> Result<(WatchCursor, FjallSnapshot), SnapshotError> {
+        FjallSnapshot::import(
+            artifact,
+            dest,
+            FjallConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn fjall_export_import_round_trip() {
+        check_export_import_round_trip(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_resume_continues_fold() {
+        check_import_resume_continues_fold(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_tampered_payload() {
+        check_import_rejects_tampered_payload(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_missing_payload_file() {
+        check_import_rejects_missing_payload_file(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_undeclared_extra_file() {
+        check_import_rejects_undeclared_extra_file(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_wrong_backend() {
+        check_import_rejects_wrong_backend(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_schema_version() {
+        check_import_rejects_schema_version(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_backend_version() {
+        check_import_rejects_backend_version(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_cursor_mismatch() {
+        check_import_rejects_cursor_mismatch(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_import_rejects_nonempty_dest() {
+        check_import_rejects_nonempty_dest(open_no_sync, import_fjall);
+    }
+
+    #[test]
+    fn fjall_export_rejects_nonempty_dest() {
+        check_export_rejects_nonempty_dest(open_no_sync);
+    }
+
+    #[test]
+    fn fjall_export_empty_store() {
+        check_export_empty_store(open_no_sync, import_fjall);
+    }
+
+    /// `settle` (major compaction) must preserve the fold byte-for-byte.
+    #[test]
+    fn fjall_settle_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &stream());
+        s.settle().expect("settle");
+        assert_eq!(dump(&s), expected_state(), "state survives settle");
+    }
+
     /// NO_SYNC crash-tail recovery. With sync off, commits are not fsync'd, but
     /// data and cursor share one atomic batch, so whatever survives is mutually
     /// consistent. We can't deterministically simulate a power-loss (a clean drop
@@ -562,6 +998,261 @@ mod fjall_backend {
             },
         )
         .expect("reopen fjall sync");
+        assert_eq!(cursor.as_u64(), Some(7));
+        assert_eq!(dump(&s), expected_state());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RocksDbSnapshot — on-disk backend (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rocksdb")]
+mod rocksdb_backend {
+    use super::*;
+    use slipstream::{RocksDbConfig, RocksDbSnapshot};
+
+    fn open_no_sync(path: &Path) -> (WatchCursor, RocksDbSnapshot) {
+        RocksDbSnapshot::open(
+            path,
+            RocksDbConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+        .expect("open rocksdb")
+    }
+
+    #[test]
+    fn rocksdb_round_trip() {
+        check_round_trip(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_get_range() {
+        check_get_range(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_for_each_in_range() {
+        check_for_each_in_range(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_cursor_resume() {
+        check_cursor_resume(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_pure_fold_property() {
+        check_property_pure_fold(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_purge() {
+        check_purge(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_empty_batch_advances_cursor() {
+        check_empty_batch_advances_cursor(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_empty_value_round_trip() {
+        check_empty_value_round_trip(open_no_sync);
+    }
+
+    fn import_rocksdb(
+        artifact: &Path,
+        dest: &Path,
+    ) -> Result<(WatchCursor, RocksDbSnapshot), SnapshotError> {
+        RocksDbSnapshot::import(
+            artifact,
+            dest,
+            RocksDbConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn rocksdb_export_import_round_trip() {
+        check_export_import_round_trip(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_resume_continues_fold() {
+        check_import_resume_continues_fold(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_tampered_payload() {
+        check_import_rejects_tampered_payload(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_missing_payload_file() {
+        check_import_rejects_missing_payload_file(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_undeclared_extra_file() {
+        check_import_rejects_undeclared_extra_file(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_wrong_backend() {
+        check_import_rejects_wrong_backend(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_schema_version() {
+        check_import_rejects_schema_version(open_no_sync, import_rocksdb);
+    }
+
+    // No `rocksdb_import_rejects_backend_version`: deliberately — the manifest's
+    // backend_version is informational for RocksDB (the engine reads older
+    // formats; its own open is the arbiter). See `RocksDbSnapshot::import`.
+
+    #[test]
+    fn rocksdb_import_rejects_cursor_mismatch() {
+        check_import_rejects_cursor_mismatch(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_import_rejects_nonempty_dest() {
+        check_import_rejects_nonempty_dest(open_no_sync, import_rocksdb);
+    }
+
+    #[test]
+    fn rocksdb_export_rejects_nonempty_dest() {
+        check_export_rejects_nonempty_dest(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_export_empty_store() {
+        check_export_empty_store(open_no_sync, import_rocksdb);
+    }
+
+    /// `settle` (flush + wait-for-compact) must preserve the fold byte-for-byte.
+    #[test]
+    fn rocksdb_settle_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &stream());
+        s.settle().expect("settle");
+        assert_eq!(dump(&s), expected_state(), "state survives settle");
+    }
+
+    /// NO_SYNC crash-tail recovery. With sync off, commits reach the WAL but are
+    /// not fsync'd; data and cursor still share one atomic WriteBatch, so whatever
+    /// survives is mutually consistent. We can't deterministically simulate a
+    /// power-loss (a clean drop flushes the WAL), so this asserts the load-bearing
+    /// invariants: after reopen the recovered cursor matches the recovered data,
+    /// and re-folding the tail from that cursor is idempotent (safe to replay).
+    #[test]
+    fn rocksdb_no_sync_tail_is_consistent_and_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let updates = stream();
+
+        {
+            let (_r, mut s) = open_no_sync(&path);
+            fold(&mut s, &updates);
+        } // drop flushes the WAL
+
+        // Recovered cursor names rev 7, and the data it names is all present.
+        let (cursor, s) = open_no_sync(&path);
+        assert_eq!(
+            cursor.as_u64(),
+            Some(7),
+            "cursor recovered, never ahead of data"
+        );
+        assert_eq!(dump(&s), expected_state());
+        drop(s);
+
+        // Re-folding the tail (the last batch, revs 6..=7) from the recovered
+        // cursor is idempotent — replaying the un-synced tail never corrupts state.
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &updates[5..]);
+        assert_eq!(
+            dump(&s),
+            expected_state(),
+            "re-folding the tail is idempotent"
+        );
+    }
+
+    /// `RocksDbReader::multi_get` is positionally aligned with its input and
+    /// agrees with `get` for every key — hits, misses, deleted keys, and the
+    /// empty-value CAS-tombstone shape — including duplicates and empty input.
+    #[test]
+    fn rocksdb_multi_get_matches_get() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &stream());
+        // One more apply: an empty-valued put (the CAS-tombstone shape).
+        s.apply(&[put("lock", b"", 8)], &WatchCursor::from_u64(8))
+            .expect("apply lock");
+        let reader = s.reader();
+
+        let keys = [
+            "node.a",  // live
+            "missing", // never written
+            "node.b",  // deleted by the stream
+            "lock",    // present with an empty value (CAS tombstone)
+            "node.a",  // duplicate of a live key
+        ];
+        let got = reader.multi_get(keys.iter().copied()).expect("multi_get");
+
+        assert_eq!(got.len(), keys.len(), "positionally aligned with input");
+        for (key, entry) in keys.iter().zip(&got) {
+            let single = reader.get(key).expect("get");
+            assert_eq!(
+                entry.as_ref().map(|e| (&e.key, &e.value)),
+                single.as_ref().map(|e| (&e.key, &e.value)),
+                "multi_get and get disagree for {key:?}"
+            );
+        }
+        assert!(got[0].is_some(), "live key resolves");
+        assert!(got[1].is_none(), "missing key is None");
+        assert!(got[2].is_none(), "deleted key is None");
+        assert!(
+            got[3].as_ref().is_some_and(|e| e.value.is_empty()),
+            "empty value is present, not confused with a delete"
+        );
+
+        let empty = reader.multi_get(std::iter::empty()).expect("empty input");
+        assert!(empty.is_empty());
+    }
+
+    /// With sync on, every commit fsyncs the WAL — round-trip must still hold.
+    #[test]
+    fn rocksdb_sync_mode_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        {
+            let (_r, mut s) = RocksDbSnapshot::open(
+                &path,
+                RocksDbConfig {
+                    sync: true,
+                    ..Default::default()
+                },
+            )
+            .expect("open rocksdb sync");
+            fold(&mut s, &stream());
+        }
+        let (cursor, s) = RocksDbSnapshot::open(
+            &path,
+            RocksDbConfig {
+                sync: true,
+                ..Default::default()
+            },
+        )
+        .expect("reopen rocksdb sync");
         assert_eq!(cursor.as_u64(), Some(7));
         assert_eq!(dump(&s), expected_state());
     }
