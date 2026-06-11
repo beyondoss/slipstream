@@ -10,6 +10,12 @@ rust = { version = "1.92", components = "clippy,rustfmt" }
 yamlfmt = "0.12.1"
 dprint = "0.50.2"
 "ubi:nats-io/nats-server" = "2.14.1"
+# Real-S3 transport tests (tests/transport_s3.rs): single static binaries, no
+# Docker — same pattern as nats-server. mc creates the test bucket. (ubi can't
+# install minio: its releases ship extension-less raw binaries that ubi's
+# asset filter rejects, hence the asdf-backend plugin.)
+"asdf:mise-plugins/mise-minio" = "2025-09-07T16-13-09Z"
+"aqua:minio/mc" = "RELEASE.2025-08-13T08-35-41Z"
 
 [tasks.format]
 description = "Auto-format all code using dprint (Go, TypeScript, YAML, JSON, Markdown)"

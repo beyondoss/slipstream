@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 /// Backends store whatever they need to resume (NATS: u64 revision).
 /// Callers should treat this as opaque and only pass it back to
 /// `watch_all_from` / `watch_prefix_from`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchCursor(VersionToken);
 
 impl WatchCursor {
@@ -131,13 +131,13 @@ impl VersionToken {
 
     /// Create from FDB versionstamp (10 bytes).
     ///
-    /// `pub(crate)` until a FoundationDB backend ships and the round-trip is
+    /// `cfg(test)` until a FoundationDB backend ships and the round-trip is
     /// tested end-to-end: a 10-byte token has no `as_u64()`, so handing one to
     /// the NATS backend's CAS path yields an unactionable `OperationFailed`.
-    /// Exposed within the crate for the snapshot length-prefixed-version tests.
-    // Only the test suite constructs one today; retained as the seam the FDB
-    // backend will use, so `allow(dead_code)` rather than deletion.
-    #[allow(dead_code)]
+    /// Today it exists only for the snapshot length-prefixed-version tests; an
+    /// FDB backend should lift the gate (and the visibility) rather than add a
+    /// second constructor.
+    #[cfg(test)]
     pub(crate) fn from_fdb_versionstamp(vs: &[u8; 10]) -> Self {
         Self { len: 10, buf: *vs }
     }
@@ -252,13 +252,20 @@ pub trait KvReader: Send + Sync {
 }
 
 /// Watch capability - optional, not all stores support real-time updates.
+///
+/// The non-`_from` watches are **state-sync** streams: they first deliver the
+/// current value of every matching key (the "re-list", as a stream of puts plus
+/// any surviving delete markers), then live updates. A consumer starting with
+/// no cursor therefore converges on the full bucket state without a separate
+/// scan — and without the scan-to-watch race a separate scan would open. The
+/// `_from` variants skip the re-list and deliver only the delta past the cursor.
 #[async_trait]
 pub trait KvWatcher: Send + Sync {
-    /// Watch all keys for changes. Sends updates through the channel.
-    /// Returns when the watch ends or an error occurs.
+    /// Watch all keys: current state first, then live changes. Sends updates
+    /// through the channel. Returns when the watch ends or an error occurs.
     async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
-    /// Watch keys matching a prefix.
+    /// Watch keys matching a prefix: current state first, then live changes.
     async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
     /// Watch keys matching ANY of `prefixes`, delivered through one channel.
@@ -269,8 +276,7 @@ pub trait KvWatcher: Send + Sync {
     /// per-stream resource (measured at ~tens of KB of server state each, growing
     /// super-linearly past a few thousand on one stream), so a watcher scoped to N
     /// prefixes must not cost N consumers.
-    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>)
-    -> Result<(), KvError>;
+    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
     /// Resume watching all keys from a previously saved cursor position.
     ///
@@ -298,6 +304,27 @@ pub trait KvWatcher: Send + Sync {
     ) -> Result<(), KvError> {
         let _ = cursor;
         self.watch_prefix(prefix, tx).await
+    }
+
+    /// Resume watching the union of `prefixes` from a previously saved cursor.
+    ///
+    /// Same single-consumer contract as [`watch_prefixes`](Self::watch_prefixes),
+    /// same delta semantics as the other `_from` variants: only updates past the
+    /// cursor are delivered, or [`KvError::CursorExpired`] if the backend has
+    /// compacted past it.
+    ///
+    /// Default implementation ignores the cursor and delegates to
+    /// `watch_prefixes()` — correct (the state-sync re-list is a superset of any
+    /// delta) but a full replay; backends that can seek a multi-filter stream
+    /// should override it.
+    async fn watch_prefixes_from(
+        &self,
+        prefixes: &[&str],
+        cursor: &WatchCursor,
+        tx: Sender<KvUpdate>,
+    ) -> Result<(), KvError> {
+        let _ = cursor;
+        self.watch_prefixes(prefixes, tx).await
     }
 }
 

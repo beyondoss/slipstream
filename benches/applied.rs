@@ -89,7 +89,9 @@ fn bench_batch_throughput(c: &mut Criterion) {
                         watcher as Arc<dyn KvWatcher>,
                         WatchScope::All,
                         None,
+                        None, // reader: cursor-expired resync not exercised here
                         None::<slipstream::AppendLogSnapshot>,
+                        None,
                         BatchConfig {
                             window: Duration::from_millis(10),
                             max: 100,

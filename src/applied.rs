@@ -50,27 +50,82 @@
 //! of [`watch_applied`] and aborts the watch — that is the caller's contract,
 //! the same as a panic in any other supplied closure.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
-use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
-use crate::snapshot::SnapshotStore;
+use crate::artifact::ExportManifest;
+use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, WatchCursor};
+use crate::snapshot::{SnapshotError, SnapshotStore};
 
-/// What to watch: every key, or every key under a prefix.
+/// A request, sent into a running [`watch_applied`] loop, to export the fold it
+/// owns (see [`SnapshotStore::export_to`]).
+///
+/// `watch_applied` takes its snapshot store **by value**, so a consumer that
+/// wants periodic artifacts of a live fold cannot call `export_to` itself. It
+/// instead passes an `mpsc::Receiver<ExportRequest>` to [`watch_applied`] and
+/// sends requests through the paired sender. The loop handles a request
+/// between batch flushes — after flushing any pending batch — so the artifact's
+/// embedded cursor is exactly the applied cursor at the moment of export.
+///
+/// The export result (or error) comes back on `reply`; an export failure is
+/// reported there and the watch keeps running (the snapshot is a cache — a
+/// failed artifact is the requester's problem, not the fold's).
+pub struct ExportRequest {
+    /// Where the artifact directory will be created. Must not exist (or be an
+    /// empty directory); same filesystem as the fold for cheap hardlinks.
+    pub dest_dir: PathBuf,
+    /// Receives the sealed manifest on success. A dropped receiver is ignored.
+    pub reply: oneshot::Sender<Result<ExportManifest, SnapshotError>>,
+}
+
+/// What to watch: every key, every key under a prefix, or the union of several
+/// prefixes.
 ///
 /// Mirrors the [`KvWatcher`] surface — `All` maps to `watch_all` /
-/// `watch_all_from`, `Prefix` to `watch_prefix` / `watch_prefix_from`.
+/// `watch_all_from`, `Prefix` to `watch_prefix` / `watch_prefix_from`,
+/// `Prefixes` to `watch_prefixes` / `watch_prefixes_from` (one multi-filter
+/// consumer for the whole union, never one consumer per prefix).
 #[derive(Debug, Clone)]
 pub enum WatchScope {
     /// Watch all keys in the bucket.
     All,
     /// Watch only keys beginning with this prefix.
     Prefix(String),
+    /// Watch keys beginning with ANY of these prefixes, on a single consumer.
+    Prefixes(Vec<String>),
 }
+
+impl WatchScope {
+    /// The scope as a list of key prefixes (`All` = the empty prefix), for
+    /// callers that enumerate scope contents (live listings, fold ranges).
+    fn prefixes(&self) -> Vec<String> {
+        match self {
+            WatchScope::All => vec![String::new()],
+            WatchScope::Prefix(p) => vec![p.clone()],
+            WatchScope::Prefixes(ps) => ps.clone(),
+        }
+    }
+}
+
+/// Internal: a cursor-expired resync handoff from the watch task to the main
+/// loop. Carries the bucket's live key listing for the watch scope; the main
+/// loop diffs it against the fold and applies synthetic deletes for keys that
+/// vanished during the gap, then acks so the watch task can start the fallback
+/// watch — the ack ordering guarantees every synthetic delete is applied before
+/// the first re-list put arrives.
+struct ResyncRequest {
+    live_keys: Vec<String>,
+    ack: oneshot::Sender<()>,
+}
+
+/// Internal: what the watch task needs to initiate a resync — the reader that
+/// lists live keys and the channel into the main loop that owns the fold.
+type ResyncHandle = (Arc<dyn KvReader>, mpsc::Sender<ResyncRequest>);
 
 /// Batching policy for [`watch_applied`].
 ///
@@ -115,9 +170,25 @@ impl Default for BatchConfig {
 /// whose `apply` had not returned. The store fold is atomic (data + cursor), so a
 /// crash leaves the store consistent and resume re-folds only the tail.
 ///
+/// # Cursor expiry and stale-key resync
+///
 /// On [`KvError::CursorExpired`] from the `*_from` resume path, this logs and
-/// falls back to a full-scope watch (`watch_all` / `watch_prefix`). Callers see
-/// the full re-list as a stream of puts, exactly as the hand-rolled loops did.
+/// falls back to a full-scope watch (`watch_all` / `watch_prefix` /
+/// `watch_prefixes`), whose state-sync re-list re-delivers the current value of
+/// every in-scope key as puts. The re-list alone cannot cover keys that were
+/// **deleted during the gap** and whose delete markers the backend has since
+/// evicted — they simply don't appear, leaving the fold (and the caller's
+/// domain state) holding them forever.
+///
+/// When both `reader` and `store` are provided, the expiry path closes that
+/// hole: before the fallback watch starts, the bucket's live keys are listed
+/// via `reader`, diffed against the fold's in-scope keys, and a synthetic
+/// [`KvUpdate::Delete`] (with an unknown [`VersionToken`](crate::VersionToken)) is run through
+/// `parse`/`apply`/`store` for each key that vanished. The synthetic deletes
+/// are strictly ordered before the first re-list put, so a key deleted and
+/// re-created during the gap converges correctly. Without a `reader` (or
+/// without a `store` to diff against) the fallback is re-list-only and a
+/// warning marks the possible stale keys.
 ///
 /// See `ARCHITECTURE.md` ("Applied-Cursor Watch") for the invariant and its
 /// rationale.
@@ -132,13 +203,25 @@ impl Default for BatchConfig {
 #[allow(clippy::too_many_arguments)]
 // The flush macro resets `batch_high`/`batch_deadline` for the next loop
 // iteration. At the two flush sites that return immediately afterward (shutdown,
-// channel-close) those resets are dead stores — correct, but flagged.
+// channel-close) those resets are dead stores — correct, but flagged. The allow
+// must sit on the function: a statement-scoped `#[allow]` inside the macro body
+// trips the experimental attributes-on-expressions gate (E0658) on stable.
 #[allow(unused_assignments)]
 pub async fn watch_applied<U, S, P, A, O>(
     watcher: Arc<dyn KvWatcher>,
     scope: WatchScope,
     resume: Option<WatchCursor>,
+    // `Some(reader)` arms the cursor-expired stale-key resync (see the function
+    // docs); `None` keeps the re-list-only fallback. Only consulted on expiry —
+    // the hot path never touches it.
+    reader: Option<Arc<dyn KvReader>>,
     mut store: Option<S>,
+    // `Some(rx)` arms an export-request arm in the select loop: each
+    // [`ExportRequest`] is handled between flushes (pending batch flushed
+    // first), so the exported artifact's cursor is exactly the applied cursor.
+    // `None` (or dropping the paired sender) leaves the loop's behavior
+    // unchanged.
+    mut exports: Option<mpsc::Receiver<ExportRequest>>,
     config: BatchConfig,
     mut parse: P,
     mut apply: A,
@@ -164,12 +247,31 @@ where
         None => WatchCursor::none(),
     };
 
+    // The scope's prefixes, for the resync diff against the fold. Cloned out
+    // before `scope` moves into the watch task.
+    let scope_prefixes = scope.prefixes();
+
+    // Cursor-expired resync channel, armed only when there is a reader to list
+    // live keys AND a store to diff them against. The watch task sends the live
+    // listing here and waits for the ack before starting the fallback watch, so
+    // synthetic deletes always precede the re-list.
+    let (resync_pair, mut resyncs): (Option<ResyncHandle>, Option<mpsc::Receiver<ResyncRequest>>) =
+        match reader {
+            Some(reader) if store.is_some() => {
+                let (rs_tx, rs_rx) = mpsc::channel(1);
+                (Some((reader, rs_tx)), Some(rs_rx))
+            }
+            _ => (None, None),
+        };
+
     // Spawn the watch task. It owns the cursor-expired fallback so the main loop
     // only ever sees a clean ordered stream of updates on `rx`.
     let (tx, mut rx) = mpsc::channel::<KvUpdate>(256);
     let handle = {
         let watcher = Arc::clone(&watcher);
-        tokio::spawn(async move { run_watch(watcher.as_ref(), &scope, resume, tx).await })
+        tokio::spawn(
+            async move { run_watch(watcher.as_ref(), &scope, resume, resync_pair, tx).await },
+        )
     };
 
     // Batch state.
@@ -180,7 +282,9 @@ where
     // cursor to it after a single atomic `apply` is correct: having seen the max
     // means we've seen everything below it, and a rejected entry is still
     // "nothing to apply", hence covered. Reset to `none()` after every flush.
-    let batch_cap = config.max.clamp(1, 64);
+    // Pre-size to the flush bound so no batch ever re-climbs the reallocation
+    // ladder; `max(1)` only guards a nonsensical `max = 0` config.
+    let batch_cap = config.max.max(1);
     let mut batch: Vec<U> = Vec::with_capacity(batch_cap);
     // Raw received updates for the durable `store`, in revision order. Only
     // populated when a `store` is present; the store folds the *raw* updates
@@ -204,7 +308,9 @@ where
     macro_rules! flush {
         () => {{
             // Nothing received since the last flush → nothing to do at all.
-            if !batch.is_empty() || !batch_high.is_none() {
+            // (`raw_batch` can be non-empty with no cursor advance only via the
+            // resync path's synthetic deletes, which carry no revision.)
+            if !batch.is_empty() || !raw_batch.is_empty() || !batch_high.is_none() {
                 if !batch.is_empty() {
                     // INVARIANT: apply() runs and RETURNS before any cursor
                     // advance below. Move the batch out so a panicking apply
@@ -215,34 +321,44 @@ where
                     // ladder (4→8→…→cap).
                     apply(std::mem::replace(&mut batch, Vec::with_capacity(batch_cap)));
                 }
-                if !batch_high.is_none() {
+                let advanced = !batch_high.is_none();
+                if advanced {
                     applied = batch_high.clone();
-                    if let Some(mut st) = store.take() {
-                        let raw = std::mem::take(&mut raw_batch);
-                        let cur = applied.clone();
-                        // Hand the store back unconditionally on a clean return so
-                        // a *failed* apply (Ok(Err)) keeps the watch running; only
-                        // a *panicked* task (Err) loses the store and is fatal.
-                        match tokio::task::spawn_blocking(move || {
-                            let res = st.apply(&raw, &cur);
-                            (st, res)
-                        })
-                        .await
-                        {
-                            Ok((st, Ok(()))) => store = Some(st),
-                            Ok((st, Err(e))) => {
-                                warn!(error = %e, "snapshot store apply failed; continuing");
-                                store = Some(st);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "snapshot store task panicked; aborting watch");
-                                handle.abort();
-                                return Err(KvError::WatchError(format!(
-                                    "snapshot store task panicked: {e}"
-                                )));
-                            }
+                }
+                if !raw_batch.is_empty()
+                    && let Some(mut st) = store.take()
+                {
+                    let raw = std::mem::take(&mut raw_batch);
+                    // Fold at the post-advance cursor. A synthetic-deletes-only
+                    // batch leaves the cursor where it was (the deletes are a
+                    // state correction, not log entries), which is safe: an
+                    // unchanged — possibly expired — cursor only ever re-runs
+                    // this same resync on the next restart.
+                    let cur = applied.clone();
+                    // Hand the store back unconditionally on a clean return so
+                    // a *failed* apply (Ok(Err)) keeps the watch running; only
+                    // a *panicked* task (Err) loses the store and is fatal.
+                    match tokio::task::spawn_blocking(move || {
+                        let res = st.apply(&raw, &cur);
+                        (st, res)
+                    })
+                    .await
+                    {
+                        Ok((st, Ok(()))) => store = Some(st),
+                        Ok((st, Err(e))) => {
+                            warn!(error = %e, "snapshot store apply failed; continuing");
+                            store = Some(st);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "snapshot store task panicked; aborting watch");
+                            handle.abort();
+                            return Err(KvError::WatchError(format!(
+                                "snapshot store task panicked: {e}"
+                            )));
                         }
                     }
+                }
+                if advanced {
                     on_applied(applied.clone());
                     batch_high = WatchCursor::none();
                 }
@@ -288,6 +404,121 @@ where
             // Batch window elapsed.
             () = &mut sleep, if batch_deadline.is_some() => {
                 flush!();
+            }
+
+            // Cursor-expired resync. Placed before `rx.recv()` (biased) so the
+            // synthetic deletes are folded before any update the fallback watch
+            // delivers — though the ack protocol already guarantees the fallback
+            // hasn't started while this arm runs. Diff the fold's in-scope keys
+            // against the bucket's live listing; anything the fold holds that
+            // the bucket no longer does vanished during the gap (its delete
+            // marker evicted with the cursor), so synthesize the delete the
+            // re-list can't deliver.
+            req = async { resyncs.as_mut().expect("arm guarded by is_some").recv().await },
+                if resyncs.is_some() => {
+                match req {
+                    Some(ResyncRequest { live_keys, ack }) => {
+                        // Flush first so the diff runs against a fold that
+                        // reflects everything received so far.
+                        flush!();
+                        let live: std::collections::HashSet<&str> =
+                            live_keys.iter().map(String::as_str).collect();
+                        let mut stale: Vec<String> = Vec::new();
+                        if let Some(st) = &store {
+                            for prefix in &scope_prefixes {
+                                match st.range(prefix) {
+                                    Ok(entries) => stale.extend(
+                                        entries
+                                            .into_iter()
+                                            .filter(|e| !live.contains(e.key.as_str()))
+                                            .map(|e| e.key),
+                                    ),
+                                    Err(e) => {
+                                        warn!(error = %e, prefix = %prefix,
+                                            "resync fold range failed; stale keys under this prefix may persist");
+                                    }
+                                }
+                            }
+                        }
+                        // Overlapping prefixes can list a key twice.
+                        stale.sort_unstable();
+                        stale.dedup();
+                        if !stale.is_empty() {
+                            warn!(stale = stale.len(), "cursor-expired resync: deleting keys that vanished during the gap");
+                        }
+                        for key in stale {
+                            // Synthetic: carries no revision (unknown version)
+                            // and so never advances the cursor.
+                            let u = KvUpdate::Delete {
+                                key,
+                                version: crate::kv::VersionToken::unknown(),
+                            };
+                            if store.is_some() {
+                                raw_batch.push(u.clone());
+                            }
+                            if let Some(parsed) = parse(&u) {
+                                batch.push(parsed);
+                            }
+                        }
+                        flush!();
+                        // Ack AFTER the deletes are applied: the watch task is
+                        // holding the fallback watch until it hears back, which
+                        // is what orders deletes before the re-list.
+                        let _ = ack.send(());
+                    }
+                    None => resyncs = None,
+                }
+            }
+
+            // Export request. Placed after shutdown/window (they stay prompt)
+            // and before `rx.recv()` so a firehose of updates cannot starve an
+            // export indefinitely. The pending batch is flushed first, so the
+            // exported cursor is exactly the applied cursor; the export itself
+            // runs on a blocking task with the store moved in and taken back —
+            // the same offload the flush path uses.
+            req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
+                if exports.is_some() => {
+                match req {
+                    Some(ExportRequest { dest_dir, reply }) => {
+                        flush!();
+                        match store.take() {
+                            Some(mut st) => {
+                                match tokio::task::spawn_blocking(move || {
+                                    let res = st.export_to(&dest_dir);
+                                    (st, res)
+                                })
+                                .await
+                                {
+                                    // Hand the store back on any clean return; an
+                                    // export failure goes to the requester only —
+                                    // the watch keeps running (the snapshot is a
+                                    // cache). A panicked task lost the store,
+                                    // which breaks the resume guarantee: fatal,
+                                    // same as the flush path's apply panic.
+                                    Ok((st, res)) => {
+                                        store = Some(st);
+                                        let _ = reply.send(res);
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "snapshot export task panicked; aborting watch");
+                                        handle.abort();
+                                        return Err(KvError::WatchError(format!(
+                                            "snapshot export task panicked: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = reply.send(Err(SnapshotError::Backend(
+                                    "watch_applied runs without a snapshot store; nothing to export"
+                                        .into(),
+                                )));
+                            }
+                        }
+                    }
+                    // Sender dropped: disarm the arm for the rest of the run.
+                    None => exports = None,
+                }
             }
 
             update = rx.recv() => {
@@ -350,11 +581,13 @@ where
 }
 
 /// Run the underlying watch for `scope`, resuming from `resume` when it carries
-/// a position, with the [`KvError::CursorExpired`] → full-watch fallback.
+/// a position, with the [`KvError::CursorExpired`] → resync + full-watch
+/// fallback.
 async fn run_watch(
     watcher: &dyn KvWatcher,
     scope: &WatchScope,
     resume: Option<WatchCursor>,
+    resync: Option<ResyncHandle>,
     tx: mpsc::Sender<KvUpdate>,
 ) -> Result<(), KvError> {
     // Resume only when the cursor carries a real position; an absent or `none()`
@@ -368,13 +601,10 @@ async fn run_watch(
             if let Some(cursor) = resume_cursor {
                 match watcher.watch_all_from(&cursor, tx.clone()).await {
                     Err(KvError::CursorExpired) => {
-                        // TODO(v2): signal a "resync" to the caller so it can
-                        // diff the full re-list against prior state and emit
-                        // synthetic deletes for keys that vanished during the
-                        // gap (see Snapshot::stale_keys). For v1 the full
-                        // re-list is replayed as a stream of puts, matching the
-                        // hand-rolled loops this combinator replaces.
-                        warn!("watch cursor expired, falling back to full watch_all");
+                        warn!(
+                            "watch cursor expired; resyncing, then falling back to full watch_all"
+                        );
+                        resync_stale_keys(scope, &resync).await;
                         watcher.watch_all(tx).await
                     }
                     other => other,
@@ -387,8 +617,10 @@ async fn run_watch(
             if let Some(cursor) = resume_cursor {
                 match watcher.watch_prefix_from(prefix, &cursor, tx.clone()).await {
                     Err(KvError::CursorExpired) => {
-                        // TODO(v2): see the watch_all arm above.
-                        warn!("watch cursor expired, falling back to full watch_prefix");
+                        warn!(
+                            "watch cursor expired; resyncing, then falling back to full watch_prefix"
+                        );
+                        resync_stale_keys(scope, &resync).await;
                         watcher.watch_prefix(prefix, tx).await
                     }
                     other => other,
@@ -397,6 +629,69 @@ async fn run_watch(
                 watcher.watch_prefix(prefix, tx).await
             }
         }
+        WatchScope::Prefixes(prefixes) => {
+            let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+            if let Some(cursor) = resume_cursor {
+                match watcher
+                    .watch_prefixes_from(&refs, &cursor, tx.clone())
+                    .await
+                {
+                    Err(KvError::CursorExpired) => {
+                        warn!(
+                            "watch cursor expired; resyncing, then falling back to full watch_prefixes"
+                        );
+                        resync_stale_keys(scope, &resync).await;
+                        watcher.watch_prefixes(&refs, tx).await
+                    }
+                    other => other,
+                }
+            } else {
+                watcher.watch_prefixes(&refs, tx).await
+            }
+        }
+    }
+}
+
+/// Cursor-expired stale-key resync, run BEFORE the fallback watch is
+/// established: list the scope's live keys, hand them to the main loop (which
+/// diffs them against the fold and applies synthetic deletes), and wait for the
+/// ack. That ordering — deletes applied, then fallback watch armed — is what
+/// makes a delete-then-recreate during the gap converge: the synthetic delete
+/// always lands before the re-list put.
+///
+/// Best-effort: with no reader/store wired (`resync` is `None`), or a failed
+/// listing, this degrades to the warn-and-relist-only fallback — keys deleted
+/// during the gap stay in the fold until their next update.
+async fn resync_stale_keys(scope: &WatchScope, resync: &Option<ResyncHandle>) {
+    let Some((reader, resync_tx)) = resync else {
+        warn!(
+            "no reader wired for cursor-expired resync; keys deleted during the gap may persist in the fold"
+        );
+        return;
+    };
+    let mut live_keys = Vec::new();
+    for prefix in scope.prefixes() {
+        match reader.keys(&prefix).await {
+            Ok(keys) => live_keys.extend(keys),
+            Err(e) => {
+                warn!(error = %e, prefix = %prefix,
+                    "resync live-key listing failed; keys deleted during the gap may persist in the fold");
+                return;
+            }
+        }
+    }
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if resync_tx
+        .send(ResyncRequest {
+            live_keys,
+            ack: ack_tx,
+        })
+        .await
+        .is_ok()
+    {
+        // A dropped ack (main loop shutting down) just means the fallback watch
+        // is about to die with it; nothing to recover.
+        let _ = ack_rx.await;
     }
 }
 
@@ -505,6 +800,47 @@ mod tests {
             self.deliver(&self.from, tx).await;
             Ok(())
         }
+
+        // Same mirroring for the multi-prefix resume arm.
+        async fn watch_prefixes_from(
+            &self,
+            _prefixes: &[&str],
+            _cursor: &WatchCursor,
+            tx: Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            if self.from_expires {
+                return Err(KvError::CursorExpired);
+            }
+            self.deliver(&self.from, tx).await;
+            Ok(())
+        }
+    }
+
+    /// A reader whose `keys()` serves a scripted live listing — the only call
+    /// the cursor-expired resync makes. Filters by prefix like a real backend
+    /// so prefix-scoped resyncs are exercised faithfully.
+    struct MockReader {
+        live: Vec<String>,
+    }
+
+    #[async_trait]
+    impl KvReader for MockReader {
+        async fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
+
+        async fn keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+            Ok(self
+                .live
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn scan(&self, _prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
     }
 
     /// A watcher whose entry points all fail. Used to prove the watch task's
@@ -558,7 +894,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch| ab.lock().unwrap().push(batch),
@@ -592,7 +930,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| {
@@ -634,7 +974,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600), // effectively never
                 max,
@@ -673,7 +1015,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600), // window won't fire
                 max: 100,
@@ -723,7 +1067,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max,
@@ -769,7 +1115,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             // Reject everything — simulates corrupt/irrelevant entries.
             |_u: &KvUpdate| -> Option<Vec<u8>> { None },
@@ -812,7 +1160,9 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
+            None,                           // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -828,6 +1178,203 @@ mod tests {
             vec![b"1".to_vec(), b"2".to_vec()],
             "fallback full watch's updates were applied"
         );
+    }
+
+    /// Cursor-expired resync: with a reader + store wired, a key the fold holds
+    /// that the live listing no longer does gets a synthetic delete — applied
+    /// strictly BEFORE the fallback re-list — and the persisted fold converges
+    /// to the live state. The synthetic delete (unknown version) must not move
+    /// the cursor; the re-list put must.
+    #[tokio::test]
+    async fn cursor_expired_resync_deletes_stale_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("resync.snap");
+        let (_r, mut store) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        // The fold from the previous run: node.a and node.b at cursor 2.
+        store
+            .apply(
+                &[put("node.a", b"1", 1), put("node.b", b"2", 2)],
+                &WatchCursor::from_u64(2),
+            )
+            .unwrap();
+
+        // During the gap node.b was deleted (marker since evicted) and node.a
+        // updated; the resume cursor (2) has expired. The fallback re-list
+        // therefore carries only the surviving key.
+        let mock = MockWatcher {
+            full: Mutex::new(Some(vec![put("node.a", b"1b", 10)])),
+            from: Mutex::new(Some(vec![])),
+            from_expires: true,
+            hold: false,
+        };
+        let reader = MockReader {
+            live: vec!["node.a".to_string()],
+        };
+
+        // Record everything `parse` sees, in order, deletes included.
+        let seen = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let s = Arc::clone(&seen);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            Arc::new(mock),
+            WatchScope::All,
+            Some(WatchCursor::from_u64(2)),
+            Some(Arc::new(reader) as Arc<dyn KvReader>),
+            Some(store),
+            None,
+            BatchConfig::default(),
+            move |u: &KvUpdate| {
+                s.lock()
+                    .unwrap()
+                    .push((u.key().to_string(), matches!(u, KvUpdate::Delete { .. })));
+                Some(())
+            },
+            |_batch: Vec<()>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        // The re-list put advanced the cursor; the synthetic delete did not.
+        assert_eq!(cursor.as_u64(), Some(10));
+        // The synthetic delete strictly precedes the re-list put.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("node.b".to_string(), true), ("node.a".to_string(), false)],
+            "synthetic delete must be applied before the fallback re-list"
+        );
+
+        // The persisted fold converged: stale key gone, live key updated.
+        let snap = crate::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(snap.cursor.as_u64(), Some(10));
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries["node.a"].value, b"1b");
+    }
+
+    /// A prefix-scoped resync diffs only in-scope keys: an out-of-scope key the
+    /// fold holds survives, the in-scope stale key is deleted, and a flush
+    /// containing only synthetic deletes leaves the cursor untouched.
+    #[tokio::test]
+    async fn cursor_expired_resync_respects_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("resync-scope.snap");
+        let (_r, mut store) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        store
+            .apply(
+                &[put("node.b", b"2", 1), put("other.z", b"9", 2)],
+                &WatchCursor::from_u64(2),
+            )
+            .unwrap();
+
+        // Expired resume; the bucket no longer has ANY node.* keys; the
+        // fallback re-list is empty.
+        let mock = MockWatcher {
+            full: Mutex::new(Some(vec![])),
+            from: Mutex::new(Some(vec![])),
+            from_expires: true,
+            hold: false,
+        };
+        let reader = MockReader { live: vec![] };
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            Arc::new(mock),
+            WatchScope::Prefix("node.".to_string()),
+            Some(WatchCursor::from_u64(2)),
+            Some(Arc::new(reader) as Arc<dyn KvReader>),
+            Some(store),
+            None,
+            BatchConfig::default(),
+            |_u: &KvUpdate| Some(()),
+            |_batch: Vec<()>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        // Deletes-only flush: cursor stays at the resume position.
+        assert_eq!(cursor.as_u64(), Some(2));
+
+        let snap = crate::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(snap.cursor.as_u64(), Some(2));
+        assert!(
+            !snap.entries.contains_key("node.b"),
+            "in-scope stale key must be resync-deleted"
+        );
+        assert_eq!(
+            snap.entries["other.z"].value, b"9",
+            "out-of-scope key must survive a prefix-scoped resync"
+        );
+    }
+
+    /// `WatchScope::Prefixes` dispatches to `watch_prefixes` (no resume) and to
+    /// `watch_prefixes_from` with the expiry → full-watch fallback (resume).
+    #[tokio::test]
+    async fn prefixes_scope_dispatches_full_watch() {
+        let updates = vec![put("a.x", b"1", 1), put("b.y", b"2", 2)];
+        let watcher = Arc::new(MockWatcher::new(updates, false));
+        let applied_batches = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ab = Arc::clone(&applied_batches);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            watcher,
+            WatchScope::Prefixes(vec!["a.".to_string(), "b.".to_string()]),
+            None,
+            None, // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            None,
+            BatchConfig::default(),
+            parse_put,
+            move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
+            move |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cursor.as_u64(), Some(2));
+        assert_eq!(
+            *applied_batches.lock().unwrap(),
+            vec![b"1".to_vec(), b"2".to_vec()]
+        );
+    }
+
+    /// `WatchScope::Prefixes` resume whose cursor has expired falls back to the
+    /// full multi-prefix watch and applies its updates.
+    #[tokio::test]
+    async fn prefixes_scope_expired_resume_falls_back() {
+        let mock = MockWatcher {
+            full: Mutex::new(Some(vec![put("a.x", b"1", 7)])),
+            from: Mutex::new(Some(vec![])),
+            from_expires: true,
+            hold: false,
+        };
+        let applied_batches = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ab = Arc::clone(&applied_batches);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            Arc::new(mock),
+            WatchScope::Prefixes(vec!["a.".to_string()]),
+            Some(WatchCursor::from_u64(3)),
+            None, // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            None,
+            BatchConfig::default(),
+            parse_put,
+            move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
+            move |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cursor.as_u64(), Some(7));
+        assert_eq!(*applied_batches.lock().unwrap(), vec![b"1".to_vec()]);
     }
 
     /// End-to-end with a real snapshot file: after the run, the persisted
@@ -848,7 +1395,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             Some(store),
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -895,7 +1444,9 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(WatchCursor::from_u64(9)), // resume past rev 9 — not expired
+            None,                           // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -933,7 +1484,9 @@ mod tests {
             watcher,
             WatchScope::Prefix("node.".to_string()),
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -947,6 +1500,53 @@ mod tests {
         assert_eq!(
             *applied_batches.lock().unwrap(),
             vec![b"1".to_vec(), b"2".to_vec()]
+        );
+    }
+
+    /// `WatchScope::Prefix` happy-path resume: a non-expired cursor takes the
+    /// `watch_prefix_from` path and only the delta is applied — the prefix
+    /// twin of `resume_from_cursor_delivers_only_delta`.
+    #[tokio::test]
+    async fn prefix_resume_from_cursor_delivers_only_delta() {
+        let mock = MockWatcher {
+            // `full` would be delivered only if the resume path were (wrongly)
+            // bypassed; a distinguishing value makes that visible.
+            full: Mutex::new(Some(vec![put("node.x", b"FULL", 1)])),
+            from: Mutex::new(Some(vec![put("node.c", b"3", 10), put("node.d", b"4", 11)])),
+            from_expires: false,
+            hold: false,
+        };
+        let watcher = Arc::new(mock);
+
+        let applied_batches = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ab = Arc::clone(&applied_batches);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            watcher,
+            WatchScope::Prefix("node.".to_string()),
+            Some(WatchCursor::from_u64(9)), // resume past rev 9 — not expired
+            None,                           // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            None,
+            BatchConfig::default(),
+            parse_put,
+            move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
+            move |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cursor.as_u64(),
+            Some(11),
+            "cursor advances to the delta max"
+        );
+        assert_eq!(
+            *applied_batches.lock().unwrap(),
+            vec![b"3".to_vec(), b"4".to_vec()],
+            "only the post-cursor delta is applied via watch_prefix_from"
         );
     }
 
@@ -971,7 +1571,9 @@ mod tests {
             watcher,
             WatchScope::Prefix("node.".to_string()),
             Some(WatchCursor::from_u64(5)), // resume position that "expired"
+            None,                           // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
@@ -1000,7 +1602,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -1039,7 +1643,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             // Keep only keys under "keep."; reject everything else.
             |u: &KvUpdate| -> Option<Vec<u8>> {
@@ -1085,7 +1691,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             None::<AppendLogSnapshot>,
+            None,
             BatchConfig::default(),
             parse_put,
             move |_batch: Vec<Vec<u8>>| {
@@ -1113,6 +1721,266 @@ mod tests {
             0,
             "on_applied never fires"
         );
+    }
+
+    /// An [`ExportRequest`] flushes the pending batch first, so the artifact's
+    /// cursor is exactly the applied cursor — and the artifact is importable
+    /// with the batched entries in it.
+    #[tokio::test(start_paused = true)]
+    async fn export_request_flushes_pending_batch_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("fold.snap");
+        let artifact = dir.path().join("artifact");
+        let (_r, store) = AppendLogSnapshot::open(&store_path, u64::MAX).unwrap();
+
+        let updates = vec![put("a", b"1", 1), put("b", b"2", 2)];
+        let watcher = Arc::new(MockWatcher::new(updates, true)); // hold open
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            Some(store),
+            Some(ex_rx),
+            BatchConfig {
+                window: Duration::from_secs(3600), // window never fires
+                max: 100,
+            },
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |_| {},
+            sd_rx,
+        ));
+
+        // Let both updates land in the (unflushed) pending batch, then export.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: artifact.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let manifest = reply_rx.await.unwrap().expect("export succeeds");
+        assert_eq!(
+            manifest.cursor.as_u64(),
+            Some(2),
+            "pending batch flushed before export: artifact cursor is the applied cursor"
+        );
+
+        // The artifact is importable and holds both batched entries.
+        let (cursor, imported) =
+            AppendLogSnapshot::import(&artifact, &dir.path().join("imported.snap"), u64::MAX)
+                .unwrap();
+        assert_eq!(cursor.as_u64(), Some(2));
+        assert_eq!(imported.get("a").unwrap().unwrap().value, b"1");
+        assert_eq!(imported.get("b").unwrap().unwrap().value, b"2");
+
+        sd_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    /// An [`ExportRequest`] that arrives with NOTHING pending (the window
+    /// already flushed everything) still produces a valid artifact whose
+    /// cursor is the applied cursor. The flush-before-export step must be a
+    /// clean no-op, not an error or a cursor regression.
+    #[tokio::test(start_paused = true)]
+    async fn export_with_empty_pending_batch_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("fold.snap");
+        let artifact = dir.path().join("artifact");
+        let (_r, store) = AppendLogSnapshot::open(&store_path, u64::MAX).unwrap();
+
+        let updates = vec![put("a", b"1", 1), put("b", b"2", 2)];
+        let watcher = Arc::new(MockWatcher::new(updates, true)); // hold open
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            Some(store),
+            Some(ex_rx),
+            BatchConfig::default(), // 10 ms window
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |_| {},
+            sd_rx,
+        ));
+
+        // Let the window flush both updates, so the export request finds an
+        // EMPTY pending batch.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: artifact.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let manifest = reply_rx
+            .await
+            .unwrap()
+            .expect("export succeeds with nothing pending");
+        assert_eq!(
+            manifest.cursor.as_u64(),
+            Some(2),
+            "artifact cursor is the applied cursor, unchanged by the no-op flush"
+        );
+
+        // The artifact is importable and holds the already-flushed entries.
+        let (cursor, imported) =
+            AppendLogSnapshot::import(&artifact, &dir.path().join("imported.snap"), u64::MAX)
+                .unwrap();
+        assert_eq!(cursor.as_u64(), Some(2));
+        assert_eq!(imported.get("a").unwrap().unwrap().value, b"1");
+        assert_eq!(imported.get("b").unwrap().unwrap().value, b"2");
+
+        sd_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    /// An export request against a store-less watch replies with an error and
+    /// the watch keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn export_without_store_replies_error() {
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |_| {},
+            sd_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: std::env::temp_dir().join("never-created"),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "no store → export errors via the reply"
+        );
+
+        // The watch is still alive and returns its applied cursor on shutdown.
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+        assert_eq!(cursor.as_u64(), Some(1));
+    }
+
+    /// An export failure (unavailable destination) is reported on the reply and
+    /// the watch keeps applying later updates.
+    #[tokio::test(start_paused = true)]
+    async fn export_error_does_not_kill_watch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("fold.snap");
+        let (_r, store) = AppendLogSnapshot::open(&store_path, u64::MAX).unwrap();
+
+        // Occupied destination → export fails.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("stray"), b"x").unwrap();
+
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel(1);
+
+        let applied = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&applied);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            Some(store),
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |cur| a.store(cur.as_u64().unwrap(), Ordering::SeqCst),
+            sd_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ex_tx
+            .send(ExportRequest {
+                dest_dir: occupied,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        match reply_rx.await.unwrap() {
+            Err(crate::snapshot::SnapshotError::ArtifactInvalid(_)) => {}
+            other => panic!("expected ArtifactInvalid, got {other:?}"),
+        }
+
+        // Watch still folds: a clean shutdown returns the applied cursor.
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+        assert_eq!(cursor.as_u64(), Some(1), "watch survived the failed export");
+        assert_eq!(applied.load(Ordering::SeqCst), 1);
+    }
+
+    /// Dropping the export sender disarms the arm; the loop keeps batching and
+    /// flushing normally.
+    #[tokio::test(start_paused = true)]
+    async fn export_sender_dropped_disarms_channel() {
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (ex_tx, ex_rx) = mpsc::channel::<ExportRequest>(1);
+
+        let applied = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&applied);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            Some(ex_rx),
+            BatchConfig::default(),
+            parse_put,
+            move |_batch: Vec<Vec<u8>>| {},
+            move |cur| a.store(cur.as_u64().unwrap(), Ordering::SeqCst),
+            sd_rx,
+        ));
+
+        drop(ex_tx); // disarm
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "loop keeps flushing after the export sender is gone"
+        );
+
+        sd_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     /// With a low `compact_threshold`, the flush path's `spawn_blocking`
@@ -1143,7 +2011,9 @@ mod tests {
             watcher,
             WatchScope::All,
             None,
+            None, // reader (no resync in this test)
             Some(store),
+            None,
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max: 1, // one update per flush → a compaction per update

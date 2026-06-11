@@ -22,16 +22,27 @@
 //! ```
 
 #![deny(unsafe_code)]
+#![deny(unused_must_use)]
 
 mod applied;
+mod artifact;
+mod export_lease;
 mod kv;
 mod nats;
 pub mod snapshot;
 #[cfg(feature = "fjall")]
 mod snapshot_fjall;
+#[cfg(any(feature = "fjall", feature = "rocksdb"))]
+mod snapshot_record;
+#[cfg(feature = "rocksdb")]
+mod snapshot_rocksdb;
 mod stores;
+#[cfg(feature = "transport")]
+mod transport;
 
-pub use applied::{BatchConfig, WatchScope, watch_applied};
+pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
+pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
+pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
 pub use kv::{
     KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };
@@ -39,4 +50,8 @@ pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
 pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
+#[cfg(feature = "rocksdb")]
+pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
 pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};
+#[cfg(feature = "transport")]
+pub use transport::{ArtifactTransport, ObjectStoreTransport, run_export_round};
