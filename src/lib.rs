@@ -25,6 +25,7 @@
 
 mod applied;
 mod artifact;
+mod export_lease;
 mod kv;
 mod nats;
 pub mod snapshot;
@@ -38,6 +39,7 @@ mod stores;
 
 pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
+pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
 pub use kv::{
     KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };

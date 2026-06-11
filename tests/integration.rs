@@ -1228,6 +1228,7 @@ fn spawn_applied(
         WatchScope::All,
         baseline,
         snapshot,
+        None,
         BatchConfig::default(),
         parse,
         move |batch: Vec<String>| {
@@ -1490,4 +1491,123 @@ async fn applied_survives_compacted_resume_cursor() {
         cursor.as_u64().is_some(),
         "combinator returned a live cursor after recovering from compaction"
     );
+}
+
+// --- Export lease --------------------------------------------------------------
+
+/// N concurrent acquirers race one round: exactly one wins, everyone else
+/// cleanly loses. This is the load-bearing claim — create-only CAS gives the
+/// race one winner by construction, against a real JetStream bucket.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_lease_one_winner_among_concurrent_acquirers() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("lease-race").await;
+
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let lease = slipstream::ExportLease::new(store.as_ref(), "export.edge.us-east", format!("node-{i}"))
+            .expect("lease");
+        tasks.push(tokio::spawn(async move {
+            lease
+                .try_acquire(Duration::from_secs(60))
+                .await
+                .expect("try_acquire")
+                .is_some()
+        }));
+    }
+
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one node wins the round");
+}
+
+/// A held (unexpired) lease blocks every later acquirer until it lapses.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_lease_held_blocks_next_round() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("lease-held").await;
+
+    let a = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-a").expect("lease");
+    let b = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-b").expect("lease");
+
+    let guard = a
+        .try_acquire(Duration::from_secs(60))
+        .await
+        .expect("acquire")
+        .expect("a wins the open round");
+    assert!(
+        b.try_acquire(Duration::from_secs(60))
+            .await
+            .expect("try_acquire")
+            .is_none(),
+        "a live lease blocks the round"
+    );
+    drop(guard); // dropping the guard does NOT release: the ttl is the round period
+    assert!(
+        b.try_acquire(Duration::from_secs(60))
+            .await
+            .expect("try_acquire")
+            .is_none(),
+        "the round persists past the winner's guard"
+    );
+}
+
+/// An expired lease is taken over via CAS — and only by one taker.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_lease_expiry_allows_takeover() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("lease-expiry").await;
+
+    let a = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-a").expect("lease");
+    let b = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-b").expect("lease");
+
+    let _ = a
+        .try_acquire(Duration::from_secs(1))
+        .await
+        .expect("acquire")
+        .expect("a wins");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let guard = b
+        .try_acquire(Duration::from_secs(60))
+        .await
+        .expect("try_acquire")
+        .expect("expired lease is taken over");
+    assert_eq!(guard.record().holder_id, "node-b");
+
+    let current = b.current().await.expect("read").expect("record exists");
+    assert_eq!(current.holder_id, "node-b", "takeover is visible fleet-wide");
+}
+
+/// `complete` publishes the exported cursor on the lease key — the
+/// fleet-visible "last export" record.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_lease_complete_publishes_outcome() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("lease-complete").await;
+
+    let lease = slipstream::ExportLease::new(store.as_ref(), "export.round", "node-a").expect("lease");
+    let guard = lease
+        .try_acquire(Duration::from_secs(60))
+        .await
+        .expect("acquire")
+        .expect("wins");
+
+    guard
+        .complete(&WatchCursor::from_u64(42))
+        .await
+        .expect("complete");
+
+    let record = lease.current().await.expect("read").expect("record");
+    assert_eq!(
+        record.completed_cursor_hex.as_deref(),
+        Some("000000000000002a"),
+        "exported cursor is published"
+    );
+    assert!(record.completed_at_unix.is_some());
+    assert_eq!(record.holder_id, "node-a");
 }
