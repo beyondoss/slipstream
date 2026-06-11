@@ -29,13 +29,43 @@
 //! [`apply`](SnapshotStore::apply) to a blocking task, and async callers querying
 //! [`get`](SnapshotStore::get)/[`range`](SnapshotStore::range) should use
 //! `spawn_blocking` likewise.
+//!
+//! ## Tuning
+//!
+//! [`open`](FjallSnapshot::open) applies the same route-scale workload tuning
+//! as the RocksDB backend (see `snapshot_rocksdb.rs`'s Tuning docs for the
+//! full model: ~1e9 entries, bulk hydration, point-gets that are ~always
+//! hits, per-service prefix scans). fjall's defaults are already closer to
+//! that workload than RocksDB's — bloom filters on by default (0.01% FP at
+//! L0, 10 bits/key deeper), index blocks pinned at L0/L1, index and filter
+//! partitioning from L3 down, lz4 from L2 down, journal capped at 512 MiB —
+//! so the constants below adjust only the three levers that aren't:
+//! worker-thread count (fjall caps at 4 by default), memtable size, and data
+//! block size — plus pinning L0+L1 filter blocks. Skipping last-level filter
+//! construction (`expect_point_read_hits`, fjall's twin of RocksDB's
+//! `optimize_filters_for_hits`) was tried and rejected: on a tree carrying
+//! compaction debt it multiplied cold point-get cost (~10 ms at 500M routes),
+//! and it makes every absent-key lookup a guaranteed disk probe. Everything
+//! else is deliberately left at fjall's defaults.
+//!
+//! Measured at 500M routes (NVMe, `benches/snapshot_backends.rs`): tuned
+//! hydration runs 0.42 M entries/s — 2.2× the RocksDB backend — at
+//! 226 B/entry on disk. The trade is cold uniform point-gets once the fold
+//! dwarfs RAM: multi-millisecond here vs sub-millisecond on the RocksDB
+//! backend, whose partitioned, cache-pinned metadata bounds a cold get to
+//! fewer disk reads. Write-heavy or hot-set-served folds favor fjall;
+//! uniform cold-read folds favor RocksDB.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use fjall::{Config, Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use fjall::config::{BlockSizePolicy, PinningPolicy};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
+use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
 use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
 use crate::snapshot::{SnapshotError, SnapshotStore};
+use crate::snapshot_record::{decode_entry, encode_value_into};
 
 /// Partition holding the folded KV state: `key` → encoded `(version, value)`.
 const DATA_PARTITION: &str = "data";
@@ -43,6 +73,30 @@ const DATA_PARTITION: &str = "data";
 const META_PARTITION: &str = "meta";
 /// Key under [`META_PARTITION`] storing the resume cursor's raw version bytes.
 const CURSOR_KEY: &[u8] = b"cursor";
+
+// --- Tuned constants (see the module-level `## Tuning` docs). ---
+
+/// Flush/compaction worker threads. fjall's default is `min(cores, 4)`,
+/// which starves a multi-GB hydration on a many-core box; this matches the
+/// RocksDB backend's parallelism (also capped at 16 — diminishing returns,
+/// and beyond it compaction competes with the serving path for CPU).
+const MAX_WORKER_THREADS: usize = 16;
+
+/// Data-partition memtable. fjall's 64 MiB default means 4× the flush (and
+/// L0 compaction) count of a 256 MiB buffer during a route-scale hydration;
+/// matches the RocksDB backend's write buffer. Memtables fill lazily, so
+/// small stores don't pay this up front.
+const DATA_MEMTABLE_BYTES: u64 = 256 << 20;
+
+/// Meta partition holds exactly one key (the cursor), rewritten every
+/// `apply`; 8 MiB is generous (parity with the RocksDB meta CF).
+const META_MEMTABLE_BYTES: u64 = 8 << 20;
+
+/// Data block size. Same math as the RocksDB backend: 4 KiB blocks at a
+/// 1e9-key fold produce multi-GB block indexes; 16 KiB quarters that and
+/// gives compression more context, at the cost of decompressing 16 KiB
+/// instead of 4 KiB on a cache-miss point read.
+const DATA_BLOCK_SIZE: u32 = 16 * 1024;
 
 /// Durability and read-cache configuration for [`FjallSnapshot`].
 ///
@@ -86,6 +140,9 @@ pub struct FjallSnapshot {
     meta: Keyspace,
     config: FjallConfig,
     cursor: WatchCursor,
+    // fjall's `Config.path` is `pub(crate)`, so the export path keeps its own
+    // copy of the DB directory for the artifact copy.
+    path: PathBuf,
 }
 
 impl FjallSnapshot {
@@ -95,20 +152,39 @@ impl FjallSnapshot {
     /// persisted resume cursor — [`WatchCursor::none`] when fresh — and the store.
     pub fn open(path: &Path, config: FjallConfig) -> Result<(WatchCursor, Self), SnapshotError> {
         std::fs::create_dir_all(path)?;
-        let mut db_config = Config::new(path);
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(4)
+            .min(MAX_WORKER_THREADS);
+        let mut builder = Database::builder(path).worker_threads(workers);
         // Size the LSM block cache to the working set (default 1 GiB). fjall's own
-        // default is 32 MiB, far too small for the fold — see `FjallConfig::cache_size_bytes`.
+        // default is 32 MiB, far too small for the fold — see
+        // `FjallConfig::cache_size_bytes`. `0` keeps fjall's default.
         if config.cache_size_bytes > 0 {
-            db_config.cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
-                config.cache_size_bytes,
-            ));
+            builder = builder.cache_size(config.cache_size_bytes);
         }
-        let db = Database::open(db_config).map_err(map_fjall)?;
+        let db: Database = builder.open().map_err(map_fjall)?;
         let data = db
-            .keyspace(DATA_PARTITION, KeyspaceCreateOptions::default)
+            .keyspace(DATA_PARTITION, || {
+                KeyspaceCreateOptions::default()
+                    .max_memtable_size(DATA_MEMTABLE_BYTES)
+                    .data_block_size_policy(BlockSizePolicy::all(DATA_BLOCK_SIZE))
+                    // Last-level filters are kept (no `expect_point_read_hits`):
+                    // they are the only in-memory rejection for absent-key
+                    // lookups, and on a tree carrying compaction debt they
+                    // reject the overlapping runs a point-get must otherwise
+                    // probe on disk (measured: skipping them cost ~10 ms cold
+                    // gets on an unsettled 500M fold).
+                    //
+                    // Pin L0+L1 filters so the hot lookup path never faults its
+                    // filter roots (fjall's default pins L0 only).
+                    .filter_block_pinning_policy(PinningPolicy::new([true, true, false]))
+            })
             .map_err(map_fjall)?;
         let meta = db
-            .keyspace(META_PARTITION, KeyspaceCreateOptions::default)
+            .keyspace(META_PARTITION, || {
+                KeyspaceCreateOptions::default().max_memtable_size(META_MEMTABLE_BYTES)
+            })
             .map_err(map_fjall)?;
 
         let cursor = match meta.get(CURSOR_KEY).map_err(map_fjall)? {
@@ -131,13 +207,9 @@ impl FjallSnapshot {
                 meta,
                 config,
                 cursor,
+                path: path.to_path_buf(),
             },
         ))
-    }
-
-    /// The most recently applied resume cursor.
-    pub fn cursor(&self) -> &WatchCursor {
-        &self.cursor
     }
 
     /// A cheap, concurrent-read-safe handle to the fold's data partition.
@@ -154,6 +226,166 @@ impl FjallSnapshot {
             data: self.data.clone(),
         }
     }
+
+    /// Force a major compaction of the data partition, blocking until done.
+    ///
+    /// fjall's background compaction is write-driven: after a bulk hydration
+    /// stops, residual overlapping runs can persist indefinitely and inflate
+    /// cold-read latency (every unrejected run costs an extra disk probe).
+    /// Call this after hydrating and before latency-sensitive serving begins;
+    /// steady-state folding does not need it.
+    pub fn settle(&self) -> Result<(), SnapshotError> {
+        self.data.major_compact().map_err(map_fjall)
+    }
+
+    /// Import an exported artifact (see [`SnapshotStore::export_to`]) as a new
+    /// fold at `dest_dir`, returning the embedded resume cursor and the opened
+    /// store.
+    ///
+    /// `dest_dir` must not exist (or be an empty directory). The artifact is
+    /// fully verified against its manifest — checksums, backend identity,
+    /// on-disk format generation — and the staged copy is **opened** (running
+    /// fjall's own recovery) and its cursor compared against the manifest's
+    /// before anything lands at `dest_dir`; a bad artifact never becomes a
+    /// fold. A crash mid-import leaves nothing at `dest_dir`; a crash after
+    /// the final rename leaves a fully valid fold (a retried import then
+    /// refuses the existing destination — just [`open`](Self::open) it).
+    pub fn import(
+        artifact_dir: &Path,
+        dest_dir: &Path,
+        config: FjallConfig,
+    ) -> Result<(WatchCursor, Self), SnapshotError> {
+        let (manifest, stage) =
+            verify_and_stage_import(artifact_dir, dest_dir, Self::BACKEND, |v| {
+                if v == Self::BACKEND_VERSION {
+                    Ok(())
+                } else {
+                    Err(SnapshotError::ArtifactInvalid(format!(
+                        "fjall artifact has on-disk format generation {v:?}, this build reads {:?}",
+                        Self::BACKEND_VERSION
+                    )))
+                }
+            })?;
+
+        // Verify by opening the staged copy — fjall's own recovery (journal
+        // CRCs, version checksums) is the consistency oracle — and gate on
+        // cursor agreement with the manifest BEFORE the rename. The verify
+        // handle uses a minimal cache; it is dropped (joining fjall's worker
+        // threads) before the rename.
+        {
+            let (staged_cursor, _verify) = Self::open(
+                &stage.payload(),
+                FjallConfig {
+                    sync: true,
+                    cache_size_bytes: 0,
+                },
+            )?;
+            if staged_cursor != manifest.cursor {
+                return Err(SnapshotError::ArtifactInvalid(format!(
+                    "payload cursor {staged_cursor:?} disagrees with manifest cursor {:?}",
+                    manifest.cursor
+                )));
+            }
+        }
+
+        stage.finalize_dir()?;
+        Self::open(dest_dir, config)
+    }
+}
+
+// --- Export internals -------------------------------------------------------
+
+impl FjallSnapshot {
+    /// Backend identity in artifact manifests.
+    pub(crate) const BACKEND: &'static str = "fjall";
+    /// On-disk format generation in artifact manifests: fjall's V3 format
+    /// marker, which fjall itself re-enforces at open (`check_version` rejects
+    /// anything but V3).
+    pub(crate) const BACKEND_VERSION: &'static str = "3";
+
+    /// Bound on the best-effort flush/compaction drain before the copy.
+    const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Best-effort quiesce before the artifact copy: rotate memtables into SSTs
+    /// and wait (bounded) for background flushes/compactions to drain, so the
+    /// copy is dominated by immutable, hardlinkable table files.
+    ///
+    /// Correctness never depends on this — `export_to` takes `&mut self` (no
+    /// concurrent commits), the copy retries on files deleted under it, and the
+    /// verify-by-reopen + cursor-equality gate catches anything torn. The
+    /// quiesce only makes the copy converge fast.
+    ///
+    /// `rotate_memtable_and_wait` / `outstanding_flushes` / `active_compactions`
+    /// are `pub` but `#[doc(hidden)]` in fjall 3.1.4 ("used in tests" /
+    /// "experimental"; verified in fjall source: `keyspace/mod.rs:708`,
+    /// `db.rs:220`, `db.rs:247`). They are compile-checked: a fjall upgrade
+    /// that removes them fails the build loudly — in that case delete this
+    /// method; persist + retry + verify remains correct, just retry-prone
+    /// under churn.
+    fn quiesce(&self) {
+        for ks in [&self.data, &self.meta] {
+            if let Err(e) = ks.rotate_memtable_and_wait() {
+                tracing::warn!(error = %e, "fjall export quiesce: memtable rotation failed; proceeding");
+                return;
+            }
+        }
+        let deadline = Instant::now() + Self::QUIESCE_TIMEOUT;
+        while (self.db.outstanding_flushes() > 0 || self.db.active_compactions() > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// `true` for paths inside fjall's immutable-file directories (`tables/`,
+/// `blobs/`): created with `create_new`, never mutated, only unlinked — safe to
+/// hardlink into an artifact. Everything else (journal, version markers, lock)
+/// is byte-copied: the source keeps appending to its journal after export
+/// returns, and a hardlinked journal would mutate the artifact under its
+/// recorded checksums.
+fn is_immutable_payload(rel: &Path) -> bool {
+    use std::path::Component;
+    rel.components()
+        .any(|c| matches!(c, Component::Normal(n) if n == "tables" || n == "blobs"))
+}
+
+/// Copy a fjall DB directory into `dst`: hardlink immutable table/blob files
+/// (copy-fallback on any error, e.g. EXDEV), byte-copy everything else.
+/// Everything is included — notably the `lock` file, which fjall's recovery
+/// `File::open`s and therefore must exist (its lock state is advisory, not in
+/// the content).
+fn copy_db_dir(src: &Path, dst: &Path) -> Result<(), SnapshotError> {
+    std::fs::create_dir_all(dst)?;
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let rel = entry
+                .path()
+                .strip_prefix(src)
+                .map_err(|_| SnapshotError::Backend("fjall copy escaped the DB root".into()))?
+                .to_path_buf();
+            let to = dst.join(&rel);
+            if ty.is_dir() {
+                std::fs::create_dir_all(&to)?;
+                stack.push(entry.path());
+            } else if ty.is_file() {
+                if is_immutable_payload(&rel) {
+                    if std::fs::hard_link(entry.path(), &to).is_err() {
+                        // EXDEV (stage on another filesystem) or anything else:
+                        // fall back to a byte-copy. Correct either way; the
+                        // hardlink is only the cheap path.
+                        std::fs::copy(entry.path(), &to)?;
+                    }
+                } else {
+                    std::fs::copy(entry.path(), &to)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A concurrent read handle over a [`FjallSnapshot`]'s data partition, cloned via
@@ -275,6 +507,76 @@ impl SnapshotStore for FjallSnapshot {
         }
         Ok(())
     }
+
+    fn cursor(&self) -> WatchCursor {
+        self.cursor.clone()
+    }
+
+    /// Export sequence (fjall has **no checkpoint API**, so this is built from
+    /// parts; correctness rests on `&mut self` exclusivity + verify-by-reopen,
+    /// never on the quiesce):
+    ///
+    /// 1. `persist(SyncAll)` — the journal is complete and durable. With
+    ///    `&mut self` nothing commits after this.
+    /// 2. Best-effort quiesce (memtables → SSTs, drain flush/compaction,
+    ///    bounded) so the copy is dominated by immutable hardlinkable files.
+    /// 3. Copy the DB dir into the stage: hardlink `tables/`/`blobs/`,
+    ///    byte-copy journal + metadata. Background GC can still delete a file
+    ///    between enumerate and link — retried, bounded.
+    /// 4. **Verify by reopening the copy**: fjall's own recovery is the
+    ///    consistency oracle, and the recovered cursor must equal the live
+    ///    cursor. Because every `apply` writes the cursor in the same batch as
+    ///    its data, cursor equality is a complete tail-loss detector. The
+    ///    verify handle is dropped (joining fjall's workers) before hashing.
+    /// 5. Hash the staged files **after** the verify-open (recovery may
+    ///    legitimately rewrite the stage), write the manifest, fsync, rename.
+    fn export_to(&mut self, dest_dir: &Path) -> Result<ExportManifest, SnapshotError> {
+        let stage = ExportStage::new(dest_dir)?;
+        let payload = stage.payload();
+
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(map_fjall)?;
+        self.quiesce();
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match copy_db_dir(&self.path, &payload) {
+                Ok(()) => break,
+                Err(SnapshotError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound && attempt < 3 =>
+                {
+                    // A straggler flush/compaction GC'd a file under the copy.
+                    // Clear and re-copy from the now-quieter tree.
+                    tracing::warn!(
+                        attempt,
+                        "fjall export copy raced background GC; retrying"
+                    );
+                    std::fs::remove_dir_all(&payload)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        {
+            let (staged_cursor, _verify) = Self::open(
+                &payload,
+                FjallConfig {
+                    sync: true,
+                    cache_size_bytes: 0,
+                },
+            )?;
+            if staged_cursor != self.cursor {
+                return Err(SnapshotError::ArtifactInvalid(format!(
+                    "exported copy recovered cursor {staged_cursor:?}, live fold is at {:?}",
+                    self.cursor
+                )));
+            }
+        } // verify handle dropped: fjall workers joined, staged files final
+
+        stage.seal_and_finalize(Self::BACKEND, Self::BACKEND_VERSION, &self.cursor)
+    }
 }
 
 impl FjallSnapshot {
@@ -292,63 +594,6 @@ impl FjallSnapshot {
             Some(PersistMode::Buffer)
         }
     }
-}
-
-/// Encode a stored value as `[ver_len:u8][version bytes][value bytes]` into `buf`.
-///
-/// `buf` is cleared and refilled (its capacity is reused across a batch). The
-/// version is length-prefixed raw bytes for the same reason the append-log format
-/// uses it: a backend's token (NATS u64, FDB 10-byte versionstamp) must round-trip
-/// intact.
-///
-/// `VersionToken` caps inline storage at 10 bytes, so the `u8` length prefix never
-/// truncates today. Checking with `try_from` rather than casting surfaces a format
-/// error instead of silently writing a wrong length — which would frame a record
-/// `decode_entry` then mis-parses — if a future token ever widens past 255 bytes.
-/// This mirrors `write_put_record` in `snapshot.rs`.
-fn encode_value_into(
-    buf: &mut Vec<u8>,
-    value: &[u8],
-    version: &VersionToken,
-) -> Result<(), SnapshotError> {
-    let vb = version.as_bytes();
-    let ver_len = u8::try_from(vb.len()).map_err(|_| {
-        SnapshotError::InvalidFormat(format!(
-            "version too long: {} bytes (max {})",
-            vb.len(),
-            u8::MAX
-        ))
-    })?;
-    buf.clear();
-    buf.reserve(1 + vb.len() + value.len());
-    buf.push(ver_len);
-    buf.extend_from_slice(vb);
-    buf.extend_from_slice(value);
-    Ok(())
-}
-
-/// Decode a `[ver_len:u8][version][value]` record back into a [`KvEntry`].
-fn decode_entry(key: &str, raw: &[u8]) -> Result<KvEntry, SnapshotError> {
-    let ver_len = *raw.first().ok_or_else(|| {
-        SnapshotError::InvalidFormat("fjall value record is empty (no version length)".into())
-    })? as usize;
-    let value_off = 1 + ver_len;
-    if raw.len() < value_off {
-        return Err(SnapshotError::InvalidFormat(format!(
-            "fjall value record truncated: need {value_off} bytes for version, have {}",
-            raw.len()
-        )));
-    }
-    let version = VersionToken::from_raw(&raw[1..value_off]).ok_or_else(|| {
-        SnapshotError::InvalidFormat(format!(
-            "version length {ver_len} exceeds version token capacity"
-        ))
-    })?;
-    Ok(KvEntry {
-        key: key.to_string(),
-        value: raw[value_off..].to_vec(),
-        version,
-    })
 }
 
 /// Map a [`fjall::Error`] into the backend-agnostic [`SnapshotError`].
@@ -370,77 +615,6 @@ fn map_fjall(e: fjall::Error) -> SnapshotError {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    /// A 10-byte FDB versionstamp has no `u64` form; the length-prefixed value
-    /// format must carry it intact. A `u64`-only field would flatten it to 0 and
-    /// silently break every later CAS — so this is the load-bearing reason the
-    /// record stores a length-prefixed token rather than a fixed 8 bytes.
-    #[test]
-    fn encode_decode_round_trips_fdb_versionstamp() {
-        let vs = VersionToken::from_fdb_versionstamp(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        let mut enc = Vec::new();
-        encode_value_into(&mut enc, b"payload", &vs).expect("encode");
-        let entry = decode_entry("k", &enc).expect("decode");
-
-        assert_eq!(entry.version.as_bytes(), &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert!(
-            entry.version.as_u64().is_none(),
-            "a 10-byte token has no u64 form — it must not be flattened"
-        );
-        assert_eq!(entry.value, b"payload");
-    }
-
-    /// An empty value (the CAS-tombstone shape) encodes to just the version prefix
-    /// and decodes back to a present, empty-valued entry with its version intact.
-    #[test]
-    fn encode_decode_round_trips_empty_value() {
-        let mut enc = Vec::new();
-        encode_value_into(&mut enc, b"", &VersionToken::from_u64(7)).expect("encode");
-        let entry = decode_entry("k", &enc).expect("decode");
-
-        assert!(entry.value.is_empty());
-        assert_eq!(entry.version.as_u64(), Some(7));
-    }
-
-    /// A zero-byte record has no version-length byte — corruption, not a valid
-    /// record. It must surface as a recoverable `InvalidFormat`, never a panic.
-    #[test]
-    fn decode_entry_rejects_empty_record() {
-        let err = decode_entry("k", &[]).unwrap_err();
-        assert!(
-            matches!(err, SnapshotError::InvalidFormat(_)),
-            "empty record must be a format error, got {err:?}"
-        );
-    }
-
-    /// A record that claims a longer version than its bytes provide is truncated
-    /// on-disk corruption — reject it instead of reading past the buffer.
-    #[test]
-    fn decode_entry_rejects_truncated_version() {
-        // Claims a 5-byte version, but only 2 bytes follow the length prefix.
-        let raw = [5u8, 0xAA, 0xBB];
-        let err = decode_entry("k", &raw).unwrap_err();
-        assert!(
-            matches!(err, SnapshotError::InvalidFormat(_)),
-            "truncated version must be a format error, got {err:?}"
-        );
-    }
-
-    /// A version length beyond `VersionToken`'s 10-byte capacity can't round-trip;
-    /// `from_raw` rejects it and `decode_entry` maps that to `InvalidFormat` rather
-    /// than silently truncating to a wrong (CAS-breaking) version.
-    #[test]
-    fn decode_entry_rejects_oversized_version() {
-        // ver_len = 11 with 11 trailing bytes: passes the truncation check, then
-        // trips the capacity check inside `VersionToken::from_raw`.
-        let mut raw = vec![11u8];
-        raw.extend_from_slice(&[0u8; 11]);
-        let err = decode_entry("k", &raw).unwrap_err();
-        assert!(
-            matches!(err, SnapshotError::InvalidFormat(_)),
-            "oversized version must be a format error, got {err:?}"
-        );
-    }
 
     /// A persisted cursor blob larger than the version-token capacity must surface
     /// as a recoverable `InvalidFormat` at `open`, not a panic or a silently
