@@ -1,12 +1,40 @@
 # Slipstream
 
-Edge nodes need local copies of large distributed config — routing tables, TLS certificates, WASM configs — but replaying the full history from NATS on every restart is too slow. At a billion routes per node, it isn't feasible at all.
+You have config in NATS JetStream: routing tables, TLS certs, WASM configs. Edge nodes need a local copy, kept in sync, that survives restarts without replaying the full stream.
 
-Slipstream turns a NATS JetStream KV bucket into a **resumable, locally-cached config stream**. A *watch cursor* (a stream sequence number) marks exactly where a node last processed an update. On restart, load the local snapshot, hand the cursor back to NATS, and receive only the delta — not the full history.
+Slipstream materializes a NATS JetStream KV bucket into a local fold on each consumer. A watch cursor (a stream sequence number) tracks position in the change stream; on restart, only the delta since the last checkpoint arrives from NATS.
 
-The core safety property: the cursor advances only **after** your `apply()` returns, never on receipt. A crash between delivery and application leaves the cursor behind the unapplied data; the next restart re-delivers rather than silently skipping it. The `watch_applied` combinator enforces this invariant so no caller can get it wrong.
+NATS is a bounded log. Entries are evicted past `max_bytes` and `max_age`. Once retention compacts past a cursor, there is no replay path from NATS. The local fold is the durable state; folds across the fleet are the only full replicas.
 
-For folds that outgrow RAM, on-disk backends (`fjall` or `RocksDB`) hold the state. For nodes that can't replay bounded NATS logs, **export/import** bootstraps a new node from a peer's fold over object storage, resuming from the embedded cursor.
+```
+ NATS JetStream KV
+ ┌──────────────────────────────────────────────────────┐
+ │  [evicted] ◄──── seq 998  seq 999  seq 1000  ──────► │  max_bytes / max_age
+ └───────────────────────────┬──────────────────────────┘
+                             │ KvUpdate stream
+                             ▼
+                      watch_applied()
+                   ┌─────────────────────┐
+                   │  parse              │
+                   │  apply()            │ ← your domain logic
+                   │  cursor = seq 1000  │   advances after apply() returns
+                   └──────────┬──────────┘
+                              │
+                   ┌──────────▼──────────┐
+                   │  local fold         │ folds are the only full replicas
+                   │  cursor = 1000      │ once NATS evicts past cursor
+                   └──────────┬──────────┘
+              ┌───────────────┴──────────────────────┐
+              │                                      │
+              ▼                                      ▼
+   restart                                 new node / cursor expired
+   resume from cursor = 1000               export fold to object storage
+   NATS delivers seq 1001+ only            import + resume from embedded cursor
+```
+
+The cursor advances after `apply()` returns, not on receipt. A crash between delivery and application re-delivers on the next start instead of silently skipping. `watch_applied` enforces this invariant.
+
+For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold state on disk.
 
 ## Install
 
@@ -15,12 +43,12 @@ For folds that outgrow RAM, on-disk backends (`fjall` or `RocksDB`) hold the sta
 beyond-slipstream = "0.5"
 ```
 
-The crate core is pure-Rust. On-disk snapshot backends are opt-in cargo features (no C toolchain is pulled unless you enable one):
+On-disk snapshot backends are opt-in cargo features:
 
 ```toml
-beyond-slipstream = { version = "0.5", features = ["fjall"] }   # on-disk SnapshotStore, pure-Rust LSM
-beyond-slipstream = { version = "0.5", features = ["rocksdb"] } # on-disk SnapshotStore, RocksDB (needs a C++ toolchain + libclang to build)
-beyond-slipstream = { version = "0.5", features = ["transport"] } # artifact export/import via object_store (S3, GCS, local)
+beyond-slipstream = { version = "0.5", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
+beyond-slipstream = { version = "0.5", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
+beyond-slipstream = { version = "0.5", features = ["transport"] } # export/import via object_store (S3, GCS, local)
 ```
 
 ## Concepts
