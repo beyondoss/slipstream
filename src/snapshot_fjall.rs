@@ -48,13 +48,14 @@
 //! and it makes every absent-key lookup a guaranteed disk probe. Everything
 //! else is deliberately left at fjall's defaults.
 //!
-//! Measured at 500M routes (NVMe, `benches/snapshot_backends.rs`): tuned
-//! hydration runs 0.42 M entries/s — 2.2× the RocksDB backend — at
-//! 226 B/entry on disk. The trade is cold uniform point-gets once the fold
-//! dwarfs RAM: multi-millisecond here vs sub-millisecond on the RocksDB
-//! backend, whose partitioned, cache-pinned metadata bounds a cold get to
-//! fewer disk reads. Write-heavy or hot-set-served folds favor fjall;
-//! uniform cold-read folds favor RocksDB.
+//! Measured at 500M routes (NVMe, `benches/snapshot_backends.rs`, settled
+//! tree): hydration 0.34 M entries/s — 1.7× the RocksDB backend — at
+//! 226 B/entry on disk. Cold uniform point-gets: p50 542 µs / p99 1.9 ms /
+//! p999 3.7 ms (RocksDB: 292 µs / 686 µs / 898 µs — fjall's median is ~1.9×
+//! and its tail ~4× behind). Absent-key lookups reject in-RAM via filters at
+//! ~420 ns. Reaching "settled" is the catch: see [`settle`](FjallSnapshot::settle).
+//! Write-heavy and hot-set-served folds favor fjall; tail-latency-sensitive
+//! cold-read folds favor RocksDB.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -231,9 +232,16 @@ impl FjallSnapshot {
     ///
     /// fjall's background compaction is write-driven: after a bulk hydration
     /// stops, residual overlapping runs can persist indefinitely and inflate
-    /// cold-read latency (every unrejected run costs an extra disk probe).
+    /// cold-read latency (every unrejected run costs an extra disk probe —
+    /// measured ~10 ms cold gets unsettled vs 542 µs p50 settled at 500M).
     /// Call this after hydrating and before latency-sensitive serving begins;
     /// steady-state folding does not need it.
+    ///
+    /// This is a full tree rewrite — budget for it: ~19 minutes and a
+    /// transient ~2× disk footprint at 500M routes (105 GiB store), measured
+    /// while old and new generations coexist. The RocksDB backend's
+    /// [`settle`](crate::RocksDbSnapshot::settle) merely drains already-queued
+    /// compactions (~40 s at the same scale).
     pub fn settle(&self) -> Result<(), SnapshotError> {
         self.data.major_compact().map_err(map_fjall)
     }

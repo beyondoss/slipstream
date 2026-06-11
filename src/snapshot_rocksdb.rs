@@ -178,13 +178,14 @@ pub struct RocksDbConfig {
     /// `resident working set + ~200 MB metadata`; `0` falls back to RocksDB's
     /// 32 MiB default.
     ///
-    /// Measured with `benches/snapshot_backends.rs` (NVMe ext4, criterion
-    /// median, default 1 GiB cache): point-gets against a cache-resident
-    /// working set run ~2 µs; uniform random gets over a 500M-route fold
-    /// (114 GiB on disk, 245 B/entry, vs 27 GiB RAM — most reads hit disk)
-    /// run ~0.9 ms mean, per-service prefix scans ~127 ns/entry, hydration
-    /// 0.19 M entries/s. The cache buys hot-set residency — the µs-vs-ms gap
-    /// above — so size it to the working set.
+    /// Measured with `benches/snapshot_backends.rs` (NVMe ext4, default
+    /// 1 GiB cache, 500M-route fold: ~105 GiB settled on disk vs 27 GiB RAM,
+    /// so uniform reads mostly hit disk): hot-set point-gets ~2 µs; cold
+    /// uniform point-gets p50 292 µs / p99 686 µs / p999 898 µs; absent-key
+    /// lookups ~320 ns (in-RAM filter rejection); per-service prefix scans
+    /// ~129 ns/entry; hydration 0.20 M entries/s. The cache buys hot-set
+    /// residency — the µs-vs-hundreds-of-µs gap — so size it to the working
+    /// set.
     pub cache_size_bytes: u64,
 }
 
@@ -374,9 +375,12 @@ impl RocksDbSnapshot {
     /// drained.
     ///
     /// A bulk hydration leaves the tree with pending compactions that inflate
-    /// cold-read latency until they drain. Call this after hydrating and
-    /// before latency-sensitive serving begins; steady-state folding does not
-    /// need it.
+    /// cold-read latency until they drain (measured: ~8× on cold point-gets
+    /// at 500M routes). Call this after hydrating and before
+    /// latency-sensitive serving begins; steady-state folding does not need
+    /// it. Cheap relative to the fjall backend's full-rewrite
+    /// [`settle`](crate::FjallSnapshot::settle): ~40 s at 500M routes,
+    /// because the background threads drained most debt during hydration.
     pub fn settle(&self) -> Result<(), SnapshotError> {
         let mut opts = WaitForCompactOptions::default();
         opts.set_flush(true);
@@ -466,9 +470,11 @@ impl RocksDbReader {
     /// and index lookups per SST.
     ///
     /// Measured (`benches/snapshot_backends.rs`, 100-key uniform random
-    /// batches against a 500M-route fold, most reads hitting NVMe): 18.5 ms
-    /// per batch vs 103 ms for a loop of [`get`](Self::get)s — 5.5× — because
-    /// `MultiGet` overlaps the cold block reads the loop pays sequentially.
+    /// batches against a 500M-route fold, most reads hitting NVMe): on a
+    /// settled tree, 19.5 ms per batch vs 23.7 ms for a loop of
+    /// [`get`](Self::get)s (~1.2×); on a tree mid-compaction-debt the gap was
+    /// 5.5× (18.5 ms vs 103 ms) — `MultiGet` overlaps the cold block reads
+    /// the loop pays sequentially, so its edge grows with reads-per-get.
     /// Against a cache-resident working set the loop is marginally *faster*
     /// (per-batch marshaling, nothing left to coalesce). Use this when
     /// batches are likely to miss; use the loop when they're hot.
