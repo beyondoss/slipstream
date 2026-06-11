@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 /// Backends store whatever they need to resume (NATS: u64 revision).
 /// Callers should treat this as opaque and only pass it back to
 /// `watch_all_from` / `watch_prefix_from`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchCursor(VersionToken);
 
 impl WatchCursor {
@@ -269,8 +269,7 @@ pub trait KvWatcher: Send + Sync {
     /// per-stream resource (measured at ~tens of KB of server state each, growing
     /// super-linearly past a few thousand on one stream), so a watcher scoped to N
     /// prefixes must not cost N consumers.
-    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>)
-    -> Result<(), KvError>;
+    async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
     /// Resume watching all keys from a previously saved cursor position.
     ///

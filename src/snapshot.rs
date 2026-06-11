@@ -43,6 +43,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
 use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
 
 const MAGIC: &[u8; 4] = b"PGSS";
@@ -79,6 +80,16 @@ pub enum SnapshotError {
     /// error surface.
     #[error("snapshot backend error: {0}")]
     Backend(String),
+    /// An export artifact failed validation: malformed/mismatched manifest,
+    /// checksum mismatch, version-policy rejection, unavailable destination, or a
+    /// post-import cursor that disagrees with the manifest.
+    ///
+    /// Distinct from [`InvalidFormat`](Self::InvalidFormat) (a *store-file*
+    /// problem — "my local fold is broken") because the recovery is different: an
+    /// invalid artifact means "fetch another artifact or fall back to a full
+    /// scan", never "repair the local store".
+    #[error("invalid snapshot artifact: {0}")]
+    ArtifactInvalid(String),
 }
 
 /// Result of loading a snapshot from disk.
@@ -378,6 +389,39 @@ pub trait SnapshotStore: Sized + Send {
         }
         Ok(())
     }
+
+    /// The most recently applied (and durably persisted) resume cursor —
+    /// [`WatchCursor::none`] when nothing has been applied.
+    fn cursor(&self) -> WatchCursor;
+
+    /// Export this fold as a transferable **artifact directory** at `dest_dir`:
+    /// the backend's files under `data/` plus a `MANIFEST.json` carrying
+    /// per-file checksums, the backend's identity and on-disk format generation,
+    /// and the watch cursor the payload is exactly consistent with
+    /// (== [`cursor`](Self::cursor) at the moment of export).
+    ///
+    /// This is the bootstrap primitive for replicas of a **bounded** log: ship
+    /// the artifact to a new/rebuilding node, import it there, and resume the
+    /// watch from the embedded cursor — replaying only the log tail instead of
+    /// a full state that the log may no longer hold.
+    ///
+    /// ## Contract
+    ///
+    /// - `dest_dir` must not exist (or be an empty directory). Never overwrites.
+    /// - On `Ok`, the artifact at `dest_dir` is **complete and fsynced**: it was
+    ///   assembled in a temp directory, the manifest written last, and atomically
+    ///   renamed into place. A crash mid-export leaves no artifact at `dest_dir`.
+    /// - `&mut self` is deliberate: export must not run concurrently with
+    ///   [`apply`](Self::apply), which is what makes the embedded cursor exact.
+    ///   Inside [`watch_applied`](crate::watch_applied), use its export-request
+    ///   channel rather than calling this directly.
+    /// - **Artifacts are transient.** Directory-copy backends hardlink immutable
+    ///   files where possible, so a lingering artifact pins storage the source
+    ///   later compacts away — upload (or move) it, then delete it. Stage and
+    ///   destination should be on the same filesystem as the fold; a
+    ///   cross-filesystem destination silently degrades hardlinks to full copies.
+    /// - Blocking I/O, like everything on this trait.
+    fn export_to(&mut self, dest_dir: &Path) -> Result<ExportManifest, SnapshotError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +449,14 @@ pub struct AppendLogSnapshot {
 }
 
 impl AppendLogSnapshot {
+    /// Backend identity in artifact manifests.
+    pub(crate) const BACKEND: &'static str = "append-log";
+    /// On-disk format generation in artifact manifests (the append log's
+    /// [`FORMAT_VERSION`]).
+    pub(crate) const BACKEND_VERSION: &'static str = "2";
+    /// The single payload file inside an artifact, relative to its `data/` dir.
+    const ARTIFACT_PAYLOAD: &'static str = "fold.snap";
+
     /// Open or resume the log at `path` with an explicit compaction threshold.
     ///
     /// Replays any existing log into the in-RAM fold (and compacts it, exactly as
@@ -424,6 +476,63 @@ impl AppendLogSnapshot {
                 cursor,
             },
         ))
+    }
+
+    /// Import an exported artifact (see [`SnapshotStore::export_to`]) as a new
+    /// fold at `dest_path`, returning the embedded resume cursor and the opened
+    /// store.
+    ///
+    /// `dest_path` is a **file** path (this backend is a single log file) and
+    /// must not already exist. The artifact is fully verified against its
+    /// manifest — checksums, backend identity, format generation — and the
+    /// staged copy is loaded and its cursor compared against the manifest's
+    /// before anything lands at `dest_path`; a bad artifact never becomes a
+    /// fold. A crash mid-import leaves nothing at `dest_path`; a crash after
+    /// the final rename leaves a valid fold (a retried import then refuses the
+    /// existing destination — just [`open`](Self::open) it).
+    pub fn import(
+        artifact_dir: &Path,
+        dest_path: &Path,
+        compact_threshold: u64,
+    ) -> Result<(WatchCursor, Self), SnapshotError> {
+        let (manifest, stage) =
+            verify_and_stage_import(artifact_dir, dest_path, Self::BACKEND, |v| {
+                if v == Self::BACKEND_VERSION {
+                    Ok(())
+                } else {
+                    Err(SnapshotError::ArtifactInvalid(format!(
+                        "append-log artifact has format generation {v:?}, this build reads {:?}",
+                        Self::BACKEND_VERSION
+                    )))
+                }
+            })?;
+
+        // This backend's artifact is exactly one payload file.
+        let expected = format!("{}/{}", crate::artifact::PAYLOAD_DIR, Self::ARTIFACT_PAYLOAD);
+        if manifest.files.len() != 1 || manifest.files[0].path != expected {
+            return Err(SnapshotError::ArtifactInvalid(format!(
+                "append-log artifact must contain exactly {expected:?}"
+            )));
+        }
+
+        // Verify the staged payload opens and agrees with the manifest cursor
+        // BEFORE the rename — a bad artifact must never land at the destination.
+        let staged_file = stage.payload().join(Self::ARTIFACT_PAYLOAD);
+        let staged_cursor = match load(&staged_file)? {
+            Some(snap) => snap.cursor,
+            // An empty fold exports to an artifact whose log holds no entries
+            // and no cursor; `load` reports that as `None`.
+            None => WatchCursor::none(),
+        };
+        if staged_cursor != manifest.cursor {
+            return Err(SnapshotError::ArtifactInvalid(format!(
+                "payload cursor {staged_cursor:?} disagrees with manifest cursor {:?}",
+                manifest.cursor
+            )));
+        }
+
+        stage.finalize_file(Self::ARTIFACT_PAYLOAD)?;
+        Self::open(dest_path, compact_threshold)
     }
 }
 
@@ -472,6 +581,40 @@ impl SnapshotStore for AppendLogSnapshot {
             .collect();
         out.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    fn cursor(&self) -> WatchCursor {
+        self.cursor.clone()
+    }
+
+    fn export_to(&mut self, dest_dir: &Path) -> Result<ExportManifest, SnapshotError> {
+        let stage = ExportStage::new(dest_dir)?;
+        fs::create_dir(stage.payload())?;
+        // The in-RAM fold is the complete live state, so the artifact payload is
+        // simply a compacted log written from it — same sorted, CRC'd, synced v2
+        // file `compact_to_file` produces for the store itself. No need to flush
+        // or read back the live log file.
+        let payload = stage.payload().join(Self::ARTIFACT_PAYLOAD);
+        compact_to_file(&payload, &self.entries, &self.cursor)?;
+
+        // Verify the payload by loading it back: cursor and entry count must
+        // match the live fold. Cheap for the in-RAM backend, and keeps the
+        // "an artifact that exists is trustworthy" guarantee uniform across
+        // backends.
+        let (loaded_cursor, loaded_len) = match load(&payload)? {
+            Some(snap) => (snap.cursor, snap.entries.len()),
+            None => (WatchCursor::none(), 0),
+        };
+        if loaded_cursor != self.cursor || loaded_len != self.entries.len() {
+            return Err(SnapshotError::ArtifactInvalid(format!(
+                "exported payload disagrees with live fold (cursor {loaded_cursor:?} vs {:?}, \
+                 {loaded_len} vs {} entries)",
+                self.cursor,
+                self.entries.len()
+            )));
+        }
+
+        stage.seal_and_finalize(Self::BACKEND, Self::BACKEND_VERSION, &self.cursor)
     }
 }
 
