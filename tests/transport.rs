@@ -17,7 +17,8 @@ use slipstream::snapshot::{SnapshotError, SnapshotStore};
 use slipstream::{
     AppendLogSnapshot, ArtifactTransport, BatchConfig, Connection, ExportLease, ExportManifest,
     KvEntry, KvUpdate, KvWriter, NatsConnection, NatsConnectionConfig, ObjectStoreTransport,
-    StoreConfig, VersionToken, WatchCursor, WatchScope, run_export_round, watch_applied,
+    PublishOutcome, StoreConfig, VersionToken, WatchCursor, WatchScope, run_export_round,
+    watch_applied,
 };
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
@@ -118,32 +119,175 @@ async fn import_remote_bootstraps_a_fold() {
     );
 }
 
-/// A sibling manifest that disagrees with the tar's embedded manifest is
-/// rejected at download — the transport is untrusted.
+/// A doctored pointer cannot reach the real payload: the payload key is
+/// derived from the pointer's bytes (content addressing), so tampering with
+/// the pointer dereferences to nothing — rejected at download, nothing lands.
 #[tokio::test(flavor = "multi_thread")]
-async fn download_rejects_manifest_disagreement() {
+async fn download_rejects_doctored_pointer() {
     let (transport, bucket) = local_transport();
     let (artifact, _m, dir) = exported_artifact();
-    transport.upload("latest", &artifact).await.unwrap();
+    assert_eq!(
+        transport.upload("latest", &artifact).await.unwrap(),
+        PublishOutcome::Published
+    );
 
-    // Doctor the sibling manifest object in the "bucket" (cursor 999).
-    let sibling = bucket
+    // Doctor the pointer object in the "bucket" (cursor 999): its derived
+    // payload address now points at an object that does not exist.
+    let pointer = bucket
         .path()
         .join("slipstream-artifacts")
         .join("latest.manifest.json");
-    let raw = std::fs::read(&sibling).unwrap();
+    let raw = std::fs::read(&pointer).unwrap();
     let mut json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     json["cursor_hex"] = "00000000000003e7".into();
-    std::fs::write(&sibling, serde_json::to_vec(&json).unwrap()).unwrap();
+    std::fs::write(&pointer, serde_json::to_vec(&json).unwrap()).unwrap();
 
     let dest = dir.path().join("downloaded");
     match transport.download("latest", &dest).await {
         Err(SnapshotError::ArtifactInvalid(msg)) => {
-            assert!(msg.contains("disagrees"), "{msg}");
+            assert!(msg.contains("not found"), "{msg}");
         }
         other => panic!("expected ArtifactInvalid, got {other:?}"),
     }
     assert!(!dest.exists(), "nothing lands at the destination");
+}
+
+/// The pointer only moves forward: publishing an artifact older than the
+/// current pointer is refused with [`PublishOutcome::SupersededByNewer`],
+/// and the published manifest is untouched. Runs on `InMemory`, which
+/// implements the same conditional-put semantics as S3 — so this exercises
+/// the VERIFIED swap path (Create, refusal, If-Match update) without a
+/// server; `transport_s3.rs` repeats it against live MinIO. The live-fleet
+/// version (a stalled round racing a takeover through `run_export_round`)
+/// is `multi_export.rs`'s slow-exporter scenario.
+#[tokio::test(flavor = "multi_thread")]
+async fn pointer_swap_refuses_regression() {
+    let transport = ObjectStoreTransport::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "slipstream-artifacts",
+    );
+    let dir = TempDir::new().unwrap();
+
+    // Two artifacts from one fold at different cursors.
+    let (_r, mut s) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
+    s.apply(&[put("a", b"1", 3)], &WatchCursor::from_u64(3))
+        .unwrap();
+    let old = dir.path().join("artifact-old");
+    let old_manifest = s.export_to(&old).unwrap();
+    s.apply(&[put("b", b"2", 5)], &WatchCursor::from_u64(5))
+        .unwrap();
+    let new = dir.path().join("artifact-new");
+    let new_manifest = s.export_to(&new).unwrap();
+
+    assert_eq!(
+        transport.upload("latest", &new).await.unwrap(),
+        PublishOutcome::Published
+    );
+    match transport.upload("latest", &old).await.unwrap() {
+        PublishOutcome::SupersededByNewer { remote_cursor } => {
+            assert_eq!(remote_cursor, new_manifest.cursor);
+        }
+        other => panic!("stale publish must be refused, got {other:?}"),
+    }
+    assert_eq!(
+        transport.manifest("latest").await.unwrap().cursor,
+        new_manifest.cursor,
+        "the pointer never regressed"
+    );
+    // Equal-or-newer always publishes (LWW among equals is harmless — each
+    // pointer atomically references its own payload).
+    assert_eq!(
+        transport.upload("latest", &new).await.unwrap(),
+        PublishOutcome::Published
+    );
+    let _ = old_manifest;
+}
+
+/// A non-CAS store (LocalFileSystem) FAILS the pointer swap by default —
+/// the degraded last-write-wins publish is outside the verified protocol
+/// and must be an explicit opt-in, not a silent downgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_cas_store_fails_closed_without_opt_in() {
+    let (transport, _bucket) = local_transport();
+    let dir = TempDir::new().unwrap();
+
+    let (_r, mut s) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
+    s.apply(&[put("a", b"1", 3)], &WatchCursor::from_u64(3))
+        .unwrap();
+    let first = dir.path().join("artifact-3");
+    s.export_to(&first).unwrap();
+    s.apply(&[put("b", b"2", 5)], &WatchCursor::from_u64(5))
+        .unwrap();
+    let second = dir.path().join("artifact-5");
+    s.export_to(&second).unwrap();
+
+    // First publish is create-only — supported everywhere, succeeds.
+    assert_eq!(
+        transport.upload("latest", &first).await.unwrap(),
+        PublishOutcome::Published
+    );
+    // Forward publish needs compare-and-swap — refused on this store with an
+    // error naming the opt-in, and the pointer is untouched.
+    match transport.upload("latest", &second).await {
+        Err(SnapshotError::Backend(msg)) => {
+            assert!(msg.contains("with_non_atomic_pointer_fallback"), "{msg}");
+        }
+        other => panic!("non-CAS swap must fail closed, got {other:?}"),
+    }
+    assert_eq!(
+        transport.manifest("latest").await.unwrap().cursor.as_u64(),
+        Some(3),
+        "the failed swap left the pointer untouched"
+    );
+}
+
+/// `prune` collects payloads the pointer no longer references — but never
+/// the referenced one, and never inside the grace window. (Local FS store:
+/// the second publish takes the explicitly opted-in non-atomic fallback;
+/// prune itself is identical on every store and re-verified on MinIO.)
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_collects_unreferenced_payloads() {
+    let (transport, bucket) = local_transport();
+    let transport = transport.with_non_atomic_pointer_fallback();
+    let dir = TempDir::new().unwrap();
+
+    let (_r, mut s) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
+    s.apply(&[put("a", b"1", 3)], &WatchCursor::from_u64(3))
+        .unwrap();
+    let old = dir.path().join("artifact-old");
+    s.export_to(&old).unwrap();
+    s.apply(&[put("b", b"2", 5)], &WatchCursor::from_u64(5))
+        .unwrap();
+    let new = dir.path().join("artifact-new");
+    let new_manifest = s.export_to(&new).unwrap();
+
+    transport.upload("latest", &old).await.unwrap();
+    transport.upload("latest", &new).await.unwrap();
+    let payloads = bucket
+        .path()
+        .join("slipstream-artifacts")
+        .join("latest.payloads");
+    assert_eq!(
+        std::fs::read_dir(&payloads).unwrap().count(),
+        2,
+        "both rounds' payloads exist before the prune"
+    );
+
+    // Inside the grace window nothing is collected.
+    assert_eq!(
+        transport
+            .prune("latest", Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    // Grace elapsed (zero): the unreferenced payload goes, the referenced one
+    // stays, and the published artifact still round-trips.
+    assert_eq!(transport.prune("latest", Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(std::fs::read_dir(&payloads).unwrap().count(), 1);
+    let downloaded = dir.path().join("downloaded");
+    let got = transport.download("latest", &downloaded).await.unwrap();
+    assert_eq!(got.cursor, new_manifest.cursor);
 }
 
 /// A missing remote object is an ArtifactInvalid, not an opaque backend error.
@@ -377,7 +521,7 @@ struct FailingTransport;
 
 #[async_trait]
 impl ArtifactTransport for FailingTransport {
-    async fn upload(&self, _key: &str, _dir: &Path) -> Result<(), SnapshotError> {
+    async fn upload(&self, _key: &str, _dir: &Path) -> Result<PublishOutcome, SnapshotError> {
         Err(SnapshotError::Backend("injected upload failure".into()))
     }
     async fn manifest(&self, _key: &str) -> Result<ExportManifest, SnapshotError> {

@@ -1001,6 +1001,14 @@ async fn stream_watch(
 /// Check if a NATS watch error indicates the requested start sequence is
 /// too old (compacted), meaning callers should fall back to a full watch.
 ///
+/// SECOND line of defense only: live nats-server (2.14) does not error on a
+/// below-head start sequence at all — it silently clamps to the first
+/// retained message (pinned by `tests/resync.rs`), so the PRIMARY expiry
+/// detection is [`NatsKvWatcher::check_resume_window`]'s proactive
+/// `first_sequence` comparison. This matcher remains for server versions or
+/// paths that do error, where mapping to [`KvError::CursorExpired`] keeps
+/// the fallback reachable instead of stranding the caller.
+///
 /// async-nats has no granular error kind for this: `WatchErrorKind` is only
 /// `InvalidKey`/`TimedOut`/`ConsumerCreate`/`Other`, and "start sequence too old"
 /// arrives as `ConsumerCreate`/`Other` with the real reason buried in the source
@@ -1085,6 +1093,54 @@ fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<Kv
     })
 }
 
+impl NatsKvWatcher {
+    /// Proactive cursor-expiry detection, REQUIRED before any `*_from` resume.
+    ///
+    /// NATS does **not** error when an ordered consumer's `ByStartSequence`
+    /// falls below the stream's first retained sequence — it silently delivers
+    /// from the first available message (pinned against a live nats-server by
+    /// `tests/resync.rs::nats_silently_clamps_resume_below_first_seq`). A
+    /// silent clamp skips the gap's evicted messages — delete markers
+    /// included — without ever taking the `CursorExpired` → resync path, so
+    /// expiry MUST be detected by comparing the stream's `first_sequence`
+    /// against the resume point before trusting the consumer. The
+    /// error-string matching at the consumer-create sites stays as a second
+    /// line of defense for server versions that do error.
+    ///
+    /// Why `first_sequence` is the right boundary: interior (per-subject
+    /// history) eviction inside the gap is safe for a last-write-wins fold —
+    /// an overwrite-evicted revision implies a LATER revision of the same
+    /// subject exists and will be delivered. Lost *deletes* come from head
+    /// eviction (stream limits/age), which is exactly what advances
+    /// `first_sequence`. (An admin interior purge of a subject can also
+    /// destroy a delete marker without moving the head — that is a manual
+    /// destructive operation, same trust class as deleting the stream.)
+    ///
+    /// Head eviction racing the window between this check and consumer
+    /// creation is the same exposure any live consumer has against
+    /// aggressive retention; the check bounds the silent gap to that
+    /// milliseconds-scale window, where the prior behavior left it unbounded.
+    async fn check_resume_window(&self, revision: u64) -> Result<(), KvError> {
+        let stream = timed(self.js.get_stream(format!("KV_{}", self.bucket)))
+            .await?
+            .map_err(|e| {
+                KvError::OperationFailed(format!("get KV stream for resume check: {e}"))
+            })?;
+        let first = stream.cached_info().state.first_sequence;
+        // The shared protocol kernel — the same guard the model checker's
+        // Resume transition executes (`crate::protocol::resume_window_ok`).
+        if !crate::protocol::resume_window_ok(revision, first) {
+            warn!(
+                revision,
+                first_sequence = first,
+                "resume cursor is below the stream's first retained sequence; cursor expired"
+            );
+            return Err(KvError::CursorExpired);
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl KvWatcher for NatsKvWatcher {
     async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError> {
@@ -1146,6 +1202,7 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_all(tx).await,
         };
+        self.check_resume_window(revision).await?;
 
         let watcher = match timed(self.kv.watch_all_from_revision(revision + 1)).await? {
             Ok(w) => w,
@@ -1158,6 +1215,12 @@ impl KvWatcher for NatsKvWatcher {
                 return Err(KvError::WatchError(err_str));
             }
         };
+        // Re-check AFTER the consumer exists: head eviction in the window
+        // between the pre-flight check and consumer creation would otherwise
+        // clamp silently. Past this point the consumer delivers from retained
+        // messages; the residual exposure is the generic retention-vs-lag
+        // bound every live consumer carries (model axiom 5).
+        self.check_resume_window(revision).await?;
 
         info!(revision, "resumed watch from cursor");
         stream_watch(watcher, &tx).await
@@ -1173,6 +1236,7 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_prefix(prefix, tx).await,
         };
+        self.check_resume_window(revision).await?;
 
         let nats_key = format!("{prefix}>");
         let watcher = match timed(self.kv.watch_from_revision(&nats_key, revision + 1)).await? {
@@ -1186,6 +1250,9 @@ impl KvWatcher for NatsKvWatcher {
                 return Err(KvError::WatchError(err_str));
             }
         };
+        // Same post-create re-check as watch_all_from: close the
+        // check→create eviction window.
+        self.check_resume_window(revision).await?;
 
         info!(revision, prefix, "resumed prefix watch from cursor");
         stream_watch(watcher, &tx).await
@@ -1227,6 +1294,21 @@ impl KvWatcher for NatsKvWatcher {
             .await?
             .map_err(|e| KvError::WatchError(format!("get KV stream: {e}")))?;
 
+        // Same proactive expiry detection as `check_resume_window` (NATS
+        // silently clamps a below-head ByStartSequence; see that method's
+        // docs) — checked on the stream handle this path already fetched,
+        // via the shared protocol kernel.
+        let first = stream.cached_info().state.first_sequence;
+        if !crate::protocol::resume_window_ok(revision, first) {
+            warn!(
+                revision,
+                first_sequence = first,
+                ?prefixes,
+                "resume cursor is below the stream's first retained sequence; cursor expired"
+            );
+            return Err(KvError::CursorExpired);
+        }
+
         let consumer = match timed(stream.create_consumer(push::OrderedConfig {
             deliver_subject: self.client.new_inbox(),
             description: Some("kv multi-prefix resume consumer".to_string()),
@@ -1252,6 +1334,11 @@ impl KvWatcher for NatsKvWatcher {
                 return Err(KvError::WatchError(err_str));
             }
         };
+
+        // Re-check AFTER the consumer exists (fresh stream info, not the
+        // handle's cached copy): closes the check→create eviction window,
+        // same as the single-filter resume paths.
+        self.check_resume_window(revision).await?;
 
         let mut messages = timed(consumer.messages())
             .await?

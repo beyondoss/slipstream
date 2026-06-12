@@ -359,3 +359,141 @@ async fn minio_multipart_upload_round_trips() {
         "all entries survive the multipart round trip"
     );
 }
+
+// --- The S3-axiom test for the pointer-swap protocol --------------------------
+
+/// Axiom 1 of `tests/model.rs`, verified against a REAL S3 API (MinIO):
+/// conditional puts have one winner per slot and the pointer swap is
+/// monotonic and crash-safe on this store.
+///
+/// Exercises, in order: `PutMode::Create` (first publish), the monotonic
+/// refusal (stale publish superseded), `PutMode::Update` / `If-Match`
+/// compare-and-swap (forward publish over an existing pointer), the
+/// crash-between-payload-and-swap window (pointer stays consistent,
+/// bootstrap stays available), recovery, and `prune` (list + delete of
+/// unreferenced content-addressed payloads).
+#[tokio::test(flavor = "multi_thread")]
+async fn minio_pointer_swap_monotonic_and_crash_safe() {
+    use slipstream::{AppendLogSnapshot, PublishOutcome};
+
+    let minio = TestMinio::start().await;
+    let dir = TempDir::new().unwrap();
+
+    // Four artifacts from one fold at cursors 3 < 5 < 7 < 9.
+    let (_r, mut s) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
+    let artifact_at = |rev: u64, s: &mut AppendLogSnapshot| {
+        s.apply(
+            &[slipstream::KvUpdate::Put(slipstream::KvEntry {
+                key: format!("route.{rev}"),
+                value: format!("v{rev}").into_bytes(),
+                version: slipstream::VersionToken::from_u64(rev),
+            })],
+            &WatchCursor::from_u64(rev),
+        )
+        .unwrap();
+        let p = dir.path().join(format!("artifact-{rev}"));
+        s.export_to(&p).unwrap();
+        p
+    };
+    let a3 = artifact_at(3, &mut s);
+    let a5 = artifact_at(5, &mut s);
+    let a7 = artifact_at(7, &mut s);
+    let a9 = artifact_at(9, &mut s);
+
+    let transport = minio_transport(&minio);
+
+    // PutMode::Create — first publish wins the empty slot.
+    assert_eq!(
+        transport.upload("edge/latest", &a5).await.unwrap(),
+        PublishOutcome::Published
+    );
+    // Monotonic refusal — a stale publish cannot regress the pointer.
+    match transport.upload("edge/latest", &a3).await.unwrap() {
+        PublishOutcome::SupersededByNewer { remote_cursor } => {
+            assert_eq!(remote_cursor.as_u64(), Some(5));
+        }
+        other => panic!("stale publish must be superseded, got {other:?}"),
+    }
+    assert_eq!(
+        transport
+            .manifest("edge/latest")
+            .await
+            .unwrap()
+            .cursor
+            .as_u64(),
+        Some(5)
+    );
+    // PutMode::Update (If-Match CAS) — forward publish over the existing
+    // pointer, on the real S3 conditional-put API.
+    assert_eq!(
+        transport.upload("edge/latest", &a7).await.unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        transport
+            .manifest("edge/latest")
+            .await
+            .unwrap()
+            .cursor
+            .as_u64(),
+        Some(7)
+    );
+
+    // Crash between payload and pointer swap, on the real store: the pointer
+    // stays fully consistent and bootstrap keeps working.
+    let raw: Arc<dyn object_store::ObjectStore> = {
+        let mut b = object_store::aws::AmazonS3Builder::new().with_bucket_name(MINIO_BUCKET);
+        for (k, v) in minio.s3_options() {
+            b = b.with_config(k.parse().expect("s3 config key"), v);
+        }
+        Arc::new(b.build().expect("build raw s3 store"))
+    };
+    let crash = Arc::new(common::ManifestPutCrash {
+        inner: raw,
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let crashing = ObjectStoreTransport::new(crash, "slipstream");
+    crashing
+        .upload("edge/latest", &a9)
+        .await
+        .expect_err("injected crash before the pointer swap");
+    assert_eq!(
+        transport
+            .manifest("edge/latest")
+            .await
+            .unwrap()
+            .cursor
+            .as_u64(),
+        Some(7),
+        "the pointer is untouched by the crashed round"
+    );
+    let dl_during = dir.path().join("dl-during");
+    let got = transport
+        .download("edge/latest", &dl_during)
+        .await
+        .expect("bootstrap stays available through the crash window");
+    assert_eq!(got.cursor.as_u64(), Some(7));
+
+    // Recovery: the next round publishes, and prune collects every payload
+    // the pointer no longer references — on the real list/delete API.
+    assert_eq!(
+        transport.upload("edge/latest", &a9).await.unwrap(),
+        PublishOutcome::Published
+    );
+    let pruned = transport
+        .prune("edge/latest", Duration::ZERO)
+        .await
+        .expect("prune");
+    assert_eq!(pruned, 3, "payloads for cursors 3, 5, 7 are unreferenced");
+    let dl = dir.path().join("dl-final");
+    let got = transport
+        .download("edge/latest", &dl)
+        .await
+        .expect("download after prune");
+    assert_eq!(got.cursor.as_u64(), Some(9));
+    let (cursor, imported) =
+        AppendLogSnapshot::import(&dl, &dir.path().join("imported.snap"), u64::MAX)
+            .expect("import");
+    assert_eq!(cursor.as_u64(), Some(9));
+    assert_eq!(imported.range("route.").unwrap().len(), 4);
+}

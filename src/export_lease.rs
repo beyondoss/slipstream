@@ -20,9 +20,14 @@
 //! portable to any [`KvWriter`] backend and free of server-version/bucket-flag
 //! requirements. The cost is wall-clock comparison across nodes: with
 //! NTP-sane clocks and round periods measured in minutes, skew is noise — and
-//! a premature steal is *safe* anyway (two exporters produce two identical
-//! artifacts; the upload is last-write-wins on the same key). The lease is a
-//! work-deduplication optimization, never a correctness gate.
+//! a premature steal is *safe* anyway, though NOT because concurrent
+//! exporters produce identical artifacts (they don't: each replica exports
+//! at its own applied cursor). Safety comes from the transport: payloads are
+//! content-addressed (concurrent uploads cannot collide or tear) and the
+//! published pointer only moves forward (an overrun round's stale artifact
+//! is refused, [`PublishOutcome::SupersededByNewer`](crate::PublishOutcome)),
+//! machine-checked in `tests/model.rs` with NO lease in the model at all.
+//! The lease is a work-deduplication optimization, never a correctness gate.
 //!
 //! ## Lifecycle
 //!
