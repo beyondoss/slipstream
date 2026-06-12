@@ -677,8 +677,11 @@ Production code and an exhaustive model checker running the same logic closes th
 | `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expired stale-key resync, `ExportRequest` handling |
 | `src/lib.rs`               | Re-exports all public types; no logic                                                |
 | `benches/`                 | Criterion benchmarks: snapshot write/checkpoint/load throughput, batch throughput, ACK subject parsing |
+| `tests/integration.rs`     | NATS JetStream backend integration suite: each test boots its own `nats-server` on a free port; covers bucket create, CAS, watch semantics, cursor resume, and delete reconciliation |
+| `tests/snapshot_store.rs`  | Backend-agnostic `SnapshotStore` conformance suite: every check is generic over the backend, instantiated for `AppendLogSnapshot`, `FjallSnapshot`, and `RocksDbSnapshot`; new backends get the whole suite for free |
 | `tests/transport.rs`       | Integration: upload/download/manifest round-trip, pointer swap, prune, non-CAS fail-closed |
 | `tests/transport_s3.rs`    | Live MinIO: CAS semantics (create, If-Match update, refusal, crash-window availability, prune) verified against a real object store |
+| `tests/bootstrap.rs`       | Tier-2 bootstrap proofs on live NATS + on-disk backends: exports from a live `watch_applied` loop under churn, imports as a second node, and asserts **delta-only resume** via delivery count (not just convergence — a full replay would produce the same end state) |
 | `tests/multi_export.rs`    | Prevention proofs on live NATS + real fjall/RocksDB: slow-exporter clobber refused, crash window keeps bootstrap available, multi-SST post-compaction fidelity |
 | `tests/resync.rs`          | Live-NATS conformance: NATS silent-clamp pinned; full expiry → resync chain e2e; no-reader divergence pinned |
 | `tests/model.rs`           | Stateright exhaustive model (~250M states, fleet size 2–3, unbounded rounds): pointer swap theorems (no regression, no torn pair, no dangling pointer, no silent divergence, terminal liveness); mutation tests prove each protocol guard load-bearing |
