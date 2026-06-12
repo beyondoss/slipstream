@@ -244,11 +244,17 @@ pub trait KvReader: Send + Sync {
     /// entries written by `delete_with_version`). Most callers should use
     /// `get()` instead, which filters tombstones for consistency with `scan()`.
     ///
-    /// Override in backends where tombstone version access is needed for
-    /// CAS conflict detection.
-    async fn entry(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        self.get(key).await
-    }
+    /// REQUIRED (no default) — deliberately. A default delegating to `get()`
+    /// silently hid tombstones on any backend that forgot to override it,
+    /// which breaks CAS callers that need the tombstone's version: e.g.
+    /// [`ExportLease::try_acquire`](crate::ExportLease::try_acquire) reads an
+    /// abandoned (CAS-deleted) lease's version through `entry()` for its
+    /// takeover write — with a `get()` default it would see `None` and report
+    /// the round as live instead of stealing it. Backends without empty-value
+    /// tombstone semantics (where delete genuinely removes the key) should
+    /// implement this as a delegation to `get()` — explicitly, so the choice
+    /// is a reviewed decision rather than an inherited footgun.
+    async fn entry(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
 }
 
 /// Watch capability - optional, not all stores support real-time updates.

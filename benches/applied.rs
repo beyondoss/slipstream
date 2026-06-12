@@ -95,6 +95,7 @@ fn bench_batch_throughput(c: &mut Criterion) {
                         BatchConfig {
                             window: Duration::from_millis(10),
                             max: 100,
+                            ..BatchConfig::default()
                         },
                         // parse: keep every put.
                         |u: &KvUpdate| match u {
