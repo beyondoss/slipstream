@@ -140,15 +140,25 @@ pub struct BatchConfig {
     pub window: Duration,
     /// Maximum number of parsed updates in a batch before forcing a flush.
     pub max: usize,
+    /// Capacity of the internal watch-task → main-loop channel. When the main
+    /// loop falls behind (slow `apply`, blocking store flush), a full channel
+    /// backpressures the watch task — that is the design — but during initial
+    /// state-sync hydration of a large bucket the channel can fill faster than
+    /// the window flushes, making *this* the effective batch boundary rather
+    /// than [`max`](Self::max). Tune it together with `max` for high-fanout
+    /// hydration; clamped to a minimum of 1.
+    pub channel_capacity: usize,
 }
 
 impl Default for BatchConfig {
     /// 10 ms / 100 updates — the de-facto default every hand-rolled caller
-    /// already used, lifted into one place.
+    /// already used, lifted into one place — and the 256-deep channel the
+    /// loop always allocated, now tunable.
     fn default() -> Self {
         Self {
             window: Duration::from_millis(10),
             max: 100,
+            channel_capacity: 256,
         }
     }
 }
@@ -274,7 +284,7 @@ where
 
     // Spawn the watch task. It owns the cursor-expired fallback so the main loop
     // only ever sees a clean ordered stream of updates on `rx`.
-    let (tx, mut rx) = mpsc::channel::<KvUpdate>(256);
+    let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
     let handle = {
         let watcher = Arc::clone(&watcher);
         tokio::spawn(
@@ -471,29 +481,33 @@ where
                         let mut stale: Vec<String> = Vec::new();
                         if let Some(st) = &store {
                             for prefix in &scope_prefixes {
-                                match st.range(prefix) {
-                                    Ok(entries) => stale.extend(
-                                        entries
-                                            .into_iter()
-                                            .filter(|e| !live.contains(e.key.as_str()))
-                                            .map(|e| e.key),
-                                    ),
-                                    Err(e) => {
-                                        // FATAL, not a degrade: an incomplete
-                                        // diff silently leaves deleted keys in
-                                        // the fold forever (tests/model.rs
-                                        // proves the divergence reachable
-                                        // under degrade semantics). Fail the
-                                        // watch; the restart re-runs the
-                                        // resume → expiry → resync from
-                                        // scratch.
-                                        warn!(error = %e, prefix = %prefix,
-                                            "resync fold range failed; aborting watch rather than diverging");
-                                        handle.abort();
-                                        return Err(KvError::WatchError(format!(
-                                            "cursor-expired resync failed listing fold prefix {prefix:?}: {e}"
-                                        )));
+                                // Stream the fold's keys rather than `range()`,
+                                // which buffers every in-scope entry — values
+                                // included — into one Vec. On an on-disk backend
+                                // holding a fold larger than RAM (the case those
+                                // backends exist for), an All-scope resync would
+                                // materialize the entire fold on the repair
+                                // path. Only the keys matter for the diff.
+                                if let Err(e) = st.for_each_in_range(prefix, |entry| {
+                                    if !live.contains(entry.key.as_str()) {
+                                        stale.push(entry.key);
                                     }
+                                    Ok(())
+                                }) {
+                                    // FATAL, not a degrade: an incomplete
+                                    // diff silently leaves deleted keys in
+                                    // the fold forever (tests/model.rs
+                                    // proves the divergence reachable
+                                    // under degrade semantics). Fail the
+                                    // watch; the restart re-runs the
+                                    // resume → expiry → resync from
+                                    // scratch.
+                                    warn!(error = %e, prefix = %prefix,
+                                        "resync fold scan failed; aborting watch rather than diverging");
+                                    handle.abort();
+                                    return Err(KvError::WatchError(format!(
+                                        "cursor-expired resync failed listing fold prefix {prefix:?}: {e}"
+                                    )));
                                 }
                             }
                         }
@@ -595,8 +609,15 @@ where
                     Some(u) => {
                         // Cursor authority: every received update bumps the
                         // pending high-water, regardless of whether `parse`
-                        // keeps it.
-                        batch_high = WatchCursor::from_version(u.version().clone());
+                        // keeps it — but only when it carries a real position.
+                        // An unknown version (e.g. an unparseable ACK subject
+                        // on the hand-built multi-prefix consumer path) must
+                        // neither mint a fake cursor nor clobber the real high
+                        // from earlier in the batch; skipping it under-advances
+                        // at worst, and re-delivery on resume is idempotent.
+                        if !u.version().is_unknown() {
+                            batch_high = WatchCursor::from_version(u.version().clone());
+                        }
 
                         // Buffer the raw update for the durable store fold (which
                         // commits the whole batch + cursor atomically on flush).
@@ -912,6 +933,10 @@ mod tests {
             unreachable!("resync only lists keys")
         }
 
+        async fn entry(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
+
         async fn keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
             Ok(self
                 .live
@@ -1063,6 +1088,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_secs(3600), // effectively never
                 max,
+                ..BatchConfig::default()
             },
             parse_put,
             move |batch: Vec<Vec<u8>>| f.lock().unwrap().push(batch.len()),
@@ -1104,6 +1130,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_secs(3600), // window won't fire
                 max: 100,
+                ..BatchConfig::default()
             },
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -1156,6 +1183,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max,
+                ..BatchConfig::default()
             },
             parse_put,
             move |_batch: Vec<Vec<u8>>| {
@@ -1221,6 +1249,55 @@ mod tests {
             "an all-rejected batch applies nothing"
         );
         assert_eq!(on_applied_max.load(Ordering::SeqCst), 7);
+    }
+
+    /// An update carrying the UNKNOWN version (an unparseable ACK subject on
+    /// the hand-built multi-prefix consumer path) must neither mint a cursor
+    /// position nor clobber the real high-water from earlier in the batch.
+    /// Pre-guard behavior: `kv_message_to_update` fabricated revision 0 for
+    /// such updates and the unconditional `batch_high = ...` adopted it,
+    /// regressing the persisted cursor to 0. The update itself is still
+    /// applied — only the cursor ignores it.
+    #[tokio::test]
+    async fn unknown_version_update_does_not_move_or_clobber_cursor() {
+        let unknown_put = KvUpdate::Put(KvEntry {
+            key: "u".to_string(),
+            value: b"x".to_vec(),
+            version: VersionToken::unknown(),
+        });
+        let updates = vec![put("a", b"1", 5), unknown_put];
+        let watcher = Arc::new(MockWatcher::new(updates, false)); // close after
+
+        let applied_batches = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let ab = Arc::clone(&applied_batches);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let cursor = watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None, // reader (no resync in this test)
+            None::<AppendLogSnapshot>,
+            None,
+            BatchConfig::default(),
+            parse_put,
+            move |batch: Vec<Vec<u8>>| ab.lock().unwrap().extend(batch),
+            move |_| {},
+            sd_rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cursor.as_u64(),
+            Some(5),
+            "the unknown-version update must not clobber the real batch high"
+        );
+        assert_eq!(
+            *applied_batches.lock().unwrap(),
+            vec![b"1".to_vec(), b"x".to_vec()],
+            "the unknown-version update is still applied"
+        );
     }
 
     /// A resume whose cursor has expired falls back to the full watch and still
@@ -1831,6 +1908,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_secs(3600), // window never fires
                 max: 100,
+                ..BatchConfig::default()
             },
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -2100,6 +2178,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_secs(3600),
                 max: 1, // one update per flush → a compaction per update
+                ..BatchConfig::default()
             },
             parse_put,
             move |_batch: Vec<Vec<u8>>| {},
@@ -2205,6 +2284,7 @@ mod tests {
             BatchConfig {
                 window: Duration::from_millis(1),
                 max: 1,
+                ..BatchConfig::default()
             },
             parse_put,
             |_batch: Vec<Vec<u8>>| {},
@@ -2240,6 +2320,9 @@ mod tests {
     #[async_trait]
     impl KvReader for FailingReader {
         async fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
+        async fn entry(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
             unreachable!("resync only lists keys")
         }
         async fn keys(&self, _prefix: &str) -> Result<Vec<String>, KvError> {

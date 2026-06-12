@@ -219,6 +219,10 @@ impl LeaseGuard {
     /// Best-effort: a CAS conflict (someone already took over) or write error
     /// is logged, not surfaced — worst case the round waits out its ttl, which
     /// is the no-abandon behavior anyway.
+    ///
+    /// An unawaited `abandon()` does nothing (and would trip the [`Drop`]
+    /// warning); the future's inherent `#[must_use]` plus this crate's
+    /// `deny(unused_must_use)` make that a compile error, not a silent leak.
     pub async fn abandon(mut self) {
         self.resolved = true;
         match self
@@ -247,6 +251,10 @@ impl LeaseGuard {
     /// Best-effort observability: a CAS conflict means the lease was already
     /// taken over (this round overran its ttl) and is logged, not surfaced —
     /// the artifact is already safe wherever the caller put it.
+    ///
+    /// An unawaited `complete()` records nothing (and would trip the [`Drop`]
+    /// warning); the future's inherent `#[must_use]` plus this crate's
+    /// `deny(unused_must_use)` make that a compile error, not a silent leak.
     pub async fn complete(mut self, cursor: &WatchCursor) -> Result<(), KvError> {
         self.resolved = true;
         self.record.completed_cursor_hex = Some(hex_encode(cursor.version().as_bytes()));

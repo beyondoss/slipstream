@@ -439,39 +439,50 @@ impl NatsConnection {
         let max_bytes = config.max_bytes.unwrap_or(10 * 1024 * 1024); // Default 10MB for Synadia Cloud
         kv_config.max_bytes = max_bytes;
 
-        // Try normal create first, fall back to raw API if it fails (Synadia Cloud compatibility)
-        match timed(js.create_key_value(kv_config)).await? {
-            Ok(kv) => Ok(kv),
-            Err(e) => {
+        // Try normal create first, fall back to raw API if it fails (Synadia Cloud compatibility).
+        //
+        // A TIMEOUT also takes the fallback, not an early return: the raw path
+        // exists for Synadia Cloud, which is the deployment most likely to be
+        // slow or distant — `?`-propagating the timeout here would skip the
+        // exact workaround built for it. If the connection is genuinely dead,
+        // the raw path's own `timed()` bounds surface that promptly anyway.
+        match timed(js.create_key_value(kv_config)).await {
+            Ok(Ok(kv)) => return Ok(kv),
+            Ok(Err(e)) => {
                 warn!(
                     bucket = config.name,
                     error = ?e,
                     "create_key_value failed, trying raw JetStream API"
                 );
-
-                // Try raw JetStream API as fallback
-                create_kv_bucket_raw(
-                    client,
-                    &config.name,
-                    max_bytes,
-                    history,
-                    max_age_nanos,
-                    config.num_replicas.unwrap_or(1),
-                )
-                .await?;
-
-                // Re-verify the bucket exists. This upholds the INVARIANT in
-                // `classify_raw_create_response`: the raw path reports `Created`
-                // on an unparseable response, so this round-trip is what actually
-                // confirms the bucket — do not remove it.
-                timed(js.get_key_value(&config.name))
-                    .await?
-                    .map_err(|e| {
-                        error!(bucket = config.name, error = ?e, "failed to get bucket after raw create");
-                        KvError::ConnectionFailed(format!("get bucket after raw create: {:?}", e))
-                    })
+            }
+            Err(_) => {
+                warn!(
+                    bucket = config.name,
+                    timeout = ?KV_OP_TIMEOUT,
+                    "create_key_value timed out, trying raw JetStream API"
+                );
             }
         }
+
+        // Try raw JetStream API as fallback
+        create_kv_bucket_raw(
+            client,
+            &config.name,
+            max_bytes,
+            history,
+            max_age_nanos,
+            config.num_replicas.unwrap_or(1),
+        )
+        .await?;
+
+        // Re-verify the bucket exists. This upholds the INVARIANT in
+        // `classify_raw_create_response`: the raw path reports `Created`
+        // on an unparseable response, so this round-trip is what actually
+        // confirms the bucket — do not remove it.
+        timed(js.get_key_value(&config.name)).await?.map_err(|e| {
+            error!(bucket = config.name, error = ?e, "failed to get bucket after raw create");
+            KvError::ConnectionFailed(format!("get bucket after raw create: {:?}", e))
+        })
     }
 }
 
@@ -1189,12 +1200,17 @@ struct NatsKvWatcher {
 /// surfaced, matching `kv::Watch`'s behavior.
 fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<KvUpdate> {
     let key = msg.subject.strip_prefix(kv_prefix)?.to_string();
-    let revision = msg
+    // An unparseable (or absent) ACK subject yields the UNKNOWN version, not a
+    // fabricated revision 0: `from_u64(0)` is a *parseable* position that
+    // `watch_applied` would adopt as its batch high-water — regressing the
+    // persisted cursor to 0 and forcing a full replay on the next restart.
+    // `unknown()` is the honest value; the cursor-authority loop skips it.
+    let version = msg
         .reply
         .as_deref()
         .and_then(stream_sequence_from_ack)
-        .unwrap_or(0);
-    let version = VersionToken::from_u64(revision);
+        .map(VersionToken::from_u64)
+        .unwrap_or_else(VersionToken::unknown);
     let operation = msg
         .headers
         .as_ref()
@@ -1782,12 +1798,18 @@ mod tests {
     }
 
     #[test]
-    fn kv_message_without_reply_gets_revision_zero() {
-        // No ACK reply subject → revision unparseable → 0, the same "unknown
-        // version" convention scan() uses.
+    fn kv_message_without_reply_gets_unknown_version() {
+        // No ACK reply subject → revision unparseable → the UNKNOWN token,
+        // never a fabricated revision 0. A parseable `Some(0)` would be
+        // adopted by watch_applied as a real batch high-water and regress
+        // the persisted cursor to 0 (full replay on next restart); unknown
+        // is skipped by the cursor-authority loop instead.
         let msg = raw_kv_msg("$KV.certs.node.a", None, b"v", None);
         match kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace") {
-            KvUpdate::Put(e) => assert_eq!(e.version.as_u64(), Some(0)),
+            KvUpdate::Put(e) => {
+                assert!(e.version.is_unknown());
+                assert_eq!(e.version.as_u64(), None);
+            }
             other => panic!("expected Put, got {other:?}"),
         }
     }

@@ -205,6 +205,8 @@ This is the lesson of Saltzer, Reed & Clark, *End-to-End Arguments in System Des
 
 **Cursor authority covers rejected entries.** `batch_high` tracks the highest revision *received* since the last flush, including updates that `parse` rejected (corrupt bytes, irrelevant keys). A rejected entry is still "nothing to apply," so it is covered by the cursor — and because NATS delivers in revision order, advancing to the max revision after one atomic `apply` is sound: having seen the max means every revision below it has been seen too. Without this, a run of irrelevant keys would pin the cursor in place and force redundant replay on every restart.
 
+The one exception: an update carrying the **unknown** version (an unparseable ACK subject on the hand-built multi-prefix consumer path) never touches `batch_high` — it can neither mint a cursor position nor clobber the real high from earlier in the batch. The update is still applied; skipping it under-advances at worst, and re-delivery on resume is idempotent. (The pre-guard code fabricated revision 0 for these, which the loop adopted as a real position — regressing the persisted cursor to 0 and forcing a full replay on the next restart.)
+
 **Snapshot consistency.** Raw `KvUpdate`s stream to the snapshot log as they arrive, but the *checkpoint* cursor is the post-apply cursor. A crash after a raw record is written but before its `apply`/checkpoint leaves the log holding data *ahead* of its cursor — which is safe: the cursor never names a revision whose `apply` had not returned, so resume re-delivers and re-applies that tail rather than skipping it. Compaction runs off the hot path via `spawn_blocking`, as everywhere else in the snapshot subsystem.
 
 **Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning).
@@ -347,7 +349,8 @@ Machine-checked as: _"bootstrap never silently diverges."_ Empirically pinned by
 
 | From | Trigger | Guard | What Actually Happens |
 |---|---|---|---|
-| Watching | `rx.recv()` delivers a `KvUpdate` | — | `batch_high` updated; raw update pushed to `raw_batch`; `parse()` called; window timer armed on first update |
+| Watching | `rx.recv()` delivers a `KvUpdate` | version not unknown | `batch_high` updated; raw update pushed to `raw_batch`; `parse()` called; window timer armed on first update |
+| Watching | `rx.recv()` delivers an unknown-version `KvUpdate` | — | Same, except `batch_high` untouched — an unparseable revision neither mints nor clobbers a cursor position |
 | Batching | Window elapses | — | `apply(batch)`; cursor = `batch_high`; `store.apply(raw_batch, cursor)` on blocking task; `on_applied` fired |
 | Batching | `batch.len() == config.max` | — | Same as window flush |
 | Flush | `store.apply()` succeeds | streak < 16 | Streak reset; `on_applied` fired; continue watching |
@@ -523,7 +526,7 @@ async-nats's bare `watch`/`watch_all`/`watch_many` ride `DeliverPolicy::New` —
 
 ### Why does the cursor-expired resync list keys instead of re-scanning values?
 
-The fallback watch's re-list already carries every live key's value, so the resync only needs to learn which keys *no longer exist* — `reader.keys()` (headers only, no value bytes) is sufficient and cheap. The synthetic deletes carry an unknown version and never advance the cursor: the fold's persisted cursor stays at its (expired) position until real re-list revisions move it, so a crash mid-resync just re-runs the same idempotent diff on the next start. Ordering, not versioning, provides correctness: the resync acks before the fallback watch is established, so a synthetic delete can never land after the re-list put that resurrects the same key.
+The fallback watch's re-list already carries every live key's value, so the resync only needs to learn which keys *no longer exist* — `reader.keys()` (headers only, no value bytes) is sufficient and cheap. The fold side of the diff is equally key-only: it streams via `for_each_in_range` rather than `range()`, so an All-scope resync against an on-disk backend never materializes the whole fold (values included) on the repair path. The synthetic deletes carry an unknown version and never advance the cursor: the fold's persisted cursor stays at its (expired) position until real re-list revisions move it, so a crash mid-resync just re-runs the same idempotent diff on the next start. Ordering, not versioning, provides correctness: the resync acks before the fallback watch is established, so a synthetic delete can never land after the re-list put that resurrects the same key.
 
 ### Why KvError: Clone instead of Box<dyn Error>?
 
@@ -545,7 +548,7 @@ Synadia Cloud returns `$JS.API.STREAM.CREATE` response shapes that `async-nats`'
 - `400` + "maximum number of streams" → Synadia at-limit but bucket may exist (non-fatal)
 - Anything else → hard failure
 
-The standard async-nats path is tried first; raw is a fallback.
+The standard async-nats path is tried first; raw is a fallback — taken on a parse-shaped error **or a timeout**. A timeout must not skip the fallback: Synadia Cloud, the deployment the raw path exists for, is also the most likely to be slow or distant, and the raw path's own per-op timeouts bound a genuinely dead connection anyway.
 
 ### Why subscribe-before-create in scan/keys?
 
@@ -637,7 +640,8 @@ Production code and an exhaustive model checker running the same logic closes th
 | ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------- |
 | Transient `store.apply()` failure    | Raw batch re-queued at front; next flush commits cumulatively; streak counter incremented | Automatic up to 16 consecutive failures |
 | 16 consecutive `store.apply()` failures | Watch fail-stops: `KvError::WatchError` returned | Restart re-folds from last good cursor; investigate store (disk, permissions) |
-| Live watch retention overrun         | Floor guard detects in-band (gapped delivery) or via 30 s backstop; watch fails with `KvError::WatchError` | Caller restarts; resume hits `CursorExpired`; resync repairs stale keys |
+| Live watch retention overrun (All scope) | Floor guard detects in-band (gapped delivery) or via 30 s backstop; watch fails with `KvError::WatchError` | Caller restarts; resume hits `CursorExpired`; resync repairs stale keys |
+| Live watch retention overrun (Prefix scope) | **Undetected until the next restart** — prefix watches deliver sparse revisions, so eviction gaps are indistinguishable from non-matching subjects client-side; the floor guard is sound for All scope only (a periodic probe here would false-positive into spurious resyncs, a design the model checker rejected) | Next restart's resume-window check hits `CursorExpired` → resync repairs; operate prefix-scoped watches with retention window comfortably above the restart/redeploy interval |
 | Resync `reader.keys()` failure       | Watch fail-stops (fail-stop, not degrade — degrade semantics proven to leave stale keys permanently) | Restart re-runs full resume → expiry → resync |
 | `CursorExpired`                      | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
 | `WatchError`                         | Watch stream dropped (NATS restart, reconnect)                              | Re-subscribe                                      |
@@ -725,6 +729,7 @@ Credentials priority: `creds` > `creds_file` > URL-embedded > no auth.
 | -------- | ------- | -------------------------------------------------------------------------- |
 | `window` | 10 ms   | Max time a batch stays open before flush                                   |
 | `max`    | 100     | Max updates per batch before early flush                                   |
+| `channel_capacity` | 256 | Depth of the watch-task → loop channel. A full channel backpressures the watch task (by design); during state-sync hydration of a large bucket it can become the effective batch boundary, so tune it together with `max` |
 
 | Constant | Value | Effect |
 |---|---|---|
