@@ -1926,9 +1926,18 @@ mod floor_guard_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let err = stream_watch_floor_guarded(watch, &tx, 1, &js, "guard")
-            .await
-            .expect_err("a gapped delivery over an advanced floor must trip");
+        // The 5s bound pins IN-BAND detection: the trip must come from the
+        // gapped-delivery check itself, not the 30s no-traffic backstop. A
+        // regression to periodic-only detection (the design the model
+        // checker rejected — catch-up between probes erases the evidence)
+        // fails this bound.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_watch_floor_guarded(watch, &tx, 1, &js, "guard"),
+        )
+        .await
+        .expect("the trip must be IN-BAND (immediate), not backstop-paced")
+        .expect_err("a gapped delivery over an advanced floor must trip");
         assert!(
             err.to_string().contains("retention overran live watch"),
             "{err}"
