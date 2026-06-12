@@ -312,8 +312,8 @@ struct NatsHandle {
     // Held to keep the NATS connection alive for the lifetime of the handle.
     // The `jetstream` context clones an internal reference, but this field is
     // the authoritative owner — dropping the handle drops the connection.
-    // `dead_code` because we never read it directly after construction.
-    #[allow(dead_code)]
+    // Also read by `store_with_config`, which clones it out from under the
+    // handle lock.
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
 }

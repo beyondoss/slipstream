@@ -615,7 +615,10 @@ impl ArtifactTransport for ObjectStoreTransport {
         let cutoff_millis = std::time::SystemTime::now()
             .checked_sub(grace)
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_millis() as i64);
+            // Saturate rather than `as i64`, which would silently wrap a
+            // >292-million-year value — unreachable for wall-clock millis, but
+            // the same discipline as the nats.rs max_age conversion.
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
         let mut deleted = 0usize;
         let mut listing = self.store.list(Some(&self.payloads_dir(key)));
