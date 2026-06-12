@@ -12,6 +12,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v2
       - uses: Swatinem/rust-cache@v2
+      # Self-heal a cache-restored minimal-profile toolchain: a cached rustup
+      # without these components otherwise fails the clippy step with
+      # "'cargo-clippy' is not installed" (recurrent flake — the components
+      # requested in mise.toml don't survive every cache round-trip).
+      # Idempotent and ~2s when the components are already present.
+      - run: rustup component add clippy rustfmt
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # The full feature matrix, or the fjall/rocksdb conformance suites and
       # the transport tier silently skip (default features exclude them all).
