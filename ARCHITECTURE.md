@@ -209,9 +209,22 @@ This is the lesson of Saltzer, Reed & Clark, *End-to-End Arguments in System Des
 
 **Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning).
 
+**Transient store failures re-queue, not drop.** If `store.apply()` returns an error, the raw batch is prepended to the next flush's accumulation and the watch continues. The streak counter increments; at 16 consecutive failures the watch fail-stops with `KvError::WatchError`. Dropping the failed batch and continuing was the shipped behavior until `transient_store_failure_never_leaves_a_cursor_gap` reproduced the bug: a transient failure followed by a successful flush advanced the cursor over a hole that survived every restart, because the restart re-folds from the advanced cursor, skipping the missing range. Cursor authority requires the store's cursor and contents to advance together, always (`applied.rs:303–394`, `tests/model_applied.rs`).
+
 **Cursor-expired resync.** On `CursorExpired` from the resume path the combinator falls back to the full-scope watch (`watch_all` / `watch_prefix` / `watch_prefixes`), whose state-sync re-list re-delivers every live key as puts. The re-list cannot cover keys deleted during the gap whose markers were evicted with the cursor, so — when the combinator is given a `KvReader` and a store — it closes that hole first: the watch task lists the bucket's live keys, hands them to the main loop, and waits for an ack; the main loop flushes, diffs the fold's in-scope keys against the listing, and runs a synthetic `KvUpdate::Delete` (unknown version — never advances the cursor) through `parse`/`apply`/store for each key that vanished; only then does the fallback watch start. That ack ordering is the invariant: a synthetic delete always precedes the re-list put for the same key, so delete-then-recreate during the gap converges. Without a reader the fallback is re-list-only and logs the possible stale keys.
 
 This is the layer the tunnel router (swap route table) and edge origin watcher (rebuild hashrings) both collapse onto: `parse` extracts the domain registration, `apply` swaps the live state, `on_applied` persists the cursor.
+
+### Live retention floor guard (`stream_watch_floor_guarded`, `nats.rs:1042`)
+
+NATS does **not** error when a live consumer's position is overrun by retention — it silently skips evicted messages (the same silent-clamp behaviour that `resume_window_ok` closes at resume time). For an All-scope watch, a skipped delete marker permanently diverges the fold, with zero log lines. The floor guard closes this mid-stream:
+
+- **In-band (primary):** when a delivered revision jumps the frontier by more than 1, fetch `first_sequence` and call `resume_window_ok(frontier, first_seq)`. A benign interior gap — per-subject overwrites below the floor threshold — passes. Head eviction past the frontier fails the watch into the restart → `CursorExpired` → resync repair path. The check runs *before* the entry is processed: the fold never advances past unexamined evidence of loss.
+- **Backstop (30 s):** when no deliveries arrive, the periodic probe catches the no-traffic case where there is no in-band evidence to act on.
+
+A periodic-only design was rejected by the model checker: deliveries catching the frontier up past a gap between probes erase the evidence, leaving permanent silent divergence with the guard running. The in-band check is what makes the design correct (`tests/model_live_watch.rs`).
+
+Scope: this guard is sound only for the All-scope unfiltered resume watch, where every stream message is deliverable and a delivery gap implies a missed message. Prefix-scoped watches deliver sparse revisions — gaps from non-matching subjects are indistinguishable from eviction gaps client-side — and retain the retention-outlives-lag operating axiom.
 
 ### scan() and keys() via Ephemeral Push Consumer
 
@@ -329,6 +342,24 @@ Machine-checked as: _"bootstrap never silently diverges."_ Empirically pinned by
 | Uploading    | Export + verify-by-reopen succeeded      | Abandon lease; delete local dir        |
 | Completing   | `Published`                              | Prune/complete failures are non-fatal  |
 | Abandoning   | `SupersededByNewer` or upload failed     | CAS delete failure is non-fatal        |
+
+### watch_applied loop state transitions
+
+| From | Trigger | Guard | What Actually Happens |
+|---|---|---|---|
+| Watching | `rx.recv()` delivers a `KvUpdate` | — | `batch_high` updated; raw update pushed to `raw_batch`; `parse()` called; window timer armed on first update |
+| Batching | Window elapses | — | `apply(batch)`; cursor = `batch_high`; `store.apply(raw_batch, cursor)` on blocking task; `on_applied` fired |
+| Batching | `batch.len() == config.max` | — | Same as window flush |
+| Flush | `store.apply()` succeeds | streak < 16 | Streak reset; `on_applied` fired; continue watching |
+| Flush | `store.apply()` transient error | streak < 16 | Raw batch prepended to next `raw_batch`; streak++; warn; continue |
+| Flush | `store.apply()` error | streak ≥ 16 | `KvError::WatchError` returned; watch fail-stops |
+| Watching | Watch task returns `CursorExpired` | first_seq > cursor+1 | Resync (if reader wired): list keys → synthetic deletes → ack; then `watch_all()` fallback |
+| Resync | `reader.keys()` fails | — | Fatal: `KvError::WatchError`; restart re-runs the full resume → expiry → resync path |
+| Resync | Fold range fails | — | Fatal: same |
+| Watching | `GuardTrip` (in-band gap or 30s backstop) | `!resume_window_ok(frontier, first_seq)` | Watch task fails; `KvError::WatchError` surfaces; caller's restart hits `CursorExpired` and runs resync |
+| Watching | `ExportRequest` | — | Flush pending batch; `store.export_to()` on blocking task; reply on oneshot; continue |
+| Any | Shutdown signal | — | Flush pending batch; abort watch task; return applied cursor |
+| Any | Channel closes cleanly | — | Flush remaining batch; return applied cursor |
 
 ## Snapshot Subsystem
 
@@ -604,6 +635,10 @@ Production code and an exhaustive model checker running the same logic closes th
 
 | Failure                              | What Actually Happens                                                       | Recovery                                          |
 | ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------- |
+| Transient `store.apply()` failure    | Raw batch re-queued at front; next flush commits cumulatively; streak counter incremented | Automatic up to 16 consecutive failures |
+| 16 consecutive `store.apply()` failures | Watch fail-stops: `KvError::WatchError` returned | Restart re-folds from last good cursor; investigate store (disk, permissions) |
+| Live watch retention overrun         | Floor guard detects in-band (gapped delivery) or via 30 s backstop; watch fails with `KvError::WatchError` | Caller restarts; resume hits `CursorExpired`; resync repairs stale keys |
+| Resync `reader.keys()` failure       | Watch fail-stops (fail-stop, not degrade — degrade semantics proven to leave stale keys permanently) | Restart re-runs full resume → expiry → resync |
 | `CursorExpired`                      | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
 | `WatchError`                         | Watch stream dropped (NATS restart, reconnect)                              | Re-subscribe                                      |
 | `Timeout` on any NATS op             | CLOSE_WAIT half-dead TCP parks the `await` without this guard              | Call `shutdown()` + `connect()`                   |
@@ -642,12 +677,18 @@ Production code and an exhaustive model checker running the same logic closes th
 | `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expired stale-key resync, `ExportRequest` handling |
 | `src/lib.rs`               | Re-exports all public types; no logic                                                |
 | `benches/`                 | Criterion benchmarks: snapshot write/checkpoint/load throughput, batch throughput, ACK subject parsing |
-| `tests/transport.rs`       | Integration: upload/download/manifest round-trip, pointer swap, prune               |
-| `tests/transport_s3.rs`    | Live MinIO / S3: CAS semantics (create, update, precondition) verified against real object stores |
-| `tests/multi_export.rs`    | Concurrent exporters, lease contention, fjall + RocksDB backends, multi-file artifacts under churn |
-| `tests/resync.rs`          | Cursor expiry, stale-key resync, NATS silent-clamp pinning across 3 backends × reader modes |
-| `tests/model.rs`           | Stateright exhaustive model: proves pointer monotonicity, no dangling pointer, no silent divergence; mutation tests prove each protocol guard is load-bearing |
-| `tests/common/mod.rs`      | Shared test helpers: ephemeral NATS server, temp dirs, assertion helpers             |
+| `tests/integration.rs`     | NATS JetStream backend integration suite: each test boots its own `nats-server` on a free port; covers bucket create, CAS, watch semantics, cursor resume, and delete reconciliation |
+| `tests/snapshot_store.rs`  | Backend-agnostic `SnapshotStore` conformance suite: every check is generic over the backend, instantiated for `AppendLogSnapshot`, `FjallSnapshot`, and `RocksDbSnapshot`; new backends get the whole suite for free |
+| `tests/transport.rs`       | Integration: upload/download/manifest round-trip, pointer swap, prune, non-CAS fail-closed |
+| `tests/transport_s3.rs`    | Live MinIO: CAS semantics (create, If-Match update, refusal, crash-window availability, prune) verified against a real object store |
+| `tests/bootstrap.rs`       | Tier-2 bootstrap proofs on live NATS + on-disk backends: exports from a live `watch_applied` loop under churn, imports as a second node, and asserts **delta-only resume** via delivery count (not just convergence — a full replay would produce the same end state) |
+| `tests/multi_export.rs`    | Prevention proofs on live NATS + real fjall/RocksDB: slow-exporter clobber refused, crash window keeps bootstrap available, multi-SST post-compaction fidelity |
+| `tests/resync.rs`          | Live-NATS conformance: NATS silent-clamp pinned; full expiry → resync chain e2e; no-reader divergence pinned |
+| `tests/model.rs`           | Stateright exhaustive model (~250M states, fleet size 2–3, unbounded rounds): pointer swap theorems (no regression, no torn pair, no dangling pointer, no silent divergence, terminal liveness); mutation tests prove each protocol guard load-bearing |
+| `tests/model_applied.rs`   | Stateright cursor-authority model: delivery → flush → transient failure → crash/restart; `DropFailedBatch` and `ResumeFromMemApplied` mutations pin both pre-fix bug classes |
+| `tests/model_resync_order.rs` | Stateright resync ack-barrier model: proves synthetic deletes strictly precede re-list puts; `NoAckBarrier` mutation reaches lost-recreate divergence |
+| `tests/model_live_watch.rs` | Stateright floor-guard model: guarded variant proves fold always converges; unguarded variant pins permanent silent divergence as the machine-checked record of the pre-guard code |
+| `tests/common/mod.rs`      | Shared test helpers: ephemeral NATS server, MinIO harness, `ManifestPutCrash` transport injection |
 
 ## Configuration
 
@@ -684,6 +725,11 @@ Credentials priority: `creds` > `creds_file` > URL-embedded > no auth.
 | -------- | ------- | -------------------------------------------------------------------------- |
 | `window` | 10 ms   | Max time a batch stays open before flush                                   |
 | `max`    | 100     | Max updates per batch before early flush                                   |
+
+| Constant | Value | Effect |
+|---|---|---|
+| `MAX_STORE_APPLY_FAILURES` | 16 | Consecutive transient store-apply failures before the watch fail-stops. Prevents the re-queued batch backlog from growing unboundedly under a persistently failing store. |
+| `FLOOR_GUARD_INTERVAL` | 30 s | Period of the no-traffic backstop probe in the live floor guard. Primary detection is in-band (gapped delivery); this only fires when no deliveries arrive. |
 
 ### ObjectStoreTransport / ExportLease
 

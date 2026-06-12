@@ -224,7 +224,9 @@ pub async fn watch_applied<U, S, P, A, O>(
     mut store: Option<S>,
     // `Some(rx)` arms an export-request arm in the select loop: each
     // [`ExportRequest`] is handled between flushes (pending batch flushed
-    // first), so the exported artifact's cursor is exactly the applied cursor.
+    // first), so the exported artifact's cursor is the applied cursor (or,
+    // across a transiently failed store flush, the store's own lagging but
+    // self-consistent cursor — never a cursor past unfolded data).
     // `None` (or dropping the paired sender) leaves the loop's behavior
     // unchanged.
     mut exports: Option<mpsc::Receiver<ExportRequest>>,
@@ -298,6 +300,12 @@ where
     // state), whereas the parsed `batch` above is the consumer's domain view.
     let mut raw_batch: Vec<KvUpdate> = Vec::new();
     let mut batch_high = WatchCursor::none();
+    // Consecutive store-apply failures. A transient failure re-queues its raw
+    // batch (cursor authority: the store's cursor and contents advance
+    // together, always); a persistent streak fail-stops before the re-queued
+    // backlog grows without bound.
+    const MAX_STORE_APPLY_FAILURES: u32 = 16;
+    let mut store_fail_streak: u32 = 0;
     // `Some` once a batch has opened and the window timer is armed; `None`
     // between flushes. Only the armed/idle distinction is read in the loop —
     // the absolute instant lives in the pinned `sleep` future below.
@@ -307,8 +315,10 @@ where
     // completion, advance the cursor, fold the raw batch + cursor durably into
     // `store`, then fire `on_applied`. The store fold runs on a blocking task
     // (its `apply` may block on I/O), moving the store in and taking it back — the
-    // same offload the append log's compaction always used. A store error is
-    // logged and the watch continues (the snapshot is a cache); a panicked
+    // same offload the append log's compaction always used. A TRANSIENT store
+    // error re-queues the raw batch for cumulative commit on the next flush
+    // (the watch continues; the store's cursor never advances past data it
+    // dropped) and a persistent failure streak is fatal; a panicked
     // blocking task drops the store irrecoverably, which breaks the
     // resume-after-restart guarantee, so it is surfaced as fatal.
     macro_rules! flush {
@@ -341,19 +351,48 @@ where
                     // unchanged — possibly expired — cursor only ever re-runs
                     // this same resync on the next restart.
                     let cur = applied.clone();
-                    // Hand the store back unconditionally on a clean return so
-                    // a *failed* apply (Ok(Err)) keeps the watch running; only
-                    // a *panicked* task (Err) loses the store and is fatal.
+                    // Hand the store AND the raw batch back on a clean return:
+                    // a *failed* apply (Ok(Err)) RE-QUEUES the batch so the
+                    // next flush commits it cumulatively — the store's cursor
+                    // and contents always advance together. Dropping the
+                    // failed batch instead lets the NEXT successful flush
+                    // advance the cursor over a hole that survives every
+                    // restart (reproduced by
+                    // `transient_store_failure_never_leaves_a_cursor_gap`).
+                    // Only a *panicked* task (Err) loses the store: fatal.
                     match tokio::task::spawn_blocking(move || {
                         let res = st.apply(&raw, &cur);
-                        (st, res)
+                        (st, raw, res)
                     })
                     .await
                     {
-                        Ok((st, Ok(()))) => store = Some(st),
-                        Ok((st, Err(e))) => {
-                            warn!(error = %e, "snapshot store apply failed; continuing");
+                        Ok((st, _raw, Ok(()))) => {
                             store = Some(st);
+                            store_fail_streak = 0;
+                        }
+                        Ok((st, raw, Err(e))) => {
+                            store_fail_streak += 1;
+                            if store_fail_streak >= MAX_STORE_APPLY_FAILURES {
+                                // A persistently failing store would otherwise
+                                // grow the re-queued batch without bound while
+                                // the fold silently stales. Fail-stop: the
+                                // restart refolds the tail from the store's
+                                // last good cursor.
+                                warn!(error = %e, streak = store_fail_streak,
+                                    "snapshot store apply failing persistently; aborting watch");
+                                handle.abort();
+                                return Err(KvError::WatchError(format!(
+                                    "snapshot store apply failed {store_fail_streak} consecutive times: {e}"
+                                )));
+                            }
+                            warn!(error = %e, streak = store_fail_streak,
+                                "snapshot store apply failed; batch re-queued for the next flush");
+                            store = Some(st);
+                            // Prepend: the failed range precedes anything
+                            // received since (stream order is preserved for
+                            // the eventual cumulative commit).
+                            let newer = std::mem::replace(&mut raw_batch, raw);
+                            raw_batch.extend(newer);
                         }
                         Err(e) => {
                             warn!(error = %e, "snapshot store task panicked; aborting watch");
@@ -481,7 +520,14 @@ where
                         flush!();
                         // Ack AFTER the deletes are applied: the watch task is
                         // holding the fallback watch until it hears back, which
-                        // is what orders deletes before the re-list.
+                        // is what orders deletes before the re-list
+                        // (tests/model_resync_order.rs proves the barrier
+                        // load-bearing). If the flush's STORE apply failed
+                        // transiently, the deletes sit re-queued at the FRONT
+                        // of the raw batch — still strictly before any
+                        // re-list put in the eventual cumulative commit, and
+                        // the domain apply saw them before this ack either
+                        // way.
                         let _ = ack.send(());
                     }
                     None => resyncs = None,
@@ -491,9 +537,14 @@ where
             // Export request. Placed after shutdown/window (they stay prompt)
             // and before `rx.recv()` so a firehose of updates cannot starve an
             // export indefinitely. The pending batch is flushed first, so the
-            // exported cursor is exactly the applied cursor; the export itself
-            // runs on a blocking task with the store moved in and taken back —
-            // the same offload the flush path uses.
+            // exported cursor is exactly the applied cursor — except when
+            // that flush's store apply transiently failed (batch re-queued):
+            // the export then captures the store's OWN lagging cursor, which
+            // is still self-consistent with its contents (cursor authority,
+            // tests/model_applied.rs); the artifact never includes unfolded
+            // data, and a bootstrap from it simply replays the short gap.
+            // The export itself runs on a blocking task with the store moved
+            // in and taken back — the same offload the flush path uses.
             req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
                 if exports.is_some() => {
                 match req {
@@ -2072,5 +2123,173 @@ mod tests {
             "last write per key survives compaction"
         );
         assert_eq!(snap.entries["node.b"].value, b"3");
+    }
+    /// A SnapshotStore whose FIRST apply fails (transient store error: disk
+    /// pressure, lock timeout), then behaves normally — the trigger for the
+    /// lost-raw-batch hazard in the flush path.
+    struct FailOnceStore {
+        inner: AppendLogSnapshot,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::snapshot::SnapshotStore for FailOnceStore {
+        fn load(
+            _path: &std::path::Path,
+        ) -> Result<(WatchCursor, Self), crate::snapshot::SnapshotError> {
+            unreachable!("test store is constructed directly")
+        }
+        fn apply(
+            &mut self,
+            batch: &[KvUpdate],
+            cursor: &WatchCursor,
+        ) -> Result<(), crate::snapshot::SnapshotError> {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                return Err(crate::snapshot::SnapshotError::Backend(
+                    "injected transient store failure".into(),
+                ));
+            }
+            self.inner.apply(batch, cursor)
+        }
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.get(key)
+        }
+        fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.range(prefix)
+        }
+        fn cursor(&self) -> WatchCursor {
+            self.inner.cursor()
+        }
+        fn export_to(
+            &mut self,
+            dest_dir: &std::path::Path,
+        ) -> Result<crate::artifact::ExportManifest, crate::snapshot::SnapshotError> {
+            self.inner.export_to(dest_dir)
+        }
+    }
+
+    /// CURSOR AUTHORITY under a transient store failure: a failed store apply
+    /// must NOT cause later successful applies to advance the persisted
+    /// cursor past data that never landed. The failed batch is re-queued and
+    /// committed cumulatively with the next flush, so the store's cursor
+    /// never lies about its contents — a restart resuming from it sees
+    /// exactly the missing tail, not a silent hole.
+    ///
+    /// (Pre-fix behavior, found while writing the watch_applied model: the
+    /// failed batch's raw updates were dropped on the warn-and-continue
+    /// path, and the NEXT successful flush committed only newer updates
+    /// under the newest cursor — a permanent, restart-surviving gap in the
+    /// fold.)
+    #[tokio::test(start_paused = true)]
+    async fn transient_store_failure_never_leaves_a_cursor_gap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fold.snap");
+        let (_r, inner) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        let store = FailOnceStore {
+            inner,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        // max: 1 -> one flush per update: flush #1 (a@1) hits the injected
+        // failure, flush #2 (b@2) succeeds.
+        let updates = vec![put("node.a", b"1", 1), put("node.b", b"2", 2)];
+        let watcher = Arc::new(MockWatcher::new(updates, true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None,
+            Some(store),
+            None,
+            BatchConfig {
+                window: Duration::from_millis(1),
+                max: 1,
+            },
+            parse_put,
+            |_batch: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+        assert_eq!(cursor.as_u64(), Some(2));
+
+        // The store on disk must be SELF-CONSISTENT: whatever its cursor
+        // claims, the data at or below it is present. With the re-queue fix
+        // the cumulative commit lands both keys at cursor 2.
+        let (persisted, reopened) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        assert_eq!(persisted.as_u64(), Some(2), "cursor reached the head");
+        assert_eq!(
+            reopened.get("node.a").unwrap().map(|e| e.value),
+            Some(b"1".to_vec()),
+            "the transiently-failed batch was re-queued, not silently dropped \
+             behind an advancing cursor"
+        );
+        assert_eq!(
+            reopened.get("node.b").unwrap().map(|e| e.value),
+            Some(b"2".to_vec())
+        );
+    }
+    /// A reader whose live-key listing always fails — the resync's I/O
+    /// failure mode.
+    struct FailingReader;
+
+    #[async_trait]
+    impl KvReader for FailingReader {
+        async fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
+        async fn keys(&self, _prefix: &str) -> Result<Vec<String>, KvError> {
+            Err(KvError::OperationFailed("injected listing failure".into()))
+        }
+        async fn scan(&self, _prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            unreachable!("resync only lists keys")
+        }
+    }
+
+    /// REGRESSION PIN (code-level twin of tests/model.rs's Degrade
+    /// configuration): a resync whose live-key listing fails must FAIL THE
+    /// WATCH, not degrade to re-list-only with a warning — the degrade
+    /// semantics provably break the convergence theorem (silent stale keys).
+    /// Reverting `resync_stale_keys` to warn-and-continue fails this test.
+    #[tokio::test]
+    async fn resync_listing_failure_is_fatal_not_degraded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("resync-fatal.snap");
+        let (_r, mut store) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        store
+            .apply(&[put("node.a", b"1", 1)], &WatchCursor::from_u64(1))
+            .unwrap();
+
+        // Resume cursor expired -> resync path -> reader listing fails.
+        let mock = MockWatcher {
+            full: Mutex::new(Some(vec![])),
+            from: Mutex::new(Some(vec![])),
+            from_expires: true,
+            hold: false,
+        };
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let err = watch_applied(
+            Arc::new(mock),
+            WatchScope::All,
+            Some(WatchCursor::from_u64(1)),
+            Some(Arc::new(FailingReader) as Arc<dyn KvReader>),
+            Some(store),
+            None,
+            BatchConfig::default(),
+            parse_put,
+            |_batch: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await
+        .expect_err("a failed resync listing must fail the watch");
+        assert!(
+            err.to_string().contains("resync failed listing live keys"),
+            "{err}"
+        );
     }
 }

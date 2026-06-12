@@ -667,7 +667,9 @@ fn map_obj(e: object_store::Error) -> SnapshotError {
 /// 1. [`ExportLease::try_acquire`] — `Ok(None)` means another node owns this
 ///    round; nothing else happens.
 /// 2. An [`ExportRequest`] into the live [`watch_applied`](crate::watch_applied)
-///    loop (pending batch flushed first; artifact cursor == applied cursor).
+///    loop (pending batch flushed first; the artifact carries the store's
+///    self-consistent cursor — the applied cursor, or a lagging one across
+///    a transiently failed store flush, never a cursor past unfolded data).
 /// 3. [`ArtifactTransport::upload`].
 /// 4. [`LeaseGuard::complete`](crate::LeaseGuard::complete) — only after the
 ///    upload succeeded, so a published completion never lies.
