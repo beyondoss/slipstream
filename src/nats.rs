@@ -998,6 +998,126 @@ async fn stream_watch(
     Ok(())
 }
 
+/// Cadence of the floor guard's no-traffic backstop probe (one stream-info
+/// RPC per interval per guarded watch). The PRIMARY detection is in-band —
+/// the gapped-delivery check fires the moment evidence surfaces — so this
+/// interval only bounds detection latency when NOTHING is being delivered;
+/// it is not load-bearing for eventual detection.
+const FLOOR_GUARD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// [`stream_watch`] for the dense ALL-scope resume path, with the LIVE
+/// retention floor guard (`tests/model_live_watch.rs` — the live twin of
+/// [`NatsKvWatcher::check_resume_window`]).
+///
+/// The hazard: retention overrunning a live consumer makes JetStream
+/// silently skip evicted messages — delete markers included — with no error
+/// anywhere (the same clamp behavior as resumes, mid-stream). Unguarded,
+/// that is PERMANENT silent fold divergence; the model proves it reachable.
+///
+/// Detection is primarily **in-band**: an unfiltered `ByStartSequence`
+/// consumer sees every retained message, so a delivered revision that jumps
+/// the frontier by more than one is evidence of eviction inside the gap.
+/// The model checker REJECTED a periodic-only design with exactly the trace
+/// this closes — deliveries can catch the frontier up past the gap between
+/// probes, erasing the evidence — so the check runs AT the gapped delivery,
+/// before the entry is processed: fetch `first_sequence` and apply the
+/// shared kernel (`protocol::resume_window_ok`) to the frontier. A benign
+/// gap (interior per-subject eviction with the floor still at or below the
+/// frontier) passes; head eviction past the frontier fails the watch, and
+/// the caller's restart routes into the verified resume → `CursorExpired` →
+/// resync repair path. The periodic probe backstops the no-traffic case.
+///
+/// Scope: sound only where density holds — the unfiltered resume watch.
+/// Prefix-scoped watches deliver sparse revisions by design and cannot
+/// distinguish benign from hazardous eviction client-side; they retain the
+/// (narrowed) retention-outlives-lag operating axiom plus the resume-time
+/// check on every restart (model axiom 5).
+///
+/// The guarantee split, precisely: the SAFETY half — never folding past
+/// unexamined evidence of loss — is unconditional in this loop (the gap
+/// check precedes processing, and a stalled downstream stalls folding too).
+/// The REPAIR half is conditional on the caller restarting the failed watch
+/// (standard supervision; same posture as the resync fail-stop): a trip
+/// with no restart is a loudly dead watch, never a silently wrong one.
+async fn stream_watch_floor_guarded(
+    mut watcher: async_nats::jetstream::kv::Watch,
+    tx: &Sender<KvUpdate>,
+    resume_revision: u64,
+    js: &async_nats::jetstream::Context,
+    bucket: &str,
+) -> Result<(), KvError> {
+    let stream_name = format!("KV_{bucket}");
+    let first_sequence = || async {
+        let stream = timed(js.get_stream(&stream_name))
+            .await?
+            .map_err(|e| KvError::OperationFailed(format!("floor guard stream lookup: {e}")))?;
+        Ok::<u64, KvError>(stream.cached_info().state.first_sequence)
+    };
+    fn trip(frontier: u64, first: u64, bucket: &str) -> KvError {
+        warn!(
+            frontier,
+            first_sequence = first,
+            bucket,
+            "stream retention overran this live watch; failing so the restart can resync \
+             (messages in the gap were evicted unseen)"
+        );
+        KvError::WatchError(format!(
+            "stream retention overran live watch (first_sequence {first} > delivered \
+             frontier {frontier} + 1); restart will resync"
+        ))
+    }
+
+    let mut frontier = resume_revision;
+    let mut backstop = tokio::time::interval(FLOOR_GUARD_INTERVAL);
+    backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    backstop.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            entry = watcher.next() => {
+                let Some(entry) = entry else { break };
+                match entry {
+                    Ok(entry) => {
+                        let revision = entry.revision;
+                        // In-band gap check BEFORE processing: never fold
+                        // past unexamined evidence of eviction.
+                        if revision > frontier.saturating_add(1) {
+                            let first = first_sequence().await?;
+                            if !crate::protocol::resume_window_ok(frontier, first) {
+                                return Err(trip(frontier, first, bucket));
+                            }
+                            // Benign interior gap: every evicted revision
+                            // below a still-low floor was a per-subject
+                            // overwrite, whose later revision the fold will
+                            // see — safe for last-write-wins.
+                        }
+                        frontier = frontier.max(revision);
+                        let update = nats_entry_to_kv_update(entry);
+                        if tx.send(update).await.is_err() {
+                            debug!("watch receiver closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "NATS KV watch error");
+                        return Err(KvError::WatchError(e.to_string()));
+                    }
+                }
+            }
+            _ = backstop.tick() => {
+                // No-traffic backstop: nothing is being delivered, so the
+                // in-band check has no evidence to act on; probe the floor
+                // directly.
+                let first = first_sequence().await?;
+                if !crate::protocol::resume_window_ok(frontier, first) {
+                    return Err(trip(frontier, first, bucket));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check if a NATS watch error indicates the requested start sequence is
 /// too old (compacted), meaning callers should fall back to a full watch.
 ///
@@ -1217,13 +1337,16 @@ impl KvWatcher for NatsKvWatcher {
         };
         // Re-check AFTER the consumer exists: head eviction in the window
         // between the pre-flight check and consumer creation would otherwise
-        // clamp silently. Past this point the consumer delivers from retained
-        // messages; the residual exposure is the generic retention-vs-lag
-        // bound every live consumer carries (model axiom 5).
+        // clamp silently.
         self.check_resume_window(revision).await?;
 
         info!(revision, "resumed watch from cursor");
-        stream_watch(watcher, &tx).await
+        // The LIVE floor guard takes over from here: in-band gapped-delivery
+        // checks plus a no-traffic backstop, so retention overrunning this
+        // watch mid-stream fail-stops into the restart→resync repair path
+        // instead of silently skipping evicted deletes (model:
+        // tests/model_live_watch.rs).
+        stream_watch_floor_guarded(watcher, &tx, revision, &self.js, &self.bucket).await
     }
 
     async fn watch_prefix_from(
@@ -1692,5 +1815,163 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+}
+
+/// Live-server conformance tests for the floor guard
+/// ([`stream_watch_floor_guarded`]) — these drive the guarded loop DIRECTLY
+/// with a deliberately clamped `Watch`, which reproduces exactly the state
+/// retention leaves behind when it overruns a live consumer (the watcher
+/// methods' resume-time checks can't be raced deterministically from
+/// outside, but the guarded loop neither knows nor cares how its watch got
+/// clamped). Spawns a throwaway `nats-server` (mise-installed, same pattern
+/// as tests/common).
+#[cfg(test)]
+mod floor_guard_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    struct TestServer {
+        child: Child,
+        url: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn start_server() -> TestServer {
+        let bin = std::env::var("NATS_SERVER_BIN").unwrap_or_else(|_| "nats-server".into());
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let child = Command::new(&bin)
+            .args([
+                "--jetstream",
+                "--addr",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--store_dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {bin}: {e}; run `mise install`"));
+        let server = TestServer {
+            child,
+            url: format!("nats://127.0.0.1:{port}"),
+            _dir: dir,
+        };
+        for _ in 0..100 {
+            if async_nats::connect(&server.url).await.is_ok() {
+                return server;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("nats-server never became ready");
+    }
+
+    /// `(js, kv store)` with five revisions across five subjects (history 1).
+    async fn seeded_bucket(
+        url: &str,
+    ) -> (
+        async_nats::jetstream::Context,
+        async_nats::jetstream::kv::Store,
+    ) {
+        let client = async_nats::connect(url).await.unwrap();
+        let js = async_nats::jetstream::new(client);
+        let kv = js
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "guard".into(),
+                history: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for i in 1..=5u8 {
+            kv.put(format!("k{i}"), vec![i].into()).await.unwrap();
+        }
+        (js, kv)
+    }
+
+    /// TRUE POSITIVE: the watch was clamped past evicted revisions (purge
+    /// advanced first_seq beyond the frontier) — the first gapped delivery
+    /// must trip the guard BEFORE the entry is processed, never silently
+    /// folding past the lost range. This is the live twin of the model's
+    /// `GuardRepair`-only-progress gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gapped_delivery_with_advanced_floor_trips() {
+        let server = start_server().await;
+        let (js, kv) = seeded_bucket(&server.url).await;
+
+        // Evict revisions 1-3 outright: first_sequence becomes 4.
+        let mut stream = js.get_stream("KV_guard").await.unwrap();
+        stream.purge().sequence(4).await.unwrap();
+        assert_eq!(stream.info().await.unwrap().state.first_sequence, 4);
+
+        // A consumer resuming from revision 1 gets CLAMPED to revision 4
+        // (NATS's silent skip, pinned by tests/resync.rs). Hand that watch
+        // to the guarded loop as a live consumer whose retention just
+        // overran it.
+        let watch = kv.watch_all_from_revision(2).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let err = stream_watch_floor_guarded(watch, &tx, 1, &js, "guard")
+            .await
+            .expect_err("a gapped delivery over an advanced floor must trip");
+        assert!(
+            err.to_string().contains("retention overran live watch"),
+            "{err}"
+        );
+        drop(tx);
+        let _ = drain.await;
+    }
+
+    /// NO FALSE POSITIVE: interior (per-subject) eviction also gaps the
+    /// delivered revisions, but the floor stays at or below the frontier —
+    /// benign for a last-write-wins fold, and the guard must let it
+    /// through. (Every existing bootstrap e2e also rides this path on its
+    /// resume; this pins the discrimination explicitly.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn benign_interior_gap_passes() {
+        let server = start_server().await;
+        let (js, kv) = seeded_bucket(&server.url).await;
+
+        // Overwrite k2 and k3: revisions 2 and 3 are interior-evicted
+        // (history 1), revisions 6 and 7 replace them. first_sequence stays
+        // 1 (k1's revision is retained).
+        kv.put("k2", vec![22].into()).await.unwrap();
+        kv.put("k3", vec![33].into()).await.unwrap();
+        let mut stream = js.get_stream("KV_guard").await.unwrap();
+        assert_eq!(stream.info().await.unwrap().state.first_sequence, 1);
+
+        // Resume from revision 1: deliveries jump 2 and 3 — gapped, benign.
+        let watch = kv.watch_all_from_revision(2).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let guard =
+            tokio::spawn(
+                async move { stream_watch_floor_guarded(watch, &tx, 1, &js, "guard").await },
+            );
+
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let update = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("deliveries continue past benign gaps")
+                .expect("watch alive");
+            got.push(update.version().as_u64().unwrap());
+        }
+        assert_eq!(got, vec![4, 5, 6, 7], "interior gaps jumped, tail dense");
+        guard.abort(); // endless live watch; the assertion above is the test
     }
 }

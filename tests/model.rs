@@ -82,13 +82,16 @@
 //!    (empirical tier: tampered-artifact and multi-SST round-trip tests).
 //!    NATS KV CAS semantics for the lease are unneeded here (see above); the
 //!    lease layer is verified by `integration.rs` contention tests.
-//! 5. Retention outlives consumer lag: the stream's retention window exceeds
-//!    the seconds-scale lag between a consumer's expiry check and its
-//!    deliveries. The code closes the check→create window with a re-check
-//!    after consumer creation (`nats.rs`); the residual in-flight exposure
-//!    is the bound every log consumer (Kafka included) operates under, and
-//!    is an OPERATING requirement: configure retention in hours, not
-//!    seconds. The model's atomic delivery transitions encode this axiom.
+//! 5. Retention outlives consumer lag — NARROWED to prefix-scoped watches
+//!    and the fresh full watch's initial history scan. The ALL-scope resume
+//!    watch (steady-state operation) no longer relies on it: the live floor
+//!    guard (`tests/model_live_watch.rs`, `stream_watch_floor_guarded`)
+//!    fail-stops on in-band evidence of retention overrunning the consumer
+//!    and routes into this model's verified resume → expiry → resync repair
+//!    path. Prefix scopes deliver sparse revisions by design and cannot
+//!    distinguish benign from hazardous eviction client-side; for them the
+//!    operating requirement stands: configure retention in hours, not
+//!    seconds.
 //!
 //! ## Bounds and the small-scope argument
 //!
