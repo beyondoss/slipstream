@@ -190,6 +190,12 @@ impl Default for BatchConfig {
 /// without a `store` to diff against) the fallback is re-list-only and a
 /// warning marks the possible stale keys.
 ///
+/// A resync that was armed but FAILS (live-key listing or fold diff error) is
+/// fatal to the watch — degrading to re-list-only would silently leave
+/// deleted keys in the fold (`tests/model.rs` proves that divergence
+/// reachable), so the error surfaces and the caller's restart retries the
+/// resume → expiry → resync path from scratch.
+///
 /// See `ARCHITECTURE.md` ("Applied-Cursor Watch") for the invariant and its
 /// rationale.
 ///
@@ -434,8 +440,20 @@ where
                                             .map(|e| e.key),
                                     ),
                                     Err(e) => {
+                                        // FATAL, not a degrade: an incomplete
+                                        // diff silently leaves deleted keys in
+                                        // the fold forever (tests/model.rs
+                                        // proves the divergence reachable
+                                        // under degrade semantics). Fail the
+                                        // watch; the restart re-runs the
+                                        // resume → expiry → resync from
+                                        // scratch.
                                         warn!(error = %e, prefix = %prefix,
-                                            "resync fold range failed; stale keys under this prefix may persist");
+                                            "resync fold range failed; aborting watch rather than diverging");
+                                        handle.abort();
+                                        return Err(KvError::WatchError(format!(
+                                            "cursor-expired resync failed listing fold prefix {prefix:?}: {e}"
+                                        )));
                                     }
                                 }
                             }
@@ -604,7 +622,7 @@ async fn run_watch(
                         warn!(
                             "watch cursor expired; resyncing, then falling back to full watch_all"
                         );
-                        resync_stale_keys(scope, &resync).await;
+                        resync_stale_keys(scope, &resync).await?;
                         watcher.watch_all(tx).await
                     }
                     other => other,
@@ -620,7 +638,7 @@ async fn run_watch(
                         warn!(
                             "watch cursor expired; resyncing, then falling back to full watch_prefix"
                         );
-                        resync_stale_keys(scope, &resync).await;
+                        resync_stale_keys(scope, &resync).await?;
                         watcher.watch_prefix(prefix, tx).await
                     }
                     other => other,
@@ -640,7 +658,7 @@ async fn run_watch(
                         warn!(
                             "watch cursor expired; resyncing, then falling back to full watch_prefixes"
                         );
-                        resync_stale_keys(scope, &resync).await;
+                        resync_stale_keys(scope, &resync).await?;
                         watcher.watch_prefixes(&refs, tx).await
                     }
                     other => other,
@@ -659,24 +677,37 @@ async fn run_watch(
 /// makes a delete-then-recreate during the gap converge: the synthetic delete
 /// always lands before the re-list put.
 ///
-/// Best-effort: with no reader/store wired (`resync` is `None`), or a failed
-/// listing, this degrades to the warn-and-relist-only fallback — keys deleted
-/// during the gap stay in the fold until their next update.
-async fn resync_stale_keys(scope: &WatchScope, resync: &Option<ResyncHandle>) {
+/// With no reader/store wired (`resync` is `None`) the caller explicitly opted
+/// out: warn and fall back re-list-only (keys deleted during the gap stay in
+/// the fold — `tests/model.rs` pins this divergence as reachable).
+///
+/// A FAILED listing, by contrast, is **fatal** — it fails the watch rather
+/// than degrading. The resync is load-bearing for the "stale, never corrupt"
+/// convergence guarantee: a silently degraded resync leaves the fold holding
+/// keys the bucket deleted, with one warn line as the only witness
+/// (`tests/model.rs` proves this divergence reachable under degrade
+/// semantics). Failing the watch turns the violated guarantee into a visible
+/// error; the caller's restart re-resumes, hits `CursorExpired` again, and
+/// retries the resync from scratch.
+async fn resync_stale_keys(
+    scope: &WatchScope,
+    resync: &Option<ResyncHandle>,
+) -> Result<(), KvError> {
     let Some((reader, resync_tx)) = resync else {
         warn!(
             "no reader wired for cursor-expired resync; keys deleted during the gap may persist in the fold"
         );
-        return;
+        return Ok(());
     };
     let mut live_keys = Vec::new();
     for prefix in scope.prefixes() {
         match reader.keys(&prefix).await {
             Ok(keys) => live_keys.extend(keys),
             Err(e) => {
-                warn!(error = %e, prefix = %prefix,
-                    "resync live-key listing failed; keys deleted during the gap may persist in the fold");
-                return;
+                return Err(KvError::WatchError(format!(
+                    "cursor-expired resync failed listing live keys under {prefix:?}: {e}; \
+                     failing the watch rather than silently keeping stale keys"
+                )));
             }
         }
     }
@@ -693,6 +724,7 @@ async fn resync_stale_keys(scope: &WatchScope, resync: &Option<ResyncHandle>) {
         // is about to die with it; nothing to recover.
         let _ = ack_rx.await;
     }
+    Ok(())
 }
 
 #[cfg(test)]

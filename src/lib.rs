@@ -29,6 +29,7 @@ mod artifact;
 mod export_lease;
 mod kv;
 mod nats;
+pub mod protocol;
 pub mod snapshot;
 #[cfg(feature = "fjall")]
 mod snapshot_fjall;
@@ -54,4 +55,4 @@ pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
 pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
 pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};
 #[cfg(feature = "transport")]
-pub use transport::{ArtifactTransport, ObjectStoreTransport, run_export_round};
+pub use transport::{ArtifactTransport, ObjectStoreTransport, PublishOutcome, run_export_round};

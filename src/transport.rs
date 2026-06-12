@@ -1,24 +1,51 @@
 //! Artifact transport: ship export artifacts to object storage and fetch them
 //! back for bootstrap. Feature `transport`.
 //!
-//! The wire format is a **plain tar** of the artifact directory
-//! (`MANIFEST.json` + `data/…`) at `<prefix>/<key>`, with the manifest
-//! duplicated as a sibling object `<key>.manifest.json` so a node can peek at
-//! an artifact's cursor/backend without downloading the payload. No
+//! ## Wire format: content-addressed payload + monotonic pointer
+//!
+//! The payload is a **plain tar** of the artifact directory (`MANIFEST.json`
+//! plus `data/…`) at a **content-addressed** key —
+//! `<prefix>/<key>.payloads/<blake3(manifest)[..8] hex>.tar` — so payload
+//! objects are write-once: two different artifacts can never collide on a
+//! key, and re-uploading the same artifact is an idempotent overwrite. No
 //! compression layer: fjall/RocksDB payload files are already lz4/zstd
-//! compressed. The sibling manifest is uploaded **last**, so its presence
-//! means the payload object is complete — the remote twin of the local
-//! artifact's manifest-written-last discipline.
+//! compressed.
+//!
+//! The manifest doubles as the **pointer**: it is published at
+//! `<prefix>/<key>.manifest.json` LAST, via a conditional put (create-only or
+//! compare-and-swap on the object version) that only ever moves the cursor
+//! FORWARD. This single atomic object is what readers trust; the payload key
+//! is derived from its bytes. The discipline is machine-checked: the pointer
+//! protocol is the `pointer_swap` model in `tests/model.rs`, where the
+//! checker proves torn payload/pointer pairs and cursor regression are
+//! structurally impossible — the two hazards the legacy two-register layout
+//! (payload and manifest as independent last-write-wins objects at fixed
+//! keys) provably had.
+//!
+//! Consequences, each pinned by `tests/multi_export.rs`:
+//! - A slow exporter whose round overran its lease CANNOT clobber a newer
+//!   published artifact: its swap is refused
+//!   ([`PublishOutcome::SupersededByNewer`]).
+//! - A crash between the payload upload and the pointer swap leaves the OLD
+//!   pointer fully consistent — bootstrap stays available throughout.
+//!
+//! Old payload objects linger after their pointer moves on; [`run_export_round`]
+//! prunes unreferenced payloads older than a grace period (never the one the
+//! current pointer targets, and never young objects a concurrent publisher or
+//! an in-flight bootstrap may still reference).
 //!
 //! Transport is **untrusted**: [`download`](ArtifactTransport::download)
-//! cross-checks the tar's embedded manifest against the sibling object, and
-//! the backend `import` re-verifies every payload file hash regardless.
+//! cross-checks the tar's embedded manifest against the pointer bytes (the
+//! content address makes a mismatch unreachable short of hash breakage or
+//! store corruption — kept as defense in depth), and the backend `import`
+//! re-verifies every payload file hash regardless.
 //!
 //! [`run_export_round`] composes the whole at-most-once round:
 //! lease → export (through the [`watch_applied`](crate::watch_applied)
-//! [`ExportRequest`] channel) → upload → publish completion → **delete the
-//! local artifact** (artifacts hardlink fold files and pin storage if they
-//! linger — transience is enforced here, not hoped for).
+//! [`ExportRequest`] channel) → upload + pointer swap → publish completion →
+//! prune stale payloads → **delete the local artifact** (artifacts hardlink
+//! fold files and pin storage if they linger — transience is enforced here,
+//! not hoped for).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,17 +54,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion, WriteMultipart,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::applied::ExportRequest;
 use crate::artifact::{
-    ExportManifest, MANIFEST_FILE, check_dest_available, manifest_from_slice, rename_into_place,
+    ExportManifest, MANIFEST_FILE, check_dest_available, hex_encode, manifest_from_slice,
+    rename_into_place,
 };
 use crate::export_lease::ExportLease;
 use crate::kv::WatchCursor;
+use crate::protocol::{PointerState, payload_prunable, pointer_publish_allowed};
 use crate::snapshot::SnapshotError;
 
 /// Buffered chunk size for uploads/downloads (also the multipart part size).
@@ -59,6 +90,34 @@ const MAX_MANIFEST_BYTES: usize = 1 << 20;
 /// artifacts). A half-dead TCP connection otherwise parks the `await` forever;
 /// same hazard and same 30 s bound as the NATS layer's `timed()`.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on pointer-swap CAS retries. Each retry means another publisher won
+/// the race in the read→swap window; with rounds minutes apart, more than a
+/// couple of iterations indicates something pathological, and an unbounded
+/// loop would livelock against it.
+const MAX_SWAP_ATTEMPTS: usize = 8;
+
+/// Outcome of [`ArtifactTransport::upload`]'s pointer swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// This artifact is now the published "latest": its payload is uploaded
+    /// and the pointer references it.
+    Published,
+    /// The pointer already references a STRICTLY newer artifact, so the
+    /// monotonic swap refused to regress it. This round's payload was
+    /// uploaded but is unreferenced (the next prune collects it). Routine
+    /// under lease overrun: the fleet has moved on, nothing was lost.
+    SupersededByNewer {
+        /// The newer published artifact's cursor.
+        remote_cursor: crate::kv::WatchCursor,
+    },
+}
+
+/// Total order for the monotonic pointer guard. Revisionless cursors rank 0:
+/// a real cursor always supersedes an empty one, never the reverse.
+fn cursor_rank(c: &WatchCursor) -> u64 {
+    c.as_u64().unwrap_or(0)
+}
 
 /// Bound one object-store await by `limit`.
 async fn timed_by<T>(
@@ -86,15 +145,27 @@ async fn timed<T>(
 /// for the wire format.
 #[async_trait]
 pub trait ArtifactTransport: Send + Sync {
-    /// Tar `artifact_dir` and upload it at `key`, then upload the manifest as
-    /// the sibling object `<key>.manifest.json` (the completeness marker).
-    /// Re-uploading the same `key` overwrites — "latest" keys are
-    /// last-write-wins by design.
-    async fn upload(&self, key: &str, artifact_dir: &Path) -> Result<(), SnapshotError>;
+    /// Tar `artifact_dir`, upload it at its content-addressed payload key,
+    /// then publish the manifest as the pointer `<key>.manifest.json` via a
+    /// monotonic conditional swap. The pointer only ever moves the cursor
+    /// forward: an older artifact gets
+    /// [`PublishOutcome::SupersededByNewer`], never a regression.
+    async fn upload(&self, key: &str, artifact_dir: &Path)
+    -> Result<PublishOutcome, SnapshotError>;
 
-    /// Fetch only the sibling manifest — peek at an artifact's cursor and
+    /// Fetch only the pointer manifest — peek at an artifact's cursor and
     /// backend before committing to a payload download.
     async fn manifest(&self, key: &str) -> Result<ExportManifest, SnapshotError>;
+
+    /// Delete payload objects under `key` that the current pointer does not
+    /// reference and that are older than `grace`. Best-effort housekeeping —
+    /// returns the number deleted. The grace period protects concurrent
+    /// publishers mid-swap and in-flight bootstraps holding an older pointer
+    /// read. Default: no-op (transports with nothing to prune).
+    async fn prune(&self, key: &str, grace: Duration) -> Result<usize, SnapshotError> {
+        let _ = (key, grace);
+        Ok(0)
+    }
 
     /// Download and unpack the artifact at `key` into `dest_dir` (which must
     /// not exist or be an empty directory), returning its manifest. The
@@ -109,6 +180,9 @@ pub trait ArtifactTransport: Send + Sync {
 pub struct ObjectStoreTransport {
     store: Arc<dyn ObjectStore>,
     prefix: ObjPath,
+    /// Accept stores without conditional-put support (see
+    /// [`with_non_atomic_pointer_fallback`](Self::with_non_atomic_pointer_fallback)).
+    allow_non_atomic_pointer: bool,
 }
 
 impl ObjectStoreTransport {
@@ -117,7 +191,25 @@ impl ObjectStoreTransport {
         Self {
             store,
             prefix: ObjPath::from(prefix.as_ref()),
+            allow_non_atomic_pointer: false,
         }
+    }
+
+    /// Accept stores that lack conditional puts (`PutMode::Update` →
+    /// `NotImplemented`, e.g. `object_store`'s `LocalFileSystem`): the
+    /// pointer publish degrades to read-check-then-unconditional-put.
+    ///
+    /// OUTSIDE the verified protocol: the monotonic refusal still runs, but
+    /// the write is not atomic, so two publishers racing the read→write
+    /// window are last-write-wins — the legacy regression hazard
+    /// (`tests/model.rs`, legacy configuration) survives on such a store.
+    /// Without this opt-in, a swap on a non-CAS store FAILS the round
+    /// instead of silently degrading. Dev/test `file://` use only; every
+    /// deployment-grade store (S3/GCS/Azure/MinIO/R2) supports the atomic
+    /// path.
+    pub fn with_non_atomic_pointer_fallback(mut self) -> Self {
+        self.allow_non_atomic_pointer = true;
+        self
     }
 
     /// Build from a URL (`s3://bucket/prefix`, `file:///path`, …) plus
@@ -141,17 +233,174 @@ impl ObjectStoreTransport {
         Ok(Self {
             store: Arc::from(store),
             prefix,
+            allow_non_atomic_pointer: false,
         })
     }
 
     // `Path::from` parses `/` separators, so multi-segment keys
     // (`edge-origins/us-east/latest`) land as real object hierarchy.
-    fn payload_path(&self, key: &str) -> ObjPath {
-        ObjPath::from(format!("{}/{key}", self.prefix))
+    //
+    /// The directory of `key`'s content-addressed payload objects.
+    fn payloads_dir(&self, key: &str) -> ObjPath {
+        ObjPath::from(format!("{}/{key}.payloads", self.prefix))
+    }
+
+    /// A payload object's address: `<cursor, 16 hex>-<blake3(manifest)[..8],
+    /// 16 hex>.tar`.
+    ///
+    /// The hash half is the content address (the manifest embeds a BLAKE3
+    /// digest per payload file, so it commits to the artifact's content; 64
+    /// bits — a birthday collision needs ~2^32 artifacts under ONE key, and
+    /// even then the embedded-manifest cross-check at download detects the
+    /// mix). The cursor half is LOAD-BEARING for prune: it lets prune apply
+    /// the strictly-below-the-pointer rule without fetching each payload
+    /// (see [`prune`](Self::prune) — the rule is what makes a
+    /// pruned-then-published dangling pointer structurally impossible, a
+    /// hazard the model checker found at zero grace).
+    fn payload_path(&self, key: &str, cursor: &WatchCursor, pointer_bytes: &[u8]) -> ObjPath {
+        let digest = blake3::hash(pointer_bytes);
+        let hex = hex_encode(&digest.as_bytes()[..8]);
+        ObjPath::from(format!(
+            "{}/{key}.payloads/{:016x}-{hex}.tar",
+            self.prefix,
+            cursor_rank(cursor)
+        ))
     }
 
     fn manifest_path(&self, key: &str) -> ObjPath {
         ObjPath::from(format!("{}/{key}.manifest.json", self.prefix))
+    }
+
+    /// Publish `pointer_bytes` (the manifest) at the pointer key with a
+    /// monotonic conditional swap: create-only when absent, compare-and-swap
+    /// against the observed object version when present, and REFUSED when
+    /// the present pointer's cursor is strictly newer. An unparseable
+    /// pointer is replaced (CAS against its version) — one corrupt object
+    /// must not wedge publishing, mirroring the lease's corrupt-steal rule.
+    ///
+    /// This is the `Publish` transition of the `pointer_swap` model in
+    /// `tests/model.rs`; the conditional-put semantics it relies on are
+    /// verified against real S3 (MinIO) by `tests/transport_s3.rs`.
+    async fn swap_pointer(
+        &self,
+        key: &str,
+        new_cursor: &WatchCursor,
+        pointer_bytes: &[u8],
+    ) -> Result<PublishOutcome, SnapshotError> {
+        let path = self.manifest_path(key);
+        for _ in 0..MAX_SWAP_ATTEMPTS {
+            // Read the current pointer (bytes + object version for the CAS).
+            let current = match timed("pointer get", self.store.get(&path)).await? {
+                Ok(get) => {
+                    let meta = get.meta.clone();
+                    let mut stream = get.into_stream();
+                    let mut buf = Vec::new();
+                    while let Some(chunk) = timed("pointer read", stream.next()).await? {
+                        let chunk = chunk.map_err(map_obj)?;
+                        if buf.len() + chunk.len() > MAX_MANIFEST_BYTES {
+                            return Err(SnapshotError::ArtifactInvalid(format!(
+                                "remote pointer for {key:?} exceeds {MAX_MANIFEST_BYTES} bytes"
+                            )));
+                        }
+                        buf.extend_from_slice(&chunk);
+                    }
+                    Some((meta, buf))
+                }
+                Err(object_store::Error::NotFound { .. }) => None,
+                Err(e) => return Err(map_obj(e)),
+            };
+
+            match current {
+                None => {
+                    // Open slot: create-only — exactly one concurrent
+                    // publisher can win it.
+                    let opts = PutOptions::from(PutMode::Create);
+                    match timed(
+                        "pointer create",
+                        self.store
+                            .put_opts(&path, PutPayload::from(pointer_bytes.to_vec()), opts),
+                    )
+                    .await?
+                    {
+                        Ok(_) => return Ok(PublishOutcome::Published),
+                        Err(object_store::Error::AlreadyExists { .. }) => continue, // lost the race; re-read
+                        Err(e) => return Err(map_obj(e)),
+                    }
+                }
+                Some((meta, bytes)) => {
+                    // THE monotonic guard — the shared protocol kernel, the
+                    // same function the model checker's Publish transition
+                    // executes (`crate::protocol`). An unparseable pointer is
+                    // rank-less and replaced.
+                    let existing = manifest_from_slice(&bytes).ok();
+                    let observed = PointerState::Present {
+                        rank: existing.as_ref().map(|m| cursor_rank(&m.cursor)),
+                    };
+                    if !pointer_publish_allowed(&observed, cursor_rank(new_cursor)) {
+                        let existing =
+                            existing.expect("refusal implies a parseable, newer pointer");
+                        return Ok(PublishOutcome::SupersededByNewer {
+                            remote_cursor: existing.cursor,
+                        });
+                    }
+                    let opts = PutOptions::from(PutMode::Update(UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    }));
+                    match timed(
+                        "pointer swap",
+                        self.store
+                            .put_opts(&path, PutPayload::from(pointer_bytes.to_vec()), opts),
+                    )
+                    .await?
+                    {
+                        Ok(_) => return Ok(PublishOutcome::Published),
+                        Err(object_store::Error::Precondition { .. }) => continue, // raced; re-read
+                        Err(object_store::Error::NotFound { .. }) => continue, // deleted under us; re-read
+                        Err(object_store::Error::NotImplemented { .. }) => {
+                            // Store without compare-and-swap (object_store's
+                            // LocalFileSystem). FAIL CLOSED unless the caller
+                            // explicitly opted in: a silently degraded swap
+                            // would reintroduce the legacy regression hazard
+                            // (tests/model.rs proves it reachable) with a log
+                            // line as the only witness — the same violated-
+                            // obligation pattern the resync fail-stop change
+                            // eliminated.
+                            if !self.allow_non_atomic_pointer {
+                                return Err(SnapshotError::Backend(format!(
+                                    "object store lacks conditional puts (PutMode::Update \
+                                     unimplemented); the pointer swap for {key:?} cannot be \
+                                     atomic and this store is outside the verified protocol. \
+                                     For dev/test stores (file://), opt in explicitly with \
+                                     ObjectStoreTransport::with_non_atomic_pointer_fallback()"
+                                )));
+                            }
+                            // Opted in: the monotonic REFUSAL above still
+                            // ran, but the write is unconditional — two
+                            // publishers racing this window are
+                            // last-write-wins, on this store only.
+                            warn!(
+                                key,
+                                "non-atomic pointer fallback (explicit opt-in): publish is \
+                                 read-check-then-put; concurrent publishers may race"
+                            );
+                            timed(
+                                "pointer put (non-atomic fallback)",
+                                self.store
+                                    .put(&path, PutPayload::from(pointer_bytes.to_vec())),
+                            )
+                            .await?
+                            .map_err(map_obj)?;
+                            return Ok(PublishOutcome::Published);
+                        }
+                        Err(e) => return Err(map_obj(e)),
+                    }
+                }
+            }
+        }
+        Err(SnapshotError::Backend(format!(
+            "pointer swap for {key:?} lost {MAX_SWAP_ATTEMPTS} consecutive CAS races; giving up"
+        )))
     }
 
     /// Fetch the sibling manifest object, enforcing [`MAX_MANIFEST_BYTES`].
@@ -176,14 +425,19 @@ impl ObjectStoreTransport {
 
 #[async_trait]
 impl ArtifactTransport for ObjectStoreTransport {
-    async fn upload(&self, key: &str, artifact_dir: &Path) -> Result<(), SnapshotError> {
+    async fn upload(
+        &self,
+        key: &str,
+        artifact_dir: &Path,
+    ) -> Result<PublishOutcome, SnapshotError> {
         // Read the manifest first — it doubles as the artifact-completeness
-        // check (export writes it last).
+        // check (export writes it last) and, as the pointer bytes, derives
+        // the payload's content address.
         let manifest_bytes = tokio::fs::read(artifact_dir.join(MANIFEST_FILE))
             .await
             .map_err(SnapshotError::Io)?;
         // Validate before shipping: never upload an artifact we couldn't read back.
-        manifest_from_slice(&manifest_bytes)?;
+        let manifest = manifest_from_slice(&manifest_bytes)?;
 
         // Tar the artifact into a temp file on a blocking task. A temp file
         // (rather than streaming the tar straight into the upload) keeps the
@@ -223,7 +477,8 @@ impl ArtifactTransport for ObjectStoreTransport {
             .map_err(SnapshotError::Io)?;
         let upload = timed(
             "multipart create",
-            self.store.put_multipart(&self.payload_path(key)),
+            self.store
+                .put_multipart(&self.payload_path(key, &manifest.cursor, &manifest_bytes)),
         )
         .await?
         .map_err(map_obj)?;
@@ -251,15 +506,10 @@ impl ArtifactTransport for ObjectStoreTransport {
         .await?
         .map_err(map_obj)?;
 
-        // Manifest sibling LAST: its presence marks the payload complete.
-        timed(
-            "manifest put",
-            self.store
-                .put(&self.manifest_path(key), PutPayload::from(manifest_bytes)),
-        )
-        .await?
-        .map_err(map_obj)?;
-        Ok(())
+        // Pointer LAST, by monotonic conditional swap: its presence marks the
+        // payload complete, and it can never regress past a newer round.
+        self.swap_pointer(key, &manifest.cursor, &manifest_bytes)
+            .await
     }
 
     async fn manifest(&self, key: &str) -> Result<ExportManifest, SnapshotError> {
@@ -279,8 +529,9 @@ impl ArtifactTransport for ObjectStoreTransport {
                 ))
             })?;
 
-        // Sibling manifest first — it is the completeness marker and the value
-        // we cross-check the tar against.
+        // Pointer first — it is the completeness marker, the source of the
+        // payload's content address, and the value we cross-check the tar
+        // against.
         let sibling = self.fetch_manifest_bytes(key).await?;
         let manifest = manifest_from_slice(&sibling)?;
 
@@ -289,10 +540,14 @@ impl ArtifactTransport for ObjectStoreTransport {
         let mut tar_writer = tokio::fs::File::create(tar_tmp.path())
             .await
             .map_err(SnapshotError::Io)?;
-        let mut stream = timed("payload get", self.store.get(&self.payload_path(key)))
-            .await?
-            .map_err(map_obj)?
-            .into_stream();
+        let mut stream = timed(
+            "payload get",
+            self.store
+                .get(&self.payload_path(key, &manifest.cursor, &sibling)),
+        )
+        .await?
+        .map_err(map_obj)?
+        .into_stream();
         while let Some(chunk) = timed("payload read", stream.next()).await? {
             let chunk = chunk.map_err(map_obj)?;
             tar_writer
@@ -343,6 +598,54 @@ impl ArtifactTransport for ObjectStoreTransport {
         .map_err(|e| SnapshotError::Backend(format!("untar task panicked: {e}")))??;
 
         Ok(manifest)
+    }
+
+    async fn prune(&self, key: &str, grace: Duration) -> Result<usize, SnapshotError> {
+        // No pointer (or an unparseable one — it will be replaced by the
+        // next publish) → nothing is provably stale, so prune nothing.
+        let pointer = match self.fetch_manifest_bytes(key).await {
+            Ok(b) => b,
+            Err(_) => return Ok(0),
+        };
+        let Ok(current) = manifest_from_slice(&pointer) else {
+            return Ok(0);
+        };
+        let keep = self.payload_path(key, &current.cursor, &pointer);
+        let pointer_rank = cursor_rank(&current.cursor);
+        let cutoff_millis = std::time::SystemTime::now()
+            .checked_sub(grace)
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as i64);
+
+        let mut deleted = 0usize;
+        let mut listing = self.store.list(Some(&self.payloads_dir(key)));
+        while let Some(meta) = timed("payload list", listing.next()).await? {
+            let meta = meta.map_err(map_obj)?;
+            // THE prune guard — the shared protocol kernel, the same
+            // function the model checker's Prune transition executes
+            // (`crate::protocol::payload_prunable`, where the
+            // strictly-below-the-pointer rule and its dangling-pointer
+            // impossibility argument live). The grace period remains as
+            // defense in depth for in-flight downloads holding stale
+            // pointer reads.
+            let payload_rank = meta
+                .location
+                .filename()
+                .and_then(|f| f.split('-').next())
+                .and_then(|h| u64::from_str_radix(h, 16).ok());
+            if payload_prunable(
+                payload_rank,
+                pointer_rank,
+                meta.location == keep,
+                meta.last_modified.timestamp_millis() <= cutoff_millis,
+            ) {
+                timed("payload delete", self.store.delete(&meta.location))
+                    .await?
+                    .map_err(map_obj)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 }
 
@@ -432,15 +735,40 @@ pub async fn run_export_round(
         }
     };
 
-    // Upload; only then publish completion.
-    if let Err(e) = transport.upload(key, &artifact_dir).await {
-        guard.abandon().await;
-        return Err(e);
+    // Upload + pointer swap; only then publish completion.
+    let outcome = match transport.upload(key, &artifact_dir).await {
+        Ok(o) => o,
+        Err(e) => {
+            guard.abandon().await;
+            return Err(e);
+        }
+    };
+    if let PublishOutcome::SupersededByNewer { remote_cursor } = &outcome {
+        // Routine under lease overrun: another node published a newer round
+        // while this one ran. The monotonic swap refused the regression —
+        // the published "latest" is intact, this round's payload awaits the
+        // next prune.
+        warn!(
+            key,
+            local = ?manifest.cursor,
+            remote = ?remote_cursor,
+            "export round superseded by a newer published artifact; pointer left untouched"
+        );
     }
     if let Err(e) = guard.complete(&manifest.cursor).await {
         // The artifact IS uploaded — the round succeeded. Losing the
         // completion record costs observability, not correctness.
         warn!(key, error = %e, "export round uploaded but completion record failed");
+    }
+
+    if matches!(outcome, PublishOutcome::Published) {
+        // Housekeeping: collect payloads no pointer references. Grace of 4
+        // round periods comfortably outlives any concurrent publisher's
+        // upload→swap window and any in-flight bootstrap holding an older
+        // pointer read (both are bounded by round-period timescales).
+        if let Err(e) = transport.prune(key, ttl.saturating_mul(4)).await {
+            warn!(key, error = %e, "stale payload prune failed; retried next round");
+        }
     }
 
     drop(round_dir); // enforce artifact transience
