@@ -45,7 +45,8 @@ pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
 pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
 pub use kv::{
-    KvEntry, KvError, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
+    KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken,
+    WatchCursor,
 };
 pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};

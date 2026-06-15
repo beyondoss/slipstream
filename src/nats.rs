@@ -10,7 +10,7 @@ use tokio::sync::{RwLock, mpsc::Sender};
 use tracing::{debug, error, info, warn};
 
 use crate::kv::{
-    KvEntry, KvError, KvReader, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
+    KvEntry, KvError, KvPurge, KvReader, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };
 use crate::stores::{Connection, ConnectionCapabilities, KvStore, StoreConfig};
 
@@ -642,6 +642,9 @@ impl Connection for NatsConnection {
             // callers that branch on this flag down a path that can never
             // succeed. Flip to `true` together with the `KvTtl` impl.
             ttl: false,
+            // Byte-reclaiming purge IS implemented for NATS (rollup delete) and
+            // vended via `KvStore::purge_writer`.
+            purge: true,
             cas: true,
             transactions: false,
             // 0 = unlimited from this layer's perspective: we impose no cap, but
@@ -685,6 +688,12 @@ impl KvStore for NatsKvStore {
     }
 
     fn writer(&self) -> Option<Arc<dyn KvWriter>> {
+        Some(Arc::new(NatsKvWriterImpl {
+            kv: self.kv.clone(),
+        }))
+    }
+
+    fn purge_writer(&self) -> Option<Arc<dyn KvPurge>> {
         Some(Arc::new(NatsKvWriterImpl {
             kv: self.kv.clone(),
         }))
@@ -1592,6 +1601,19 @@ impl KvWriter for NatsKvWriterImpl {
     }
 }
 
+#[async_trait]
+impl KvPurge for NatsKvWriterImpl {
+    async fn purge(&self, key: &str) -> Result<(), KvError> {
+        // Rollup purge (`Nats-Rollup: sub`): drops all prior revisions of the
+        // subject, reclaiming bytes against `max_bytes` — unlike `delete`, which
+        // only appends a marker. Idempotent: purging an absent key is a no-op.
+        timed(self.kv.purge(key))
+            .await?
+            .map_err(|e| KvError::OperationFailed(e.to_string()))?;
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for NatsConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NatsConnection")
@@ -1923,6 +1945,76 @@ mod floor_guard_tests {
             kv.put(format!("k{i}"), vec![i].into()).await.unwrap();
         }
         (js, kv)
+    }
+
+    /// `KvPurge::purge` must reclaim bytes against `max_bytes` — unlike
+    /// `delete`/`delete_with_version`, which only append markers. This is the
+    /// in-repo twin of the "does purge actually free bytes?" gate: fill a
+    /// bucket, purge half the keys, assert the stream's byte count drops.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_reclaims_bytes() {
+        use crate::kv::KvPurge;
+
+        let server = start_server().await;
+        let client = async_nats::connect(&server.url).await.unwrap();
+        let js = async_nats::jetstream::new(client);
+        let kv = js
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "purge".into(),
+                history: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Fill with sizable values across many distinct keys.
+        let val = vec![b'x'; 4096];
+        for i in 0..50u32 {
+            kv.put(format!("k{i}"), val.clone().into()).await.unwrap();
+        }
+        let before = js
+            .get_stream("KV_purge")
+            .await
+            .unwrap()
+            .info()
+            .await
+            .unwrap()
+            .state
+            .bytes;
+
+        // Purge half the keys through the KvPurge impl.
+        let writer = NatsKvWriterImpl { kv: kv.clone() };
+        for i in 0..25u32 {
+            writer.purge(&format!("k{i}")).await.unwrap();
+        }
+
+        // Purge is a rollup: prior revisions of each subject are removed, so the
+        // stream's byte count must fall. (A residual purge marker may remain per
+        // subject — far smaller than the 4KiB value — so we assert a strict drop,
+        // not zero.) Poll briefly in case the server reflects reclamation async.
+        let mut after = before;
+        for _ in 0..20 {
+            after = js
+                .get_stream("KV_purge")
+                .await
+                .unwrap()
+                .info()
+                .await
+                .unwrap()
+                .state
+                .bytes;
+            if after < before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            after < before,
+            "purge must reclaim bytes: before={before} after={after}"
+        );
+
+        // Purge is idempotent: re-purging an absent key is not an error.
+        writer.purge("k0").await.unwrap();
     }
 
     /// TRUE POSITIVE: the watch was clamped past evicted revisions (purge

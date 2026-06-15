@@ -380,6 +380,24 @@ pub trait KvTtl: KvWriter {
     ) -> Result<VersionToken, KvError>;
 }
 
+/// Purge support - optional, for stores that can reclaim a key's storage.
+///
+/// Unlike [`KvWriter::delete`] (which writes a delete marker) and
+/// [`KvWriter::delete_with_version`] (which writes an empty-value tombstone),
+/// `purge` removes a key *and reclaims its bytes*. On NATS this issues a
+/// rollup (`Nats-Rollup: sub`) that drops all prior revisions of the subject,
+/// so the bytes stop counting against the stream's `max_bytes`.
+///
+/// Use this to bound a bucket that has no `max_age`: dead keys deleted with
+/// `delete`/`delete_with_version` accumulate forever, but purged keys are
+/// reclaimed.
+#[async_trait]
+pub trait KvPurge: KvWriter {
+    /// Purge a key, reclaiming its storage. Idempotent: purging an absent key
+    /// is not an error.
+    async fn purge(&self, key: &str) -> Result<(), KvError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
