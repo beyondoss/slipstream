@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::kv::{KvError, KvReader, KvWatcher, KvWriter};
+use crate::kv::{KvError, KvPurge, KvReader, KvWatcher, KvWriter};
 
 /// Storage type for a store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,6 +52,15 @@ pub trait KvStore: Send + Sync {
     fn writer(&self) -> Option<Arc<dyn KvWriter>> {
         None
     }
+
+    /// Get the purge interface (if supported).
+    ///
+    /// Purge reclaims a key's bytes, unlike `writer().delete()` which only
+    /// writes a marker. See [`KvPurge`]. Returns `None` for backends without
+    /// byte-reclaiming purge.
+    fn purge_writer(&self) -> Option<Arc<dyn KvPurge>> {
+        None
+    }
 }
 
 /// Capabilities a store connection may support.
@@ -63,6 +72,8 @@ pub struct ConnectionCapabilities {
     pub prefix_watch: bool,
     /// Supports TTL on keys.
     pub ttl: bool,
+    /// Supports byte-reclaiming purge (rollup delete). NATS: true.
+    pub purge: bool,
     /// Supports atomic compare-and-swap.
     pub cas: bool,
     /// Supports multi-key transactions.
