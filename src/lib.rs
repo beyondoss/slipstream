@@ -54,6 +54,8 @@ pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
 #[cfg(feature = "rocksdb")]
 pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
-pub use stores::{Connection, ConnectionCapabilities, KvStore, StorageType, StoreConfig};
+pub use stores::{
+    Connection, ConnectionCapabilities, DiscardPolicy, KvStore, StorageType, StoreConfig,
+};
 #[cfg(feature = "transport")]
 pub use transport::{ArtifactTransport, ObjectStoreTransport, PublishOutcome, run_export_round};

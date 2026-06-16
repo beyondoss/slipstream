@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use slipstream::{
-    Connection, KvError, KvStore, KvUpdate, KvWriter, NatsConnection, NatsConnectionConfig,
-    StoreConfig, VersionToken, WatchCursor,
+    Connection, DiscardPolicy, KvError, KvStore, KvUpdate, KvWriter, NatsConnection,
+    NatsConnectionConfig, StoreConfig, VersionToken, WatchCursor,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -1681,4 +1681,67 @@ async fn export_lease_complete_publishes_outcome() {
     );
     assert!(record.completed_at_unix.is_some());
     assert_eq!(record.holder_id, "node-a");
+}
+
+/// The `discard` knob: `DiscardPolicy::Old` creates an evict-oldest bucket (a
+/// size ceiling that never rejects — right for high-churn routing-origin logs),
+/// while the default stays `discard:new` (reject-when-full, right for config
+/// buckets). Asserted by reading the created stream's config back from NATS.
+#[tokio::test]
+async fn discard_policy_old_evicts_default_rejects() {
+    use async_nats::jetstream::stream::DiscardPolicy as NatsDiscard;
+
+    let nats = TestNats::start().await;
+    let conn = nats.connect().await;
+
+    // Opt-in: a size-bounded, evict-oldest log bucket.
+    conn.store_with_config(StoreConfig {
+        name: "origins-old".to_string(),
+        max_bytes: Some(1024 * 1024),
+        max_history: Some(1),
+        discard: DiscardPolicy::Old,
+        ..Default::default()
+    })
+    .await
+    .expect("open discard:old store");
+
+    // Default: unchanged reject-when-full behavior (back-compat).
+    conn.store_with_config(StoreConfig {
+        name: "config-new".to_string(),
+        max_bytes: Some(1024 * 1024),
+        ..Default::default()
+    })
+    .await
+    .expect("open default store");
+
+    let js = async_nats::jetstream::new(async_nats::connect(&nats.url).await.expect("raw connect"));
+    let old = js
+        .get_stream("KV_origins-old")
+        .await
+        .expect("get old stream")
+        .info()
+        .await
+        .expect("old info")
+        .config
+        .discard;
+    let new = js
+        .get_stream("KV_config-new")
+        .await
+        .expect("get new stream")
+        .info()
+        .await
+        .expect("new info")
+        .config
+        .discard;
+
+    assert_eq!(
+        old,
+        NatsDiscard::Old,
+        "DiscardPolicy::Old must create an evict-oldest bucket"
+    );
+    assert_eq!(
+        new,
+        NatsDiscard::New,
+        "the default must remain discard:new (back-compat)"
+    );
 }

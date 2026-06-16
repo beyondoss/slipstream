@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::kv::{
     KvEntry, KvError, KvPurge, KvReader, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
 };
-use crate::stores::{Connection, ConnectionCapabilities, KvStore, StoreConfig};
+use crate::stores::{Connection, ConnectionCapabilities, DiscardPolicy, KvStore, StoreConfig};
 
 /// Default per-operation timeout for NATS KV ops. async-nats's request/response
 /// futures don't fail in-flight requests when the underlying TCP connection
@@ -183,6 +183,7 @@ pub(crate) async fn create_kv_bucket_raw(
     max_bytes: i64,
     history: i64,
     max_age_nanos: i64,
+    discard: DiscardPolicy,
     num_replicas: usize,
 ) -> Result<(), KvError> {
     let stream_name = format!("KV_{}", bucket);
@@ -200,7 +201,7 @@ pub(crate) async fn create_kv_bucket_raw(
         "deny_delete": false,
         "deny_purge": false,
         "allow_direct": true,
-        "discard": "new",
+        "discard": discard.as_nats(),
         "num_replicas": num_replicas,
         "retention": "limits"
     });
@@ -446,31 +447,40 @@ impl NatsConnection {
         // slow or distant — `?`-propagating the timeout here would skip the
         // exact workaround built for it. If the connection is genuinely dead,
         // the raw path's own `timed()` bounds surface that promptly anyway.
-        match timed(js.create_key_value(kv_config)).await {
-            Ok(Ok(kv)) => return Ok(kv),
-            Ok(Err(e)) => {
-                warn!(
-                    bucket = config.name,
-                    error = ?e,
-                    "create_key_value failed, trying raw JetStream API"
-                );
-            }
-            Err(_) => {
-                warn!(
-                    bucket = config.name,
-                    timeout = ?KV_OP_TIMEOUT,
-                    "create_key_value timed out, trying raw JetStream API"
-                );
+        //
+        // EXCEPTION: `discard:old` cannot go through the normal path —
+        // async-nats' `kv::Config` exposes no discard field, so `create_key_value`
+        // would silently produce a `discard:new` bucket. Skip straight to the raw
+        // stream API (the only place the policy is expressible) for that case.
+        if config.discard == DiscardPolicy::New {
+            match timed(js.create_key_value(kv_config)).await {
+                Ok(Ok(kv)) => return Ok(kv),
+                Ok(Err(e)) => {
+                    warn!(
+                        bucket = config.name,
+                        error = ?e,
+                        "create_key_value failed, trying raw JetStream API"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        bucket = config.name,
+                        timeout = ?KV_OP_TIMEOUT,
+                        "create_key_value timed out, trying raw JetStream API"
+                    );
+                }
             }
         }
 
-        // Try raw JetStream API as fallback
+        // Raw JetStream API: the fallback for `discard:new`, and the ONLY path for
+        // `discard:old`.
         create_kv_bucket_raw(
             client,
             &config.name,
             max_bytes,
             history,
             max_age_nanos,
+            config.discard,
             config.num_replicas.unwrap_or(1),
         )
         .await?;
