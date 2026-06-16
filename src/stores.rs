@@ -14,6 +14,37 @@ pub enum StorageType {
     Persistent,
 }
 
+/// What a bounded bucket does when it reaches `max_bytes` (NATS-specific).
+///
+/// This is a real semantic choice, not a tuning knob — it decides what the bucket
+/// gives up at capacity:
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiscardPolicy {
+    /// **Reject** new writes when full, preserving every existing entry (NATS
+    /// `discard:new`). Correct for **config** buckets (certs, configs read as the
+    /// source of truth) where silently dropping a live value is unacceptable — but
+    /// it FREEZES writes at capacity (err 10077). Pair it with `max_age` so the
+    /// bucket is trimmed before it ever fills.
+    #[default]
+    New,
+    /// **Evict the oldest** messages when full (NATS `discard:old`): a hard size
+    /// ceiling that never rejects. Correct for high-churn **log** buckets whose
+    /// consumers hold the durable fold (e.g. routing origins): the bucket is a
+    /// bounded change-feed, not the source of truth, so an evicted entry is
+    /// recovered from the consumer's fold (and the `CursorExpired` resync path),
+    /// while writers never freeze.
+    Old,
+}
+
+impl DiscardPolicy {
+    pub(crate) fn as_nats(self) -> &'static str {
+        match self {
+            DiscardPolicy::New => "new",
+            DiscardPolicy::Old => "old",
+        }
+    }
+}
+
 /// Configuration for creating a store.
 #[derive(Debug, Clone, Default)]
 pub struct StoreConfig {
@@ -33,6 +64,12 @@ pub struct StoreConfig {
     /// Number of stream replicas for the bucket (NATS cluster mode).
     /// Defaults to 1 (single replica). Set to 3 for production HA clusters.
     pub num_replicas: Option<usize>,
+    /// Behavior at `max_bytes` (NATS-specific, ignored by other stores). Defaults
+    /// to [`DiscardPolicy::New`] (reject) so config buckets never silently drop a
+    /// live value; set [`DiscardPolicy::Old`] for size-bounded log buckets (routing
+    /// origins) that must never freeze writers. Only applied at bucket *creation* —
+    /// an existing bucket's policy is left untouched.
+    pub discard: DiscardPolicy,
 }
 
 /// A named KV store (bucket/namespace/database).
