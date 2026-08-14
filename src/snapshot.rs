@@ -1630,4 +1630,25 @@ mod tests {
         );
         assert_eq!(snap.entries["node.a"].value, b"survives");
     }
+
+    /// Compact is the fold's durable publish: inode `sync_all` then rename.
+    /// Without a parent-directory fsync the new dirent can vanish on power
+    /// loss — the same hole `artifact::rename_into_place` already closes.
+    #[test]
+    fn compact_to_file_fsyncs_parent_dirent() {
+        let src = include_str!("snapshot.rs");
+        let compact = src
+            .split("fn compact_to_file(")
+            .nth(1)
+            .expect("compact_to_file must exist");
+        let compact = compact
+            .split("\n// ---------------------------------------------------------------------------")
+            .next()
+            .unwrap();
+        assert!(
+            compact.contains("fsync_dir"),
+            "compact_to_file must fsync the parent directory after persist, \
+             matching artifact::rename_into_place (Pedra F17)"
+        );
+    }
 }
