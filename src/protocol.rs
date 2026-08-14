@@ -148,4 +148,13 @@ mod tests {
         assert!(!resume_window_ok(3, 5), "gap head-evicted: expired");
         assert!(resume_window_ok(u64::MAX, u64::MAX), "saturating boundary");
     }
+
+    #[test]
+    fn resume_start_does_not_wrap_in_nats() {
+        let src = include_str!("nats.rs");
+        assert!(
+            !src.contains("revision + 1"),
+            "watch resume must not wrap u64::MAX to 0; use resume_start_sequence"
+        );
+    }
 }
