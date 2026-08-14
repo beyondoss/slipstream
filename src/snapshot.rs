@@ -284,6 +284,12 @@ pub fn load(path: &Path) -> Result<Option<Snapshot>, SnapshotError> {
     let (entries, cursor, already_compact) = replay_log(&data)?;
 
     if entries.is_empty() && cursor.is_none() {
+        // A torn or junk first record leaves bytes past the header. Returning
+        // None without rewriting would make SnapshotWriter::open append after
+        // the junk, and the next load would drop every later apply.
+        if data.len() > HEADER_LEN {
+            compact_to_file(path, &HashMap::new(), &WatchCursor::none())?;
+        }
         return Ok(None);
     }
 
@@ -774,9 +780,17 @@ fn parse_record(data: &[u8]) -> Result<(Record<'_>, usize), RecordError> {
         REC_PUT => parse_put(data, stored_crc),
         REC_DELETE => parse_delete(data, stored_crc),
         REC_CURSOR => parse_cursor(data, stored_crc),
-        other => Err(RecordError::Invalid(format!(
-            "unknown record type: {other:#x}"
-        ))),
+        other => {
+            // Trailing NUL slack (prealloc / torn copy) is a discarded tail,
+            // not an invalid file. Mid-file unknown types still fail-stop.
+            let crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if crc == 0 && other == 0 {
+                return Err(RecordError::Truncated);
+            }
+            Err(RecordError::Invalid(format!(
+                "unknown record type: {other:#x}"
+            )))
+        }
     }
 }
 
@@ -797,6 +811,16 @@ fn parse_put(data: &[u8], stored_crc: u32) -> Result<(Record<'_>, usize), Record
         data[vl_off + 2],
         data[vl_off + 3],
     ]) as usize;
+    // Lengths are read before CRC. A bit-flipped value_len of 2e9 looks like
+    // EOF and used to silent-drop every later record. Cap far above any
+    // legitimate config value; a torn last record of a real-sized value is
+    // still Truncated below.
+    const MAX_VALUE_LEN: usize = 16 * 1024 * 1024;
+    if value_len > MAX_VALUE_LEN {
+        return Err(RecordError::CrcMismatch {
+            consumed: data.len().min(vl_off + 4),
+        });
+    }
 
     // ver_len byte sits right after the value.
     let ver_len_off = vl_off + 4 + value_len;
