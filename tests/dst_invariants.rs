@@ -2,7 +2,7 @@
 //!
 //! These assert the *correct* behavior. They fail on current main (B1/B3/B4).
 
-use slipstream::snapshot::{SnapshotWriter, load, SnapshotError};
+use slipstream::snapshot::{SnapshotError, SnapshotWriter, load};
 use slipstream::{AppendLogSnapshot, KvEntry, KvUpdate, SnapshotStore, VersionToken, WatchCursor};
 use std::path::Path;
 use tempfile::TempDir;
