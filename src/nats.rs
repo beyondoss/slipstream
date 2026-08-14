@@ -1174,6 +1174,12 @@ async fn stream_watch_floor_guarded(
 ///
 /// If these messages ever change, `cursor_expired_matches_known_nats_error_strings`
 /// is the canary that fails loudly on the next dependency bump.
+fn resume_start(revision: u64) -> Result<u64, KvError> {
+    crate::protocol::resume_start_sequence(revision).ok_or_else(|| {
+        KvError::WatchError("resume revision is u64::MAX; refusing wrap to 0".into())
+    })
+}
+
 fn is_cursor_expired_error(err: &str) -> bool {
     use std::sync::OnceLock;
     // One Aho-Corasick automaton over all needles: a single pass over the error
@@ -1359,7 +1365,8 @@ impl KvWatcher for NatsKvWatcher {
         };
         self.check_resume_window(revision).await?;
 
-        let watcher = match timed(self.kv.watch_all_from_revision(revision + 1)).await? {
+        let start = resume_start(revision)?;
+        let watcher = match timed(self.kv.watch_all_from_revision(start)).await? {
             Ok(w) => w,
             Err(e) => {
                 let err_str = e.to_string();
@@ -1397,7 +1404,8 @@ impl KvWatcher for NatsKvWatcher {
         self.check_resume_window(revision).await?;
 
         let nats_key = format!("{prefix}>");
-        let watcher = match timed(self.kv.watch_from_revision(&nats_key, revision + 1)).await? {
+        let start = resume_start(revision)?;
+        let watcher = match timed(self.kv.watch_from_revision(&nats_key, start)).await? {
             Ok(w) => w,
             Err(e) => {
                 let err_str = e.to_string();
@@ -1473,7 +1481,7 @@ impl KvWatcher for NatsKvWatcher {
             filter_subjects,
             replay_policy: ReplayPolicy::Instant,
             deliver_policy: DeliverPolicy::ByStartSequence {
-                start_sequence: revision + 1,
+                start_sequence: resume_start(revision)?,
             },
             ..Default::default()
         }))
