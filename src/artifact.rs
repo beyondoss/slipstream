@@ -360,7 +360,7 @@ pub(crate) fn hash_payload(root: &Path) -> Result<Vec<ArtifactFile>, SnapshotErr
     Ok(files)
 }
 
-fn fsync_dir(path: &Path) -> Result<(), SnapshotError> {
+pub(crate) fn fsync_dir(path: &Path) -> Result<(), SnapshotError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
