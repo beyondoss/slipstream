@@ -1119,6 +1119,10 @@ fn compact_to_file(
 
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| SnapshotError::Io(e.error))?;
+    // persist() is rename(2). The inode is durable; the directory entry is
+    // not until the parent is fsynced. artifact::rename_into_place already
+    // does this — compact is the fold's only other rename-publish.
+    crate::artifact::fsync_dir(dir)?;
 
     Ok(())
 }
