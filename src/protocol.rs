@@ -111,6 +111,14 @@ pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
     first_sequence <= revision.saturating_add(1)
 }
 
+/// Sequence the watch should start at after applying `revision`.
+///
+/// `None` at `u64::MAX`: wrapping to 0 would silently replay the bucket
+/// from the beginning. Callers must fail the watch rather than wrap.
+pub fn resume_start_sequence(revision: u64) -> Option<u64> {
+    revision.checked_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +155,16 @@ mod tests {
         assert!(resume_window_ok(3, 1), "history intact");
         assert!(!resume_window_ok(3, 5), "gap head-evicted: expired");
         assert!(resume_window_ok(u64::MAX, u64::MAX), "saturating boundary");
+        assert_eq!(resume_start_sequence(3), Some(4));
+        assert_eq!(resume_start_sequence(u64::MAX), None);
+    }
+
+    #[test]
+    fn resume_start_does_not_wrap_in_nats() {
+        let src = include_str!("nats.rs");
+        assert!(
+            !src.contains("revision + 1"),
+            "watch resume must not wrap u64::MAX to 0; use resume_start_sequence"
+        );
     }
 }
