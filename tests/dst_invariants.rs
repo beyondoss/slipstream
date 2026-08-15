@@ -2,7 +2,7 @@
 //!
 //! These assert the *correct* behavior. They fail on current main (B1/B3/B4).
 
-use slipstream::snapshot::{SnapshotError, SnapshotWriter, load};
+use slipstream::snapshot::{load, SnapshotError, SnapshotWriter};
 use slipstream::{AppendLogSnapshot, KvEntry, KvUpdate, SnapshotStore, VersionToken, WatchCursor};
 use std::path::Path;
 use tempfile::TempDir;
@@ -135,4 +135,58 @@ fn trailing_zero_bytes_do_not_reject_the_prefix() {
         .expect("prefix still a snapshot");
     assert_eq!(snap.entries.len(), 3, "all three keys must survive");
     assert_eq!(snap.cursor.as_u64(), Some(3));
+}
+
+/// Five NULs at a record boundary look like `crc=0, type=0`. After the B4
+/// fix that is `Truncated`, so a *mid-file* hole (prealloc / leftover
+/// version bytes / torn copy) stops replay and `load` rewrites the suffix
+/// away. Each PUT/CURSOR on either side is CRC-valid — the zeros are not
+/// inside any frame.
+#[test]
+fn mid_file_nuls_must_not_drop_a_crc_valid_suffix() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("s.snap");
+
+    let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+    w.write_update(&put("a", b"x", 1)).unwrap();
+    w.checkpoint(&WatchCursor::from_u64(1)).unwrap();
+    w.write_update(&put("b", b"y", 2)).unwrap();
+    w.checkpoint(&WatchCursor::from_u64(2)).unwrap();
+    drop(w);
+
+    let orig = std::fs::read(&path).unwrap();
+    // First record: PUT a (key 1, value 1, ver 8) = 4+1+2+1+4+1+1+8 = 22,
+    // then CURSOR 1 = 4+1+1+8 = 14. Insert after those two.
+    let rec1 = 22usize;
+    let cur1 = 14usize;
+    let insert_at = 6 + rec1 + cur1;
+    assert!(
+        insert_at < orig.len(),
+        "need a suffix after the first put+cursor"
+    );
+    let mut punched = orig[..insert_at].to_vec();
+    punched.extend_from_slice(&[0u8; 5]);
+    punched.extend_from_slice(&orig[insert_at..]);
+    std::fs::write(&path, &punched).unwrap();
+
+    match load(&path) {
+        Err(SnapshotError::Corrupted) | Err(SnapshotError::InvalidFormat(_)) => {
+            // Fail-stop on mid-file junk: file must stay intact so a suffix
+            // of CRC-valid records is not burned by compact-on-load.
+            let stayed = std::fs::read(&path).unwrap();
+            assert_eq!(
+                stayed, punched,
+                "fail-stop must not rewrite the suffix away"
+            );
+        }
+        Ok(Some(snap)) => {
+            assert!(
+                snap.entries.contains_key("b") && snap.cursor.as_u64() == Some(2),
+                "mid-file NULs must not silent-drop a CRC-valid suffix; got keys={:?} cursor={:?}",
+                snap.entries.keys().collect::<Vec<_>>(),
+                snap.cursor.as_u64()
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }

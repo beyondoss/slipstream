@@ -783,9 +783,17 @@ fn parse_record(data: &[u8]) -> Result<(Record<'_>, usize), RecordError> {
         other => {
             // Trailing NUL slack (prealloc / torn copy) is a discarded tail,
             // not an invalid file. Mid-file unknown types still fail-stop.
+            // crc==0 && type==0 is trailing slack ONLY if the rest of the
+            // file is zeros; a hole in front of a CRC-valid suffix is
+            // mid-file junk (load must not compact that suffix away).
             let crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             if crc == 0 && other == 0 {
-                return Err(RecordError::Truncated);
+                if data.iter().all(|&b| b == 0) {
+                    return Err(RecordError::Truncated);
+                }
+                return Err(RecordError::Invalid(
+                    "mid-file zero hole before a non-zero suffix".into(),
+                ));
             }
             Err(RecordError::Invalid(format!(
                 "unknown record type: {other:#x}"
