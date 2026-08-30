@@ -1,14 +1,14 @@
 //! Comparative benchmarks for the on-disk [`SnapshotStore`] backends:
-//! `FjallSnapshot` vs `RocksDbSnapshot`, on the route-fold workload shape the
-//! backends are tuned for (clustered `route.svc-NNNNNN.NNNNNNNN` keys, ~200 B
-//! values, batched applies, point gets for existing keys, per-service prefix
-//! scans).
+//! `FjallSnapshot` vs `RocksDbSnapshot` vs `PedraDbSnapshot`, on the route-fold
+//! workload shape the backends are tuned for (clustered
+//! `route.svc-NNNNNN.NNNNNNNN` keys, ~200 B values, batched applies, point gets
+//! for existing keys, per-service prefix scans).
 //!
-//! Run with both backends enabled:
+//! Run with all three backends enabled:
 //!
 //! ```text
-//! cargo bench --bench snapshot_backends --features fjall,rocksdb
-//! SLIPSTREAM_BENCH_ENTRIES=4000000 cargo bench --bench snapshot_backends --features fjall,rocksdb
+//! cargo bench --bench snapshot_backends --features fjall,rocksdb,pedradb
+//! SLIPSTREAM_BENCH_ENTRIES=4000000 cargo bench --bench snapshot_backends --features fjall,rocksdb,pedradb
 //! ```
 //!
 //! Env knobs: `SLIPSTREAM_BENCH_ENTRIES` (default 1_000_000),
@@ -27,8 +27,8 @@ use std::path::Path;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use slipstream::snapshot::SnapshotStore;
 use slipstream::{
-    FjallConfig, FjallSnapshot, KvEntry, KvUpdate, RocksDbConfig, RocksDbSnapshot, VersionToken,
-    WatchCursor,
+    FjallConfig, FjallSnapshot, KvEntry, KvUpdate, PedraDbConfig, PedraDbSnapshot, RocksDbConfig,
+    RocksDbSnapshot, VersionToken, WatchCursor,
 };
 use tempfile::TempDir;
 
@@ -186,6 +186,14 @@ fn open_rocksdb(path: &Path) -> RocksDbSnapshot {
     RocksDbSnapshot::open(path, config).expect("open rocksdb").1
 }
 
+fn open_pedradb(path: &Path) -> PedraDbSnapshot {
+    let mut config = PedraDbConfig::default();
+    if let Some(bytes) = cache_bytes() {
+        config.cache_size_bytes = bytes;
+    }
+    PedraDbSnapshot::open(path, config).expect("open pedradb").1
+}
+
 fn bench_apply_hydrate(c: &mut Criterion) {
     let n = entries();
     let vlen = value_bytes();
@@ -223,6 +231,17 @@ fn bench_apply_hydrate(c: &mut Criterion) {
             || TempDir::new().unwrap(),
             |dir| {
                 let mut s = open_rocksdb(&dir.path().join("store"));
+                hydrate(&mut s, n, &pool, vlen);
+                dir
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    g.bench_function(BenchmarkId::new("pedradb", n), |b| {
+        b.iter_batched(
+            || TempDir::new().unwrap(),
+            |dir| {
+                let mut s = open_pedradb(&dir.path().join("store"));
                 hydrate(&mut s, n, &pool, vlen);
                 dir
             },
@@ -289,10 +308,33 @@ fn bench_reads(c: &mut Criterion) {
     );
     let rocks_reader = rocks.reader();
 
+    let pedra_dir = TempDir::new().unwrap();
+    let mut pedra = open_pedradb(&pedra_dir.path().join("store"));
+    let started = std::time::Instant::now();
+    hydrate(&mut pedra, n, &pool, vlen);
+    let secs = started.elapsed().as_secs_f64();
+    let bytes = dir_size_bytes(pedra_dir.path());
+    eprintln!(
+        "hydrate/pedradb: {n} entries in {secs:.1}s ({:.2}M entries/s); on disk \
+         {:.2} GiB ({:.0} B/entry)",
+        n as f64 / secs / 1e6,
+        bytes as f64 / (1u64 << 30) as f64,
+        bytes as f64 / n as f64,
+    );
+    let started = std::time::Instant::now();
+    pedra.settle().expect("settle pedradb");
+    let settled_bytes = dir_size_bytes(pedra_dir.path());
+    eprintln!(
+        "settle/pedradb: {:.1}s; on disk after {:.2} GiB",
+        started.elapsed().as_secs_f64(),
+        settled_bytes as f64 / (1u64 << 30) as f64,
+    );
+    let pedra_reader = pedra.reader();
+
     // --- Cold-read latency distributions (percentiles, not criterion means).
     // 10k uniform random probes each; "miss" keys share the key shape but name
-    // services that were never written. Run-order caveat: rocksdb hydrated
-    // last, so a slice of its store is page-cache-resident that fjall's isn't.
+    // services that were never written. Run-order caveat: later backends get
+    // more page-cache residency from earlier hydrations.
     probe_percentiles("probe_hit/fjall", |i| {
         let _ = black_box(fjall.get(&key(i)).expect("get"));
     });
@@ -304,6 +346,12 @@ fn bench_reads(c: &mut Criterion) {
     });
     probe_percentiles("probe_miss/rocksdb", |i| {
         let _ = black_box(rocks.get(&miss_key(i)).expect("get"));
+    });
+    probe_percentiles("probe_hit/pedradb", |i| {
+        let _ = black_box(pedra.get(&key(i)).expect("get"));
+    });
+    probe_percentiles("probe_miss/pedradb", |i| {
+        let _ = black_box(pedra.get(&miss_key(i)).expect("get"));
     });
 
     // --- Point gets for existing keys, uniform over the whole fold. ---
@@ -329,6 +377,13 @@ fn bench_reads(c: &mut Criterion) {
         b.iter(|| {
             let i = (next_rand(&mut rocks_state) % n as u64) as usize;
             black_box(rocks.get(&key(i)).expect("get"))
+        });
+    });
+    let mut pedra_state = 0xDEAD_BEEFu64;
+    g.bench_function("pedradb", |b| {
+        b.iter(|| {
+            let i = (next_rand(&mut pedra_state) % n as u64) as usize;
+            black_box(pedra.get(&key(i)).expect("get"))
         });
     });
     g.finish();
@@ -362,9 +417,21 @@ fn bench_reads(c: &mut Criterion) {
             black_box(count)
         });
     });
+    g.bench_function("pedradb", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            pedra
+                .for_each_in_range(&prefix, |e| {
+                    count += black_box(e.value.len());
+                    Ok(())
+                })
+                .expect("scan");
+            black_box(count)
+        });
+    });
     g.finish();
 
-    // --- Batched lookups (rocksdb-only API): one MultiGet vs 100 gets. ---
+    // --- Batched lookups: MultiGet vs 100 gets (rocksdb + pedradb). ---
     // Fresh random keys EVERY iteration, generated in `iter_batched` setup so
     // key construction is excluded from the timing. A fixed key set would be
     // cache-hot after criterion's warmup and measure only per-call overhead —
@@ -402,6 +469,32 @@ fn bench_reads(c: &mut Criterion) {
             |keys| {
                 black_box(
                     rocks_reader
+                        .multi_get(keys.iter().map(String::as_str))
+                        .expect("multi_get"),
+                )
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let mut pedra_loop_state = 0xC0DE_BEEFu64;
+    g.bench_function("pedradb_get_loop", |b| {
+        b.iter_batched(
+            || make_keys(&mut pedra_loop_state),
+            |keys| {
+                for k in &keys {
+                    black_box(pedra_reader.get(k).expect("get"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let mut pedra_mg_state = 0xFEED_FACEu64;
+    g.bench_function("pedradb_multi_get", |b| {
+        b.iter_batched(
+            || make_keys(&mut pedra_mg_state),
+            |keys| {
+                black_box(
+                    pedra_reader
                         .multi_get(keys.iter().map(String::as_str))
                         .expect("multi_get"),
                 )

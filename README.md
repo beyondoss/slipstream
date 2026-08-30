@@ -34,7 +34,8 @@ NATS is a bounded log. Entries are evicted past `max_bytes` and `max_age`. Once 
 
 The cursor advances after `apply()` returns, not on receipt. A crash between delivery and application re-delivers on the next start instead of silently skipping. `watch_applied` enforces this invariant.
 
-For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold state on disk.
+For folds that outgrow RAM, `fjall` (pure Rust), `rocksdb`, and `pedradb`
+(pure-Rust LSM with a RocksDB-shaped API) backends hold state on disk.
 
 ## Install
 
@@ -48,6 +49,7 @@ On-disk snapshot backends are opt-in cargo features:
 ```toml
 beyond-slipstream = { version = "0.7", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
 beyond-slipstream = { version = "0.7", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
+beyond-slipstream = { version = "0.7", features = ["pedradb"] }   # PedraDB via rocksdb-compat (pure Rust; git dep)
 beyond-slipstream = { version = "0.7", features = ["transport"] } # export/import via object_store (S3, GCS, local)
 ```
 
@@ -70,6 +72,7 @@ beyond-slipstream = { version = "0.7", features = ["transport"] } # export/impor
 | `AppendLogSnapshot`  | Default `SnapshotStore`: the append-only log + an in-RAM fold (pure-Rust, small state) |
 | `FjallSnapshot`      | On-disk `SnapshotStore` for folds too large for RAM; queryable (`feature = "fjall"`) |
 | `RocksDbSnapshot`    | Same contract on RocksDB, for consumers who prefer the C++ LSM (`feature = "rocksdb"`) |
+| `PedraDbSnapshot`    | Same contract on [PedraDB](https://github.com/paulocsanz/pedradb) via `rocksdb-compat` (`feature = "pedradb"`) |
 | `watch_applied`      | Watch loop that advances the cursor only after your `apply` returns, folding into any `SnapshotStore` |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, global ordering) |
 
@@ -281,6 +284,7 @@ Every backend keeps the same invariants: the fold is a pure function of the log 
 | `AppendLogSnapshot` | **Default.** Fold fits in RAM (edge/tunnel-style services) | Pure-Rust, the append-only log above plus an in-RAM map serving `get`/`range`. No extra dependencies. |
 | `FjallSnapshot` | Fold too large for RAM (e.g. routing at ~1B keys) | On-disk [fjall](https://docs.rs/fjall) LSM, `feature = "fjall"`. Pure-Rust. Each `apply` is one atomic batch (data **and** cursor); durability (NO_SYNC vs fsync) is configurable. |
 | `RocksDbSnapshot` | Same as `FjallSnapshot`, preferring the battle-tested C++ LSM and its tooling (`ldb`, `sst_dump`) | On-disk [RocksDB](https://docs.rs/rust-rocksdb), `feature = "rocksdb"`. Each `apply` is one atomic `WriteBatch` (data **and** cursor); WAL always on, per-commit fsync configurable. Tuned for billion-key route folds (hit-optimized ribbon filters, partitioned index, zstd bottommost, batched `multi_get`). Builds C++ (needs a toolchain + libclang). |
+| `PedraDbSnapshot` | Same as `FjallSnapshot`, preferring a pure-Rust RocksDB-shaped LSM | On-disk [PedraDB](https://github.com/paulocsanz/pedradb) via `rocksdb-compat`, `feature = "pedradb"`. Each `apply` is one atomic `WriteBatch` (data **and** cursor); per-commit fsync configurable. Pre-1.0 git dependency. |
 
 Pick a backend, then hand it to [`watch_applied`](#applied-watch) — `load` returns the resume cursor alongside the store:
 
@@ -295,6 +299,9 @@ let (resume, store) = AppendLogSnapshot::load(Path::new("/var/lib/svc/state.snap
 
 // Or the same on RocksDB, behind `feature = "rocksdb"`:
 // let (resume, store) = RocksDbSnapshot::open(dir, RocksDbConfig { sync: false, ..Default::default() })?;
+
+// Or PedraDB, behind `feature = "pedradb"`:
+// let (resume, store) = PedraDbSnapshot::open(dir, PedraDbConfig { sync: false, ..Default::default() })?;
 
 let final_cursor = watch_applied(
     watcher, WatchScope::All, Some(resume),

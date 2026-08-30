@@ -1,7 +1,7 @@
 //! Shared on-disk value-record codec for the LSM-backed [`SnapshotStore`]
-//! backends (`FjallSnapshot`, `RocksDbSnapshot`).
+//! backends (`FjallSnapshot`, `RocksDbSnapshot`, `PedraDbSnapshot`).
 //!
-//! Both backends store the folded KV state as `key` → `[ver_len:u8][version
+//! All three backends store the folded KV state as `key` → `[ver_len:u8][version
 //! bytes][value bytes]`. Keeping the codec (and its corruption tests) in one
 //! place means the record format cannot drift between backends — a store
 //! written by one decodes identically in the other's terms.

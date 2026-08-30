@@ -33,7 +33,9 @@ pub mod protocol;
 pub mod snapshot;
 #[cfg(feature = "fjall")]
 mod snapshot_fjall;
-#[cfg(any(feature = "fjall", feature = "rocksdb"))]
+#[cfg(feature = "pedradb")]
+mod snapshot_pedradb;
+#[cfg(any(feature = "fjall", feature = "rocksdb", feature = "pedradb"))]
 mod snapshot_record;
 #[cfg(feature = "rocksdb")]
 mod snapshot_rocksdb;
@@ -52,6 +54,8 @@ pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
 pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
+#[cfg(feature = "pedradb")]
+pub use snapshot_pedradb::{PedraDbConfig, PedraDbReader, PedraDbSnapshot};
 #[cfg(feature = "rocksdb")]
 pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
 pub use stores::{
