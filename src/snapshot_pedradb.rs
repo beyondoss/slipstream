@@ -40,8 +40,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pedradb::checkpoint::Checkpoint;
-use pedradb::{
+use rocksdb_compat::checkpoint::Checkpoint;
+use rocksdb_compat::{
     ColumnFamily, ColumnFamilyDescriptor, Direction, ErrorKind, IteratorMode, Options, ReadOptions,
     WriteBatch, WriteOptions, DB,
 };
@@ -125,7 +125,7 @@ impl PedraDbSnapshot {
                     config.cache_size_bytes
                 ))
             })?;
-            db_opts.set_block_cache(&pedradb::Cache::new_lru_cache(capacity));
+            db_opts.set_block_cache(&rocksdb_compat::Cache::new_lru_cache(capacity));
         }
 
         let mut data_opts = Options::default();
@@ -464,7 +464,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn map_pedradb(e: pedradb::Error) -> SnapshotError {
+fn map_pedradb(e: rocksdb_compat::Error) -> SnapshotError {
     match e.kind() {
         ErrorKind::Io => SnapshotError::Io(std::io::Error::other(e.to_string())),
         // Deliberately NOT mapping Corruption → SnapshotError::Corrupted:
