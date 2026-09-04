@@ -1,20 +1,20 @@
 # Snapshot Backends
 
-Three [`SnapshotStore`] backends ship with slipstream. Pick one based on fold size
+Four [`SnapshotStore`] backends ship with slipstream. Pick one based on fold size
 and read pattern.
 
 ## Quick reference
 
-| | `AppendLogSnapshot` | `FjallSnapshot` | `RocksDbSnapshot` |
-|---|---|---|---|
-| Feature flag | (default) | `fjall` | `rocksdb` |
-| Build deps | none | none | C++ toolchain, libclang |
-| Fold size | fits in RAM | any | any |
-| Cold get p50 (500M routes) | n/a | 542 µs | 292 µs |
-| Cold get p999 (500M routes) | n/a | 3.7 ms | 898 µs |
-| Hydrate + settle (500M) | n/a | 40 min | 43 min |
-| Disk per entry (500M) | n/a | 226 B | 245 B |
-| `settle()` cost (500M) | n/a | ~19 min, 2x disk | ~40 s |
+| | `AppendLogSnapshot` | `FjallSnapshot` | `RocksDbSnapshot` | `PedraDbSnapshot` |
+|---|---|---|---|---|
+| Feature flag | (default) | `fjall` | `rocksdb` | `pedradb` |
+| Build deps | none | none | C++ toolchain, libclang | none (pure Rust; git dep today) |
+| Fold size | fits in RAM | any | any | any |
+| Cold get p50 (500M routes) | n/a | 542 µs | 292 µs | *run `snapshot_backends`* |
+| Cold get p999 (500M routes) | n/a | 3.7 ms | 898 µs | *run `snapshot_backends`* |
+| Hydrate + settle (500M) | n/a | 40 min | 43 min | *run `snapshot_backends`* |
+| Disk per entry (500M) | n/a | 226 B | 245 B | *run `snapshot_backends`* |
+| `settle()` cost (500M) | n/a | ~19 min, 2x disk | ~40 s | flush + full compact |
 
 ## Choosing
 
@@ -26,22 +26,29 @@ write throughput matters more than cold-read tail latency.
 **`RocksDbSnapshot`**: fold is too large for RAM; cold-read tail latency or settle
 time matters; operational tooling (`ldb`, `sst_dump`) is useful.
 
-Total time-to-serving-ready at 500M routes is a wash (2602 s fjall, 2593 s
-rocksdb). The divergence is tail latency and settle cost.
+**`PedraDbSnapshot`**: fold is too large for RAM; want a pure-Rust LSM with a
+RocksDB-shaped API ([PedraDB](https://github.com/paulocsanz/pedradb) via
+`rocksdb-compat`). Pre-1.0; compare with `cargo bench --bench snapshot_backends
+--features fjall,rocksdb,pedradb`.
+
+Total time-to-serving-ready at 500M routes is a wash between fjall and rocksdb
+(2602 s fjall, 2593 s rocksdb). The divergence is tail latency and settle cost.
+Pedra numbers land in the comparative bench output once you run it.
 
 ## Benchmark data
 
 All numbers: 500M routes, ~60 B keys, ~200 B incompressible values, 1 GiB block
-cache, NVMe ext4, settled trees. Source: `benches/snapshot_backends.rs`.
+cache, NVMe ext4, settled trees. Source: `benches/snapshot_backends.rs`
+(`--features fjall,rocksdb,pedradb`).
 
 ### Hydration (`apply` path, 1024-update batches)
 
-| | fjall | rocksdb |
-|---|---|---|
-| 50M routes | 47 s (1.06 M/s) | 121 s (0.41 M/s) |
-| 100M routes | 110 s (0.91 M/s) | 344 s (0.29 M/s) |
-| 250M routes | 480 s (0.52 M/s) | 1165 s (0.21 M/s) |
-| 500M routes | 1475 s (0.34 M/s) | 2552 s (0.20 M/s) |
+| | fjall | rocksdb | pedradb |
+|---|---|---|---|
+| 50M routes | 47 s (1.06 M/s) | 121 s (0.41 M/s) | *bench* |
+| 100M routes | 110 s (0.91 M/s) | 344 s (0.29 M/s) | *bench* |
+| 250M routes | 480 s (0.52 M/s) | 1165 s (0.21 M/s) | *bench* |
+| 500M routes | 1475 s (0.34 M/s) | 2552 s (0.20 M/s) | *bench* |
 
 fjall throughput decays with scale as compaction debt accumulates during
 hydration; rocksdb drains that debt concurrently.
@@ -123,5 +130,13 @@ store.settle()?; // ~19 min at 500M routes; budget 2x disk headroom
 let reader = store.reader();
 ```
 
-Both backends implement [`SnapshotStore`], so the `watch_applied` integration
-is identical regardless of which you choose.
+```rust
+use slipstream::{PedraDbConfig, PedraDbSnapshot, SnapshotStore};
+
+let (cursor, mut store) = PedraDbSnapshot::open(path, PedraDbConfig::default())?;
+store.settle()?; // flush + full compact (Pedra's wait_for_compact is a no-op)
+let reader = store.reader();
+```
+
+All three on-disk backends implement [`SnapshotStore`], so the `watch_applied`
+integration is identical regardless of which you choose.

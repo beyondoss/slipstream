@@ -1,16 +1,17 @@
 //! Backend-agnostic conformance suite for [`SnapshotStore`].
 //!
 //! Every check is written generically over a backend and an `open` closure, then
-//! instantiated for each shipped backend: [`AppendLogSnapshot`] (always) and
-//! `FjallSnapshot` (behind `--features fjall`), and `RocksDbSnapshot` (behind
-//! `--features rocksdb`). New backends get the whole suite by adding two
-//! wrapper lines.
+//! instantiated for each shipped backend: [`AppendLogSnapshot`] (always),
+//! `FjallSnapshot` (behind `--features fjall`), `RocksDbSnapshot` (behind
+//! `--features rocksdb`), and `PedraDbSnapshot` (behind `--features pedradb`).
+//! New backends get the whole suite by adding two wrapper lines.
 //!
 //! Run the full matrix with:
 //! ```text
 //! cargo test --test snapshot_store
 //! cargo test --test snapshot_store --features fjall
 //! cargo test --test snapshot_store --features rocksdb
+//! cargo test --test snapshot_store --features pedradb
 //! ```
 
 use std::path::Path;
@@ -1306,6 +1307,250 @@ mod rocksdb_backend {
             },
         )
         .expect("reopen rocksdb sync");
+        assert_eq!(cursor.as_u64(), Some(7));
+        assert_eq!(dump(&s), expected_state());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PedraDbSnapshot — on-disk PedraDB backend (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pedradb")]
+mod pedradb_backend {
+    use super::*;
+    use slipstream::{PedraDbConfig, PedraDbSnapshot};
+
+    fn open_no_sync(path: &Path) -> (WatchCursor, PedraDbSnapshot) {
+        PedraDbSnapshot::open(
+            path,
+            PedraDbConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+        .expect("open pedradb")
+    }
+
+    #[test]
+    fn pedradb_round_trip() {
+        check_round_trip(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_get_range() {
+        check_get_range(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_for_each_in_range() {
+        check_for_each_in_range(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_cursor_resume() {
+        check_cursor_resume(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_pure_fold_property() {
+        check_property_pure_fold(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_purge() {
+        check_purge(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_empty_batch_advances_cursor() {
+        check_empty_batch_advances_cursor(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_empty_value_round_trip() {
+        check_empty_value_round_trip(open_no_sync);
+    }
+
+    fn import_pedradb(
+        artifact: &Path,
+        dest: &Path,
+    ) -> Result<(WatchCursor, PedraDbSnapshot), SnapshotError> {
+        PedraDbSnapshot::import(
+            artifact,
+            dest,
+            PedraDbConfig {
+                sync: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pedradb_export_import_round_trip() {
+        check_export_import_round_trip(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_resume_continues_fold() {
+        check_import_resume_continues_fold(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_tampered_payload() {
+        check_import_rejects_tampered_payload(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_missing_payload_file() {
+        check_import_rejects_missing_payload_file(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_undeclared_extra_file() {
+        check_import_rejects_undeclared_extra_file(open_no_sync, import_pedradb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pedradb_import_rejects_symlink_in_payload() {
+        check_import_rejects_symlink_in_payload(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_wrong_backend() {
+        check_import_rejects_wrong_backend(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_schema_version() {
+        check_import_rejects_schema_version(open_no_sync, import_pedradb);
+    }
+
+    // No `pedradb_import_rejects_backend_version`: same as RocksDB — the
+    // manifest's backend_version is informational; Pedra's own open is the
+    // arbiter of on-disk compatibility.
+
+    #[test]
+    fn pedradb_import_rejects_cursor_mismatch() {
+        check_import_rejects_cursor_mismatch(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_import_rejects_nonempty_dest() {
+        check_import_rejects_nonempty_dest(open_no_sync, import_pedradb);
+    }
+
+    #[test]
+    fn pedradb_export_rejects_nonempty_dest() {
+        check_export_rejects_nonempty_dest(open_no_sync);
+    }
+
+    #[test]
+    fn pedradb_export_empty_store() {
+        check_export_empty_store(open_no_sync, import_pedradb);
+    }
+
+    /// `settle` (flush + compact) must preserve the fold byte-for-byte.
+    #[test]
+    fn pedradb_settle_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &stream());
+        s.settle().expect("settle");
+        assert_eq!(dump(&s), expected_state(), "state survives settle");
+    }
+
+    /// NO_SYNC crash-tail recovery. Same invariants as the RocksDB case:
+    /// after reopen the recovered cursor matches the recovered data, and
+    /// re-folding the tail from that cursor is idempotent.
+    #[test]
+    fn pedradb_no_sync_tail_is_consistent_and_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let updates = stream();
+
+        {
+            let (_r, mut s) = open_no_sync(&path);
+            fold(&mut s, &updates);
+        }
+
+        let (cursor, mut s) = open_no_sync(&path);
+        assert_eq!(cursor.as_u64(), Some(7));
+        assert_eq!(dump(&s), expected_state());
+
+        fold(&mut s, &updates);
+        assert_eq!(
+            dump(&s),
+            expected_state(),
+            "re-folding the tail is idempotent"
+        );
+    }
+
+    #[test]
+    fn pedradb_multi_get_matches_get() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let (_r, mut s) = open_no_sync(&path);
+        fold(&mut s, &stream());
+        s.apply(&[put("lock", b"", 8)], &WatchCursor::from_u64(8))
+            .expect("apply lock");
+        let reader = s.reader();
+
+        let keys = [
+            "node.a",
+            "missing",
+            "node.b",
+            "lock",
+            "node.a",
+        ];
+        let got = reader.multi_get(keys.iter().copied()).expect("multi_get");
+
+        assert_eq!(got.len(), keys.len(), "positionally aligned with input");
+        for (key, entry) in keys.iter().zip(&got) {
+            let single = reader.get(key).expect("get");
+            assert_eq!(
+                entry.as_ref().map(|e| (&e.key, &e.value)),
+                single.as_ref().map(|e| (&e.key, &e.value)),
+                "multi_get and get disagree for {key:?}"
+            );
+        }
+        assert!(got[0].is_some(), "live key resolves");
+        assert!(got[1].is_none(), "missing key is None");
+        assert!(got[2].is_none(), "deleted key is None");
+        assert!(
+            got[3].as_ref().is_some_and(|e| e.value.is_empty()),
+            "empty value is present, not confused with a delete"
+        );
+
+        let empty = reader.multi_get(std::iter::empty()).expect("empty input");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn pedradb_sync_mode_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        {
+            let (_r, mut s) = PedraDbSnapshot::open(
+                &path,
+                PedraDbConfig {
+                    sync: true,
+                    ..Default::default()
+                },
+            )
+            .expect("open pedradb sync");
+            fold(&mut s, &stream());
+        }
+        let (cursor, s) = PedraDbSnapshot::open(
+            &path,
+            PedraDbConfig {
+                sync: true,
+                ..Default::default()
+            },
+        )
+        .expect("reopen pedradb sync");
         assert_eq!(cursor.as_u64(), Some(7));
         assert_eq!(dump(&s), expected_state());
     }

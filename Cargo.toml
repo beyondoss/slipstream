@@ -28,6 +28,9 @@ crc32fast = "1"
 fjall = { version = "3", optional = true }
 futures = "0.3"
 object_store = { version = "0.13.2", optional = true, features = ["aws", "fs"] }
+# PedraDB's rocksdb-compat crate (rust-rocksdb-shaped API on a pure-Rust LSM).
+# Pre-1.0; not yet on crates.io — pin the git repo until a tagged release.
+rocksdb-compat = { git = "https://github.com/paulocsanz/pedradb", rev = "5b6789c9731388c0fb51801e2b73f80981128ed3", optional = true }
 rocksdb = { package = "rust-rocksdb", version = "0.50", optional = true, default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,11 +61,12 @@ harness = false
 [[bench]]
 name = "snapshot_backends"
 harness = false
-required-features = ["fjall", "rocksdb"]
+required-features = ["fjall", "rocksdb", "pedradb"]
 
 [features]
 fjall = ["dep:fjall"]
 rocksdb = ["dep:rocksdb"]
+pedradb = ["dep:rocksdb-compat"]
 # Artifact transport: tar wire format + object_store (S3/GCS/Azure/local-fs)
 # upload/download, plus run_export_round. tokio/fs streams downloads to disk.
 transport = ["dep:object_store", "dep:tar", "tokio/fs"]
