@@ -1622,7 +1622,7 @@ dependencies = [
 [[package]]
 name = "pedradb-core"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1636,7 +1636,7 @@ dependencies = [
 [[package]]
 name = "pedradb-io-uring"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 dependencies = [
  "io-uring",
  "parking_lot",
@@ -1647,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "pedradb-ops"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 dependencies = [
  "crc32c",
  "pedradb-core",
@@ -1658,12 +1658,12 @@ dependencies = [
 [[package]]
 name = "pedradb-posix"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 
 [[package]]
 name = "pedradb-sim"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 dependencies = [
  "pedradb-core",
 ]
@@ -2091,7 +2091,7 @@ dependencies = [
 [[package]]
 name = "rocksdb-compat"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb#3c12c7cedf1c97cc244372bd3978f8782b3f542e"
+source = "git+https://github.com/paulocsanz/pedradb?rev=5b6789c9731388c0fb51801e2b73f80981128ed3#5b6789c9731388c0fb51801e2b73f80981128ed3"
 dependencies = [
  "bytes",
  "crc32c",
