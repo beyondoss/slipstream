@@ -1,20 +1,23 @@
 //! Comparative benchmarks for the on-disk [`SnapshotStore`] backends:
-//! `FjallSnapshot` vs `RocksDbSnapshot`, on the route-fold workload shape the
-//! backends are tuned for (clustered `route.svc-NNNNNN.NNNNNNNN` keys, ~200 B
-//! values, batched applies, point gets for existing keys, per-service prefix
-//! scans).
+//! `FjallSnapshot` vs `RocksDbSnapshot` vs `PedraDbSnapshot`, on the route-fold
+//! workload shape the backends are tuned for (clustered
+//! `route.svc-NNNNNN.NNNNNNNN` keys, ~200 B values, batched applies, point gets
+//! for existing keys, per-service prefix scans).
 //!
-//! Run with both backends enabled:
+//! Run with all three backends enabled:
 //!
 //! ```text
-//! cargo bench --bench snapshot_backends --features fjall,rocksdb
-//! SLIPSTREAM_BENCH_ENTRIES=4000000 cargo bench --bench snapshot_backends --features fjall,rocksdb
+//! cargo bench --bench snapshot_backends --features fjall,rocksdb,pedradb
+//! SLIPSTREAM_BENCH_ENTRIES=4000000 cargo bench --bench snapshot_backends --features fjall,rocksdb,pedradb
+//! SLIPSTREAM_BENCH_ENTRIES=1000000000 cargo bench --bench snapshot_backends --features fjall,rocksdb,pedradb
 //! ```
 //!
 //! Env knobs: `SLIPSTREAM_BENCH_ENTRIES` (default 1_000_000),
-//! `SLIPSTREAM_BENCH_VALUE_BYTES` (default 200), and
-//! `SLIPSTREAM_BENCH_CACHE_BYTES` (default: each backend's default cache) for
-//! measuring cache-size sensitivity, e.g. 32 MiB vs 2 GiB.
+//! `SLIPSTREAM_BENCH_VALUE_BYTES` (default 200),
+//! `SLIPSTREAM_BENCH_CACHE_BYTES` (default: each backend's default cache),
+//! `SLIPSTREAM_BENCH_BACKENDS` (comma list: `fjall,rocksdb,pedradb`; default all),
+//! `SLIPSTREAM_BENCH_SEQUENTIAL=1` (force one-backend-at-a-time; auto-on when
+//! entries ≥ 50M so a 1B fold fits on ~250 GiB disks).
 //!
 //! Caveats for honest numbers: `TempDir` honors `TMPDIR` — point it at real
 //! NVMe, not tmpfs, when disk behavior matters. Criterion's repeated iterations
@@ -27,8 +30,8 @@ use std::path::Path;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use slipstream::snapshot::SnapshotStore;
 use slipstream::{
-    FjallConfig, FjallSnapshot, KvEntry, KvUpdate, RocksDbConfig, RocksDbSnapshot, VersionToken,
-    WatchCursor,
+    FjallConfig, FjallSnapshot, KvEntry, KvUpdate, PedraDbConfig, PedraDbSnapshot, RocksDbConfig,
+    RocksDbReader, RocksDbSnapshot, PedraDbReader, VersionToken, WatchCursor,
 };
 use tempfile::TempDir;
 
@@ -39,6 +42,25 @@ const APPLY_BATCH: usize = 1024;
 /// Pseudo-random pool the entry values are sliced from (so compression sees
 /// realistic entropy instead of a constant byte).
 const VALUE_POOL_BYTES: usize = 1 << 20;
+/// Above this size, keep only one backend on disk at a time (1B ≈ 220–320 GiB).
+const SEQUENTIAL_ENTRIES: usize = 50_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Fjall,
+    RocksDb,
+    PedraDb,
+}
+
+impl Backend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fjall => "fjall",
+            Self::RocksDb => "rocksdb",
+            Self::PedraDb => "pedradb",
+        }
+    }
+}
 
 fn entries() -> usize {
     std::env::var("SLIPSTREAM_BENCH_ENTRIES")
@@ -52,6 +74,31 @@ fn value_bytes() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200)
+}
+
+fn backends() -> Vec<Backend> {
+    let raw = std::env::var("SLIPSTREAM_BENCH_BACKENDS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return vec![Backend::Fjall, Backend::RocksDb, Backend::PedraDb];
+    }
+    raw.split(',')
+        .filter_map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "fjall" => Some(Backend::Fjall),
+            "rocksdb" | "rocks" => Some(Backend::RocksDb),
+            "pedradb" | "pedra" => Some(Backend::PedraDb),
+            other => {
+                eprintln!("snapshot_backends: ignoring unknown backend {other:?}");
+                None
+            }
+        })
+        .collect()
+}
+
+fn sequential_mode(n: usize) -> bool {
+    std::env::var("SLIPSTREAM_BENCH_SEQUENTIAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || n >= SEQUENTIAL_ENTRIES
 }
 
 /// Deterministic xorshift64* step — repeatable key/value choice across runs.
@@ -92,6 +139,8 @@ fn value_for(pool: &[u8], i: usize, len: usize) -> &[u8] {
 fn hydrate<S: SnapshotStore>(store: &mut S, n: usize, pool: &[u8], vlen: usize) {
     let mut batch = Vec::with_capacity(APPLY_BATCH);
     let mut i = 0usize;
+    let progress_every = if n >= 10_000_000 { 10_000_000 } else { usize::MAX };
+    let started = std::time::Instant::now();
     while i < n {
         batch.clear();
         let end = (i + APPLY_BATCH).min(n);
@@ -106,19 +155,21 @@ fn hydrate<S: SnapshotStore>(store: &mut S, n: usize, pool: &[u8], vlen: usize) 
             .apply(&batch, &WatchCursor::from_u64(end as u64))
             .expect("apply");
         i = end;
+        if i % progress_every == 0 || i == n {
+            let secs = started.elapsed().as_secs_f64().max(1e-9);
+            eprintln!(
+                "  hydrate progress: {i}/{n} ({:.1}%, {:.2}M entries/s)",
+                100.0 * i as f64 / n as f64,
+                i as f64 / secs / 1e6,
+            );
+        }
     }
 }
 
-/// A key shaped like the fold's keys but in a service range that is never
-/// hydrated — the absent-key (unknown service) lookup.
 fn miss_key(i: usize) -> String {
     format!("route.svc-9{:06}.{:08}", i % 999_999, i % 1000)
 }
 
-/// 10k uniform random single-key probes, reported as a latency distribution.
-/// Criterion's mean-of-batches hides exactly the tail this exists to surface
-/// (a 200 µs p50 with a 100 ms p999 and "everything is 10 ms" have the same
-/// mean and opposite fixes).
 fn probe_percentiles(label: &str, mut op: impl FnMut(usize)) {
     const PROBES: usize = 10_000;
     let n = entries();
@@ -148,9 +199,6 @@ fn cache_bytes() -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Recursive on-disk size of a store directory, for the post-hydration space
-/// report (WAL/journal and not-yet-compacted overhead included — this is what
-/// the disk actually holds after a hydration).
 fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -170,6 +218,18 @@ fn dir_size_bytes(path: &Path) -> u64 {
     total
 }
 
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .args(["-B1", "--output=avail"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse().ok())
+}
+
 fn open_fjall(path: &Path) -> FjallSnapshot {
     let mut config = FjallConfig::default();
     if let Some(bytes) = cache_bytes() {
@@ -186,15 +246,47 @@ fn open_rocksdb(path: &Path) -> RocksDbSnapshot {
     RocksDbSnapshot::open(path, config).expect("open rocksdb").1
 }
 
+fn open_pedradb(path: &Path) -> PedraDbSnapshot {
+    let mut config = PedraDbConfig::default();
+    if let Some(bytes) = cache_bytes() {
+        config.cache_size_bytes = bytes;
+    }
+    PedraDbSnapshot::open(path, config).expect("open pedradb").1
+}
+
+fn maybe_settle(name: &str, dir: &Path, settle: impl FnOnce() -> Result<(), String>) {
+    let size = dir_size_bytes(dir);
+    let free = free_disk_bytes(dir).unwrap_or(u64::MAX);
+    // fjall settle rewrites the tree and can peak ~2× the hydrated size.
+    // Require 2.1× free headroom or skip; 1.3× starts a compact that fills
+    // the disk (measured: 500M fjall hydrate is ~105 GiB, settle climbs past
+    // 150 GiB on a 254 GiB volume).
+    if free < size.saturating_mul(21) / 10 {
+        eprintln!(
+            "settle/{name}: SKIPPED — need ~{:.1} GiB free for settle headroom, have {:.1} GiB \
+             (store is {:.1} GiB)",
+            size as f64 * 2.1 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64,
+            size as f64 / (1u64 << 30) as f64,
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    settle().unwrap_or_else(|e| panic!("settle {name}: {e}"));
+    let settled_bytes = dir_size_bytes(dir);
+    eprintln!(
+        "settle/{name}: {:.1}s; on disk after {:.2} GiB",
+        started.elapsed().as_secs_f64(),
+        settled_bytes as f64 / (1u64 << 30) as f64,
+    );
+}
+
 fn bench_apply_hydrate(c: &mut Criterion) {
     let n = entries();
     let vlen = value_bytes();
     let pool = value_pool();
+    let selected = backends();
 
-    // Criterion runs at least 10 samples; 10 full hydrations beyond a few
-    // million entries is hours. At large scale, skip this group — the read
-    // benchmarks' setup (`bench_reads`) times its one-shot hydration of each
-    // backend and prints the throughput instead.
     if n > 8_000_000 {
         eprintln!(
             "apply_hydrate: skipped at {n} entries (>8M); see the one-shot \
@@ -207,26 +299,271 @@ fn bench_apply_hydrate(c: &mut Criterion) {
     g.sample_size(10);
     g.throughput(Throughput::Elements(n as u64));
 
-    g.bench_function(BenchmarkId::new("fjall", n), |b| {
+    if selected.contains(&Backend::Fjall) {
+        g.bench_function(BenchmarkId::new("fjall", n), |b| {
+            b.iter_batched(
+                || TempDir::new().unwrap(),
+                |dir| {
+                    let mut s = open_fjall(&dir.path().join("store"));
+                    hydrate(&mut s, n, &pool, vlen);
+                    dir
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    if selected.contains(&Backend::RocksDb) {
+        g.bench_function(BenchmarkId::new("rocksdb", n), |b| {
+            b.iter_batched(
+                || TempDir::new().unwrap(),
+                |dir| {
+                    let mut s = open_rocksdb(&dir.path().join("store"));
+                    hydrate(&mut s, n, &pool, vlen);
+                    dir
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    if selected.contains(&Backend::PedraDb) {
+        g.bench_function(BenchmarkId::new("pedradb", n), |b| {
+            b.iter_batched(
+                || TempDir::new().unwrap(),
+                |dir| {
+                    let mut s = open_pedradb(&dir.path().join("store"));
+                    hydrate(&mut s, n, &pool, vlen);
+                    dir
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    g.finish();
+}
+
+fn report_hydrate(name: &str, n: usize, dir: &Path, secs: f64) {
+    let bytes = dir_size_bytes(dir);
+    eprintln!(
+        "hydrate/{name}: {n} entries in {secs:.1}s ({:.2}M entries/s); on disk \
+         {:.2} GiB ({:.0} B/entry)",
+        n as f64 / secs / 1e6,
+        bytes as f64 / (1u64 << 30) as f64,
+        bytes as f64 / n as f64,
+    );
+}
+
+fn bench_one_backend_reads(
+    c: &mut Criterion,
+    backend: Backend,
+    n: usize,
+    pool: &[u8],
+    vlen: usize,
+) {
+    let name = backend.name();
+    eprintln!("=== backend {name} (n={n}) ===");
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().join("store");
+
+    match backend {
+        Backend::Fjall => {
+            let mut store = open_fjall(&store_path);
+            let started = std::time::Instant::now();
+            hydrate(&mut store, n, pool, vlen);
+            report_hydrate(name, n, dir.path(), started.elapsed().as_secs_f64());
+            maybe_settle(name, dir.path(), || {
+                store.settle().map_err(|e| e.to_string())
+            });
+            probe_percentiles(&format!("probe_hit/{name}"), |i| {
+                let _ = black_box(store.get(&key(i)).expect("get"));
+            });
+            probe_percentiles(&format!("probe_miss/{name}"), |i| {
+                let _ = black_box(store.get(&miss_key(i)).expect("get"));
+            });
+            bench_get_hit(c, name, n, |i| store.get(&key(i)).expect("get"));
+            bench_prefix_scan(c, name, n, |prefix, f| {
+                store
+                    .for_each_in_range(prefix, |e| f(e))
+                    .expect("scan");
+            });
+        }
+        Backend::RocksDb => {
+            let mut store = open_rocksdb(&store_path);
+            let started = std::time::Instant::now();
+            hydrate(&mut store, n, pool, vlen);
+            report_hydrate(name, n, dir.path(), started.elapsed().as_secs_f64());
+            maybe_settle(name, dir.path(), || {
+                store.settle().map_err(|e| e.to_string())
+            });
+            let reader = store.reader();
+            probe_percentiles(&format!("probe_hit/{name}"), |i| {
+                let _ = black_box(store.get(&key(i)).expect("get"));
+            });
+            probe_percentiles(&format!("probe_miss/{name}"), |i| {
+                let _ = black_box(store.get(&miss_key(i)).expect("get"));
+            });
+            bench_get_hit(c, name, n, |i| store.get(&key(i)).expect("get"));
+            bench_prefix_scan(c, name, n, |prefix, f| {
+                store
+                    .for_each_in_range(prefix, |e| f(e))
+                    .expect("scan");
+            });
+            bench_lookup_100(c, name, n, &reader);
+        }
+        Backend::PedraDb => {
+            let mut store = open_pedradb(&store_path);
+            let started = std::time::Instant::now();
+            hydrate(&mut store, n, pool, vlen);
+            report_hydrate(name, n, dir.path(), started.elapsed().as_secs_f64());
+            maybe_settle(name, dir.path(), || {
+                store.settle().map_err(|e| e.to_string())
+            });
+            let reader = store.reader();
+            probe_percentiles(&format!("probe_hit/{name}"), |i| {
+                let _ = black_box(store.get(&key(i)).expect("get"));
+            });
+            probe_percentiles(&format!("probe_miss/{name}"), |i| {
+                let _ = black_box(store.get(&miss_key(i)).expect("get"));
+            });
+            bench_get_hit(c, name, n, |i| store.get(&key(i)).expect("get"));
+            bench_prefix_scan(c, name, n, |prefix, f| {
+                store
+                    .for_each_in_range(prefix, |e| f(e))
+                    .expect("scan");
+            });
+            bench_lookup_100_pedra(c, name, n, &reader);
+        }
+    }
+    eprintln!("=== done {name}; freeing disk ===");
+    drop(dir);
+}
+
+fn bench_get_hit<F>(c: &mut Criterion, name: &str, n: usize, mut get: F)
+where
+    F: FnMut(usize) -> Option<KvEntry>,
+{
+    let mut g = c.benchmark_group("get_hit");
+    g.throughput(Throughput::Elements(1));
+    // Shorter measurement at huge N — each coldish get can be hundreds of µs.
+    if n >= SEQUENTIAL_ENTRIES {
+        g.sample_size(30);
+        g.warm_up_time(std::time::Duration::from_secs(2));
+        g.measurement_time(std::time::Duration::from_secs(10));
+    }
+    let mut state = 0xDEAD_BEEFu64;
+    g.bench_function(name, |b| {
+        b.iter(|| {
+            let i = (next_rand(&mut state) % n as u64) as usize;
+            black_box(get(i))
+        });
+    });
+    g.finish();
+}
+
+fn bench_prefix_scan<F>(c: &mut Criterion, name: &str, n: usize, mut scan: F)
+where
+    F: FnMut(&str, &mut dyn FnMut(KvEntry) -> Result<(), slipstream::snapshot::SnapshotError>),
+{
+    let mid_service = (n / ROUTES_PER_SERVICE) / 2;
+    let prefix = format!("route.svc-{mid_service:06}.");
+    let mut g = c.benchmark_group("prefix_scan");
+    g.throughput(Throughput::Elements(ROUTES_PER_SERVICE as u64));
+    if n >= SEQUENTIAL_ENTRIES {
+        g.sample_size(20);
+        g.warm_up_time(std::time::Duration::from_secs(2));
+        g.measurement_time(std::time::Duration::from_secs(10));
+    }
+    g.bench_function(name, |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            scan(&prefix, &mut |e| {
+                count += black_box(e.value.len());
+                Ok(())
+            });
+            black_box(count)
+        });
+    });
+    g.finish();
+}
+
+fn bench_lookup_100(c: &mut Criterion, name: &str, n: usize, reader: &RocksDbReader) {
+    let make_keys = |state: &mut u64| -> Vec<String> {
+        (0..100)
+            .map(|_| key((next_rand(state) % n as u64) as usize))
+            .collect()
+    };
+    let mut g = c.benchmark_group("lookup_100");
+    g.throughput(Throughput::Elements(100));
+    if n >= SEQUENTIAL_ENTRIES {
+        g.sample_size(20);
+        g.warm_up_time(std::time::Duration::from_secs(2));
+        g.measurement_time(std::time::Duration::from_secs(15));
+    }
+    let mut loop_state = 0xFACE_FEEDu64;
+    g.bench_function(format!("{name}_get_loop"), |b| {
         b.iter_batched(
-            || TempDir::new().unwrap(),
-            |dir| {
-                let mut s = open_fjall(&dir.path().join("store"));
-                hydrate(&mut s, n, &pool, vlen);
-                dir
+            || make_keys(&mut loop_state),
+            |keys| {
+                for k in &keys {
+                    black_box(reader.get(k).expect("get"));
+                }
             },
-            BatchSize::PerIteration,
+            BatchSize::SmallInput,
         );
     });
-    g.bench_function(BenchmarkId::new("rocksdb", n), |b| {
+    let mut mg_state = 0xBADC_0FFEu64;
+    g.bench_function(format!("{name}_multi_get"), |b| {
         b.iter_batched(
-            || TempDir::new().unwrap(),
-            |dir| {
-                let mut s = open_rocksdb(&dir.path().join("store"));
-                hydrate(&mut s, n, &pool, vlen);
-                dir
+            || make_keys(&mut mg_state),
+            |keys| {
+                black_box(
+                    reader
+                        .multi_get(keys.iter().map(String::as_str))
+                        .expect("multi_get"),
+                )
             },
-            BatchSize::PerIteration,
+            BatchSize::SmallInput,
+        );
+    });
+    g.finish();
+}
+
+fn bench_lookup_100_pedra(c: &mut Criterion, name: &str, n: usize, reader: &PedraDbReader) {
+    let make_keys = |state: &mut u64| -> Vec<String> {
+        (0..100)
+            .map(|_| key((next_rand(state) % n as u64) as usize))
+            .collect()
+    };
+    let mut g = c.benchmark_group("lookup_100");
+    g.throughput(Throughput::Elements(100));
+    if n >= SEQUENTIAL_ENTRIES {
+        g.sample_size(20);
+        g.warm_up_time(std::time::Duration::from_secs(2));
+        g.measurement_time(std::time::Duration::from_secs(15));
+    }
+    let mut loop_state = 0xC0DE_BEEFu64;
+    g.bench_function(format!("{name}_get_loop"), |b| {
+        b.iter_batched(
+            || make_keys(&mut loop_state),
+            |keys| {
+                for k in &keys {
+                    black_box(reader.get(k).expect("get"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let mut mg_state = 0xFEED_FACEu64;
+    g.bench_function(format!("{name}_multi_get"), |b| {
+        b.iter_batched(
+            || make_keys(&mut mg_state),
+            |keys| {
+                black_box(
+                    reader
+                        .multi_get(keys.iter().map(String::as_str))
+                        .expect("multi_get"),
+                )
+            },
+            BatchSize::SmallInput,
         );
     });
     g.finish();
@@ -236,180 +573,18 @@ fn bench_reads(c: &mut Criterion) {
     let n = entries();
     let vlen = value_bytes();
     let pool = value_pool();
-
-    // One hydrated store per backend, built outside the timers and shared by
-    // every read benchmark below. The hydrations are timed and printed — at
-    // large scale this is the apply-throughput measurement (see
-    // `bench_apply_hydrate`).
-    let fjall_dir = TempDir::new().unwrap();
-    let mut fjall = open_fjall(&fjall_dir.path().join("store"));
-    let started = std::time::Instant::now();
-    hydrate(&mut fjall, n, &pool, vlen);
-    let secs = started.elapsed().as_secs_f64();
-    let bytes = dir_size_bytes(fjall_dir.path());
+    let selected = backends();
+    let sequential = sequential_mode(n);
     eprintln!(
-        "hydrate/fjall: {n} entries in {secs:.1}s ({:.2}M entries/s); on disk \
-         {:.2} GiB ({:.0} B/entry)",
-        n as f64 / secs / 1e6,
-        bytes as f64 / (1u64 << 30) as f64,
-        bytes as f64 / n as f64,
+        "snapshot_backends: n={n} value_bytes={vlen} sequential={sequential} backends={:?}",
+        selected.iter().map(|b| b.name()).collect::<Vec<_>>()
     );
-    // Settle before reading: a fresh hydration leaves compaction debt that
-    // inflates cold reads (the unsettled state is reported separately by the
-    // settle duration itself).
-    let started = std::time::Instant::now();
-    fjall.settle().expect("settle fjall");
-    let settled_bytes = dir_size_bytes(fjall_dir.path());
-    eprintln!(
-        "settle/fjall: {:.1}s; on disk after {:.2} GiB",
-        started.elapsed().as_secs_f64(),
-        settled_bytes as f64 / (1u64 << 30) as f64,
-    );
-
-    let rocks_dir = TempDir::new().unwrap();
-    let mut rocks = open_rocksdb(&rocks_dir.path().join("store"));
-    let started = std::time::Instant::now();
-    hydrate(&mut rocks, n, &pool, vlen);
-    let secs = started.elapsed().as_secs_f64();
-    let bytes = dir_size_bytes(rocks_dir.path());
-    eprintln!(
-        "hydrate/rocksdb: {n} entries in {secs:.1}s ({:.2}M entries/s); on disk \
-         {:.2} GiB ({:.0} B/entry)",
-        n as f64 / secs / 1e6,
-        bytes as f64 / (1u64 << 30) as f64,
-        bytes as f64 / n as f64,
-    );
-    let started = std::time::Instant::now();
-    rocks.settle().expect("settle rocksdb");
-    let settled_bytes = dir_size_bytes(rocks_dir.path());
-    eprintln!(
-        "settle/rocksdb: {:.1}s; on disk after {:.2} GiB",
-        started.elapsed().as_secs_f64(),
-        settled_bytes as f64 / (1u64 << 30) as f64,
-    );
-    let rocks_reader = rocks.reader();
-
-    // --- Cold-read latency distributions (percentiles, not criterion means).
-    // 10k uniform random probes each; "miss" keys share the key shape but name
-    // services that were never written. Run-order caveat: rocksdb hydrated
-    // last, so a slice of its store is page-cache-resident that fjall's isn't.
-    probe_percentiles("probe_hit/fjall", |i| {
-        let _ = black_box(fjall.get(&key(i)).expect("get"));
-    });
-    probe_percentiles("probe_miss/fjall", |i| {
-        let _ = black_box(fjall.get(&miss_key(i)).expect("get"));
-    });
-    probe_percentiles("probe_hit/rocksdb", |i| {
-        let _ = black_box(rocks.get(&key(i)).expect("get"));
-    });
-    probe_percentiles("probe_miss/rocksdb", |i| {
-        let _ = black_box(rocks.get(&miss_key(i)).expect("get"));
-    });
-
-    // --- Point gets for existing keys, uniform over the whole fold. ---
-    // CRITICAL: the RNG state must live OUTSIDE the benchmark closure.
-    // Criterion re-invokes that closure once per sample (and per warmup pass);
-    // state declared inside the body resets to the seed every time, replaying
-    // the same key prefix — which the page cache then serves warm. At 250M
-    // that artifact reported 1.5 µs "gets" while criterion's own calibration
-    // (estimated time / iterations) showed ~860 µs during warmup. Hoisted
-    // state keeps every draw fresh across samples, so the measured miss rate
-    // is the true one for uniform access over a fold larger than RAM.
-    let mut g = c.benchmark_group("get_hit");
-    g.throughput(Throughput::Elements(1));
-    let mut fjall_state = 0xDEAD_BEEFu64;
-    g.bench_function("fjall", |b| {
-        b.iter(|| {
-            let i = (next_rand(&mut fjall_state) % n as u64) as usize;
-            black_box(fjall.get(&key(i)).expect("get"))
-        });
-    });
-    let mut rocks_state = 0xDEAD_BEEFu64;
-    g.bench_function("rocksdb", |b| {
-        b.iter(|| {
-            let i = (next_rand(&mut rocks_state) % n as u64) as usize;
-            black_box(rocks.get(&key(i)).expect("get"))
-        });
-    });
-    g.finish();
-
-    // --- One service's routes: the working-set hydration scan. ---
-    let mid_service = (n / ROUTES_PER_SERVICE) / 2;
-    let prefix = format!("route.svc-{mid_service:06}.");
-    let mut g = c.benchmark_group("prefix_scan");
-    g.throughput(Throughput::Elements(ROUTES_PER_SERVICE as u64));
-    g.bench_function("fjall", |b| {
-        b.iter(|| {
-            let mut count = 0usize;
-            fjall
-                .for_each_in_range(&prefix, |e| {
-                    count += black_box(e.value.len());
-                    Ok(())
-                })
-                .expect("scan");
-            black_box(count)
-        });
-    });
-    g.bench_function("rocksdb", |b| {
-        b.iter(|| {
-            let mut count = 0usize;
-            rocks
-                .for_each_in_range(&prefix, |e| {
-                    count += black_box(e.value.len());
-                    Ok(())
-                })
-                .expect("scan");
-            black_box(count)
-        });
-    });
-    g.finish();
-
-    // --- Batched lookups (rocksdb-only API): one MultiGet vs 100 gets. ---
-    // Fresh random keys EVERY iteration, generated in `iter_batched` setup so
-    // key construction is excluded from the timing. A fixed key set would be
-    // cache-hot after criterion's warmup and measure only per-call overhead —
-    // MultiGet exists to coalesce filter/index probes and block reads on
-    // *misses*, so the batches must keep missing. Each arm uses a different
-    // seed: identical sequences would hand the second arm blocks the first
-    // arm just pulled into cache. (Page cache still warms globally as the
-    // group runs — both arms drift faster over time, in run order.)
-    let make_keys = |state: &mut u64| -> Vec<String> {
-        (0..100)
-            .map(|_| key((next_rand(state) % n as u64) as usize))
-            .collect()
-    };
-    // RNG state hoisted for the same reason as `get_hit` above: criterion
-    // re-invokes the closure per sample, and a body-local seed would replay
-    // the same batches into a warmed page cache.
-    let mut g = c.benchmark_group("lookup_100");
-    g.throughput(Throughput::Elements(100));
-    let mut loop_state = 0xFACE_FEEDu64;
-    g.bench_function("rocksdb_get_loop", |b| {
-        b.iter_batched(
-            || make_keys(&mut loop_state),
-            |keys| {
-                for k in &keys {
-                    black_box(rocks_reader.get(k).expect("get"));
-                }
-            },
-            BatchSize::SmallInput,
-        );
-    });
-    let mut mg_state = 0xBADC_0FFEu64;
-    g.bench_function("rocksdb_multi_get", |b| {
-        b.iter_batched(
-            || make_keys(&mut mg_state),
-            |keys| {
-                black_box(
-                    rocks_reader
-                        .multi_get(keys.iter().map(String::as_str))
-                        .expect("multi_get"),
-                )
-            },
-            BatchSize::SmallInput,
-        );
-    });
-    g.finish();
+    // Always one backend at a time: at ≥50M (or SLIPSTREAM_BENCH_SEQUENTIAL=1)
+    // concurrent stores cannot fit; at small N the difference is only page-cache
+    // warming order, which already varied by run order before.
+    for backend in selected {
+        bench_one_backend_reads(c, backend, n, &pool, vlen);
+    }
 }
 
 criterion_group!(benches, bench_apply_hydrate, bench_reads);

@@ -155,6 +155,7 @@ dependencies = [
  "fjall",
  "futures",
  "object_store",
+ "rocksdb-compat",
  "rust-rocksdb",
  "serde",
  "serde_json",
@@ -451,6 +452,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -730,7 +740,7 @@ dependencies = [
  "flume",
  "log",
  "lsm-tree",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "tempfile",
  "xxhash-rust",
 ]
@@ -1250,6 +1260,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,7 +1411,7 @@ dependencies = [
  "enum_dispatch",
  "interval-heap",
  "log",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "quick_cache",
  "rustc-hash",
  "self_cell",
@@ -1409,6 +1430,12 @@ dependencies = [
  "cc",
  "libc",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "lz4_flex"
@@ -1591,6 +1618,65 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pedradb-core"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "lz4_flex 0.11.6",
+ "parking_lot",
+ "pedradb-posix",
+ "pedradb-spec",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "pedradb-io-uring"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "io-uring",
+ "libc",
+ "parking_lot",
+ "pedradb-core",
+ "pedradb-posix",
+]
+
+[[package]]
+name = "pedradb-ops"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "crc32c",
+ "pedradb-core",
+ "pedradb-io-uring",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "pedradb-posix"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "pedradb-sim"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "pedradb-core",
+]
+
+[[package]]
+name = "pedradb-spec"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 
 [[package]]
 name = "pem-rfc7468"
@@ -2010,6 +2096,20 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rocksdb-compat"
+version = "0.1.0"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "parking_lot",
+ "pedradb-core",
+ "pedradb-io-uring",
+ "pedradb-ops",
+ "pedradb-sim",
 ]
 
 [[package]]

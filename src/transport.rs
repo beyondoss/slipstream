@@ -857,3 +857,23 @@ impl crate::RocksDbSnapshot {
             .map_err(|e| SnapshotError::Backend(format!("import task panicked: {e}")))?
     }
 }
+
+#[cfg(feature = "pedradb")]
+impl crate::PedraDbSnapshot {
+    /// Fetch the artifact at `key` and import it as a new fold at `dest_dir`
+    /// (download → full verification → verify-open → rename), resuming from
+    /// the embedded cursor. The downloaded artifact is deleted afterwards.
+    pub async fn import_remote(
+        transport: &dyn ArtifactTransport,
+        key: &str,
+        scratch_dir: &Path,
+        dest_dir: &Path,
+        config: crate::PedraDbConfig,
+    ) -> Result<(WatchCursor, Self), SnapshotError> {
+        let (_guard, artifact) = download_to_scratch(transport, key, scratch_dir).await?;
+        let dest = dest_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::import(&artifact, &dest, config))
+            .await
+            .map_err(|e| SnapshotError::Backend(format!("import task panicked: {e}")))?
+    }
+}
