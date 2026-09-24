@@ -257,12 +257,15 @@ fn open_pedradb(path: &Path) -> PedraDbSnapshot {
 fn maybe_settle(name: &str, dir: &Path, settle: impl FnOnce() -> Result<(), String>) {
     let size = dir_size_bytes(dir);
     let free = free_disk_bytes(dir).unwrap_or(u64::MAX);
-    // fjall settle can peak ~2×; require 1.3× free headroom or skip.
-    if free < size.saturating_mul(13) / 10 {
+    // fjall settle rewrites the tree and can peak ~2× the hydrated size.
+    // Require 2.1× free headroom or skip; 1.3× starts a compact that fills
+    // the disk (measured: 500M fjall hydrate is ~105 GiB, settle climbs past
+    // 150 GiB on a 254 GiB volume).
+    if free < size.saturating_mul(21) / 10 {
         eprintln!(
             "settle/{name}: SKIPPED — need ~{:.1} GiB free for settle headroom, have {:.1} GiB \
              (store is {:.1} GiB)",
-            size as f64 * 1.3 / (1u64 << 30) as f64,
+            size as f64 * 2.1 / (1u64 << 30) as f64,
             free as f64 / (1u64 << 30) as f64,
             size as f64 / (1u64 << 30) as f64,
         );
