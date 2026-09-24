@@ -1622,7 +1622,7 @@ dependencies = [
 [[package]]
 name = "pedradb-core"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1637,7 +1637,7 @@ dependencies = [
 [[package]]
 name = "pedradb-io-uring"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "io-uring",
  "libc",
@@ -1649,7 +1649,7 @@ dependencies = [
 [[package]]
 name = "pedradb-ops"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "crc32c",
  "pedradb-core",
@@ -1660,7 +1660,7 @@ dependencies = [
 [[package]]
 name = "pedradb-posix"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "libc",
 ]
@@ -1668,7 +1668,7 @@ dependencies = [
 [[package]]
 name = "pedradb-sim"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "pedradb-core",
 ]
@@ -1676,7 +1676,7 @@ dependencies = [
 [[package]]
 name = "pedradb-spec"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 
 [[package]]
 name = "pem-rfc7468"
@@ -2101,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "rocksdb-compat"
 version = "0.1.0"
-source = "git+https://github.com/paulocsanz/pedradb?rev=4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd#4d5d8c74922dc55fdd7254d18a4f5dac3f39bddd"
+source = "git+https://github.com/paulocsanz/pedradb?rev=60d88f48ee2e935f18343d3bd8b935b78421d449#60d88f48ee2e935f18343d3bd8b935b78421d449"
 dependencies = [
  "bytes",
  "crc32c",
