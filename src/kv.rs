@@ -79,8 +79,30 @@ pub enum KvError {
     Timeout,
     /// The watch cursor/revision is too old — the backend has compacted past it.
     /// Callers should fall back to a full scan + watch.
+    ///
+    /// A `*_from` resume can also return this MID-STREAM, after delivering
+    /// updates: the NATS All-scope resume watch does so when retention overruns
+    /// the live consumer (the floor guard). Everything delivered before the
+    /// error is valid; the position after it is expired.
     #[error("watch cursor expired (compacted)")]
     CursorExpired,
+}
+
+/// What a backend's retention can do to the log a watch resumes from. These
+/// are the facts [`watch_applied`](crate::watch_applied) needs to repair an
+/// expired cursor without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Retention can evict a key's CURRENT value, not just superseded history
+    /// (NATS: `max_age`, per-message TTLs, or `discard: old` under a byte or
+    /// message limit). When true, a key missing from the bucket may never have
+    /// been deleted, so the bucket's key listing is not evidence of deletion.
+    pub evicts_current_values: bool,
+    /// The oldest revision still in the log (NATS: the stream's
+    /// `first_sequence`). Resuming after cursor `C` is gap-free iff
+    /// `first_revision <= C + 1`
+    /// ([`resume_window_ok`](crate::protocol::resume_window_ok)).
+    pub first_revision: u64,
 }
 
 /// Opaque version token that abstracts store-specific versioning.
@@ -331,6 +353,16 @@ pub trait KvWatcher: Send + Sync {
     ) -> Result<(), KvError> {
         let _ = cursor;
         self.watch_prefixes(prefixes, tx).await
+    }
+
+    /// The watched log's retention, read live: whether it can evict current
+    /// values, and the oldest revision it still holds.
+    ///
+    /// `Ok(None)` (the default) means the backend can't say. Callers must then
+    /// assume current values CAN be evicted, so the cursor-expired key-listing
+    /// diff is not trusted unless the caller explicitly chose it.
+    async fn retention(&self) -> Result<Option<Retention>, KvError> {
+        Ok(None)
     }
 }
 

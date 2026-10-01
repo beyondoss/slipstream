@@ -69,6 +69,7 @@ use crate::artifact::{
 use crate::export_lease::ExportLease;
 use crate::kv::WatchCursor;
 use crate::protocol::{PointerState, payload_prunable, pointer_publish_allowed};
+use crate::repair::{RestoreSource, RestoredFold};
 use crate::snapshot::SnapshotError;
 
 /// Buffered chunk size for uploads/downloads (also the multipart part size).
@@ -785,18 +786,86 @@ pub async fn run_export_round(
 // ---------------------------------------------------------------------------
 
 /// Download `key` into a throwaway dir under `scratch_dir`, returning the
-/// artifact path and the guard keeping it alive.
+/// guard keeping it alive, the artifact path, and its manifest.
 async fn download_to_scratch(
     transport: &dyn ArtifactTransport,
     key: &str,
     scratch_dir: &Path,
-) -> Result<(tempfile::TempDir, PathBuf), SnapshotError> {
+) -> Result<(tempfile::TempDir, PathBuf, ExportManifest), SnapshotError> {
     let tmp = tempfile::Builder::new()
         .prefix(".slipstream-bootstrap-")
         .tempdir_in(scratch_dir)?;
     let artifact = tmp.path().join("artifact");
-    transport.download(key, &artifact).await?;
-    Ok((tmp, artifact))
+    let manifest = transport.download(key, &artifact).await?;
+    Ok((tmp, artifact, manifest))
+}
+
+/// The backend import an [`ArtifactRestore`] opens artifacts with:
+/// `(artifact_dir, dest) -> (cursor, fold)`, e.g.
+/// `|a, d| FjallSnapshot::import(a, d, config)`.
+type ImportFn<S> = dyn Fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError> + Send + Sync;
+
+/// [`RestoreSource`] over an [`ArtifactTransport`]: the newest artifact
+/// published under `key`, downloaded and imported into a scratch directory
+/// with the consumer's own backend. Hand it to
+/// [`watch_applied`](crate::watch_applied) as [`ExpiryRepair::Restore`] (or
+/// [`ExpiryRepair::Auto`]) to repair an expired cursor from artifacts — the
+/// only sound repair on a bucket whose retention evicts current values.
+///
+/// [`ExpiryRepair::Restore`]: crate::ExpiryRepair::Restore
+/// [`ExpiryRepair::Auto`]: crate::ExpiryRepair::Auto
+pub struct ArtifactRestore<S> {
+    transport: Arc<dyn ArtifactTransport>,
+    key: String,
+    scratch_dir: PathBuf,
+    import: Arc<ImportFn<S>>,
+}
+
+impl<S> ArtifactRestore<S> {
+    /// Restore from the artifacts published under `key` on `transport`.
+    /// `scratch_dir` must exist and should sit on the fold's filesystem (the
+    /// artifact is downloaded and imported there, then deleted). `import` opens
+    /// a verified artifact directory as a fold at a path that doesn't exist
+    /// yet — the backend's `import`, e.g.
+    /// `|artifact, dest| AppendLogSnapshot::import(artifact, dest, u64::MAX)`.
+    pub fn new(
+        transport: Arc<dyn ArtifactTransport>,
+        key: impl Into<String>,
+        scratch_dir: impl Into<PathBuf>,
+        import: impl Fn(&Path, &Path) -> Result<(WatchCursor, S), SnapshotError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            transport,
+            key: key.into(),
+            scratch_dir: scratch_dir.into(),
+            import: Arc::new(import),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Send + 'static> RestoreSource<S> for ArtifactRestore<S> {
+    async fn latest(&self) -> Result<ExportManifest, SnapshotError> {
+        self.transport.manifest(&self.key).await
+    }
+
+    async fn fetch(&self) -> Result<RestoredFold<S>, SnapshotError> {
+        let (tmp, artifact, manifest) =
+            download_to_scratch(&*self.transport, &self.key, &self.scratch_dir).await?;
+        let import = Arc::clone(&self.import);
+        let dest = tmp.path().join("fold");
+        let fold = tokio::task::spawn_blocking(move || -> Result<S, SnapshotError> {
+            let (_cursor, fold) = import(&artifact, &dest)?;
+            // Import copied (and re-verified) the payload: the downloaded
+            // artifact is dead weight, possibly GBs — drop it now rather than
+            // for the life of the restore.
+            std::fs::remove_dir_all(&artifact)?;
+            Ok(fold)
+        })
+        .await
+        .map_err(|e| SnapshotError::Backend(format!("restore import task panicked: {e}")))??;
+        Ok(RestoredFold::new(manifest, fold).holding(tmp))
+    }
 }
 
 impl crate::AppendLogSnapshot {
@@ -810,7 +879,8 @@ impl crate::AppendLogSnapshot {
         dest_path: &Path,
         compact_threshold: u64,
     ) -> Result<(WatchCursor, Self), SnapshotError> {
-        let (_guard, artifact) = download_to_scratch(transport, key, scratch_dir).await?;
+        let (_guard, artifact, _manifest) =
+            download_to_scratch(transport, key, scratch_dir).await?;
         let dest = dest_path.to_path_buf();
         tokio::task::spawn_blocking(move || Self::import(&artifact, &dest, compact_threshold))
             .await
@@ -830,7 +900,8 @@ impl crate::FjallSnapshot {
         dest_dir: &Path,
         config: crate::FjallConfig,
     ) -> Result<(WatchCursor, Self), SnapshotError> {
-        let (_guard, artifact) = download_to_scratch(transport, key, scratch_dir).await?;
+        let (_guard, artifact, _manifest) =
+            download_to_scratch(transport, key, scratch_dir).await?;
         let dest = dest_dir.to_path_buf();
         tokio::task::spawn_blocking(move || Self::import(&artifact, &dest, config))
             .await
@@ -850,7 +921,8 @@ impl crate::RocksDbSnapshot {
         dest_dir: &Path,
         config: crate::RocksDbConfig,
     ) -> Result<(WatchCursor, Self), SnapshotError> {
-        let (_guard, artifact) = download_to_scratch(transport, key, scratch_dir).await?;
+        let (_guard, artifact, _manifest) =
+            download_to_scratch(transport, key, scratch_dir).await?;
         let dest = dest_dir.to_path_buf();
         tokio::task::spawn_blocking(move || Self::import(&artifact, &dest, config))
             .await

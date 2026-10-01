@@ -30,9 +30,15 @@ pub enum DiscardPolicy {
     /// **Evict the oldest** messages when full (NATS `discard:old`): a hard size
     /// ceiling that never rejects. Correct for high-churn **log** buckets whose
     /// consumers hold the durable fold (e.g. routing origins): the bucket is a
-    /// bounded change-feed, not the source of truth, so an evicted entry is
-    /// recovered from the consumer's fold (and the `CursorExpired` resync path),
-    /// while writers never freeze.
+    /// bounded change-feed, not the source of truth, so an evicted entry lives
+    /// on in the consumers' folds, while writers never freeze.
+    ///
+    /// Eviction here drops CURRENT values, not just old history, so a key
+    /// missing from the bucket may never have been deleted. A consumer whose
+    /// cursor expires must repair from an exported artifact
+    /// ([`ExpiryRepair::Restore`](crate::ExpiryRepair::Restore) or
+    /// [`Auto`](crate::ExpiryRepair::Auto)), never from the bucket's key listing,
+    /// and the export interval must stay well inside the bucket's turnover.
     Old,
 }
 
@@ -57,6 +63,12 @@ pub struct StoreConfig {
     /// Maximum age for entries in the bucket (bucket-level TTL).
     /// Entries older than this are automatically removed.
     /// NATS: maps to `max_age` on bucket config.
+    ///
+    /// This evicts CURRENT values: a key nobody deleted disappears from the
+    /// bucket once its last write is older than `max_age`. A consumer whose
+    /// cursor expires must then repair from an exported artifact (see
+    /// [`ExpiryRepair`](crate::ExpiryRepair)), with exports running well
+    /// inside `max_age`.
     pub max_age: Option<Duration>,
     /// Maximum bytes for the bucket (required by Synadia Cloud).
     /// NATS: maps to `max_bytes` on bucket config.

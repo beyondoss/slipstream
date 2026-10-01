@@ -11,6 +11,7 @@
 //! | [`pointer_publish_allowed`]| `transport::swap_pointer`           | `Act::Publish`     |
 //! | [`payload_prunable`]       | `transport::ObjectStoreTransport::prune` | `Act::Prune`  |
 //! | [`resume_window_ok`]       | `nats` resume paths (`check_resume_window`) | `Act::Resume` |
+//! | [`restore_allowed`]        | `applied` artifact restore (`check_restore`) | `Act::RestoreRead`, live `GuardRepair` |
 //!
 //! Because the model transitions call these very functions, a change to any
 //! guard is re-verified against the full bounded state space on the next
@@ -98,7 +99,11 @@ pub fn payload_prunable(
 /// the gap is safe for a last-write-wins fold (an overwrite-evicted revision
 /// implies a later revision of the same subject exists and will be
 /// delivered); lost DELETES come from head eviction, which is exactly what
-/// advances `first_sequence`.
+/// advances `first_sequence`. On a bucket whose retention also evicts
+/// *current* values (`max_age`, `discard: old`), head eviction loses live puts
+/// too. The same check detects that, but the repair then has to come from an
+/// artifact ([`restore_allowed`]), because the bucket's key listing no longer
+/// separates "deleted" from "aged out".
 ///
 /// This check must be performed by US: NATS does not error on a below-head
 /// start sequence — it silently clamps to the first retained message
@@ -109,6 +114,28 @@ pub fn payload_prunable(
 /// `first_sequence - 1`).
 pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
     first_sequence <= revision.saturating_add(1)
+}
+
+/// THE restore guard: may a fold whose cursor (`local_revision`) fell out of
+/// the log be replaced by an artifact exported at `artifact_revision`?
+///
+/// Both must hold:
+/// - **Ahead**: the artifact is strictly newer than the local fold. A restore
+///   never moves a fold (or the consumer's domain state built from it)
+///   backward.
+/// - **Fresh**: the artifact's cursor is still inside the log's retention
+///   window ([`resume_window_ok`]), so the watch can resume from it and replay
+///   the tail without a gap. A stale artifact has no safe recovery: whatever
+///   was evicted between its cursor and `first_sequence` is gone from both the
+///   artifact and the log.
+///
+/// "Fresh" implies "ahead" whenever the local cursor is genuinely expired; the
+/// ahead half is what still protects a restore when retention can't be read
+/// (or was read before a stream was recreated). Machine-checked in
+/// `tests/model.rs` (`RestoreRead`) and `tests/model_live_watch.rs`
+/// (`GuardRepair`).
+pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
+    artifact_revision > local_revision && resume_window_ok(artifact_revision, first_sequence)
 }
 
 /// Sequence the watch should start at after applying `revision`.
@@ -157,6 +184,25 @@ mod tests {
         assert!(resume_window_ok(u64::MAX, u64::MAX), "saturating boundary");
         assert_eq!(resume_start_sequence(3), Some(4));
         assert_eq!(resume_start_sequence(u64::MAX), None);
+    }
+
+    #[test]
+    fn restore_guard_boundaries() {
+        // Local cursor 3 expired (first retained 6): an artifact at 5 resumes
+        // at 6 — ahead and fresh.
+        assert!(restore_allowed(5, 3, 6));
+        // Artifact at 4 would resume at 5, already evicted: stale.
+        assert!(!restore_allowed(4, 3, 6), "stale artifact refused");
+        // Equal to local is not ahead, even inside the window.
+        assert!(!restore_allowed(3, 3, 1), "not strictly ahead");
+        assert!(
+            !restore_allowed(2, 3, 1),
+            "older artifact never regresses the fold"
+        );
+        assert!(
+            restore_allowed(u64::MAX, 0, u64::MAX),
+            "saturating boundary"
+        );
     }
 
     #[test]
