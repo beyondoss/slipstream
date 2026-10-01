@@ -990,6 +990,16 @@ fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry) -> KvUpdate 
     use async_nats::jetstream::kv::Operation;
     let version = VersionToken::from_u64(entry.revision);
     match entry.operation {
+        // An empty value is a `delete_with_version` tombstone: a delete, with
+        // the tombstone's own revision — the rule `get`/`scan`/`keys` apply.
+        // Watches, folds, and the repairs' key listings must all agree on it
+        // (a fold holding the key as present-but-empty disagreed with every
+        // read path and made the key-listing repair delete it, then re-list
+        // it). `entry()` still exposes the raw tombstone for CAS callers.
+        Operation::Put if entry.value.is_empty() => KvUpdate::Delete {
+            key: entry.key,
+            version,
+        },
         Operation::Put => KvUpdate::Put(KvEntry {
             key: entry.key,
             value: entry.value.to_vec(),
@@ -1248,6 +1258,9 @@ fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<Kv
     Some(match operation {
         Some("DEL") => KvUpdate::Delete { key, version },
         Some("PURGE") => KvUpdate::Purge { key, version },
+        // An empty value is a `delete_with_version` tombstone — a delete, as
+        // in `nats_entry_to_kv_update`.
+        _ if msg.payload.is_empty() => KvUpdate::Delete { key, version },
         // No header (or an explicit "PUT") is a put — the common case carries
         // no KV-Operation header at all.
         _ => KvUpdate::Put(KvEntry {
@@ -1911,6 +1924,21 @@ mod tests {
             kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace"),
             KvUpdate::Purge { ref key, .. } if key == "node.a"
         ));
+    }
+
+    /// A `delete_with_version` tombstone (empty-value Put) decodes as a
+    /// delete carrying its revision, so the fold drops the key exactly as
+    /// `get`/`scan`/`keys` do.
+    #[test]
+    fn kv_message_empty_value_is_a_delete() {
+        let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", None);
+        match kv_message_to_update(&msg, "$KV.certs.") {
+            Some(KvUpdate::Delete { key, version }) => {
+                assert_eq!(key, "node.a");
+                assert_eq!(version.as_u64(), Some(42), "the tombstone's own revision");
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
     }
 
     #[test]

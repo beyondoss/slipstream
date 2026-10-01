@@ -216,7 +216,11 @@ pub struct KvEntry {
 pub enum KvUpdate {
     /// Key was created or updated.
     Put(KvEntry),
-    /// Key was deleted.
+    /// Key was deleted — by a delete marker, or (NATS) by a
+    /// [`delete_with_version`](KvWriter::delete_with_version) tombstone, which
+    /// watches report as a delete with the tombstone's revision: the same rule
+    /// `get`/`scan`/`keys` apply. Only [`entry`](KvReader::entry) exposes the raw
+    /// tombstone.
     Delete { key: String, version: VersionToken },
     /// Key was purged (NATS-specific: all history removed).
     /// Stores without purge semantics should map this to Delete.
@@ -393,6 +397,10 @@ pub trait KvWriter: Send + Sync {
     /// CAS-gated delete: delete only if current version matches `expected`.
     /// Returns `RevisionMismatch` on conflict.
     /// Writes an empty value (logical delete) so concurrent writers get a conflict.
+    /// Every read path treats it as a delete — `get`/`scan`/`keys` hide it, and
+    /// watches (hence folds) receive a [`KvUpdate::Delete`] — except
+    /// [`entry`](KvReader::entry), which exposes the tombstone and its version for
+    /// CAS callers.
     async fn delete_with_version(
         &self,
         key: &str,

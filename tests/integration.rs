@@ -548,6 +548,91 @@ async fn watch_all_streams_live_updates() {
     assert!(matches!(&updates[2], KvUpdate::Delete { key, .. } if key == "node.a"));
 }
 
+/// A `delete_with_version` tombstone (an empty-value Put, so concurrent CAS
+/// writers still conflict) reaches watchers — the plain watch AND the
+/// multi-prefix resume consumer — as a DELETE carrying its own revision: the
+/// same rule `get`/`scan`/`keys` apply. A fold therefore drops the key
+/// instead of holding it present-but-empty, and agrees with every read path
+/// and with the repairs' key listings. `entry()` still exposes the raw
+/// tombstone (its version is what a CAS takeover needs).
+#[tokio::test]
+async fn cas_tombstone_reaches_watchers_as_a_delete() {
+    let nats = TestNats::start().await;
+    let (_conn, store) = nats.store("tomb").await;
+    let writer = store.writer().expect("writer");
+    let watcher = store.watcher().expect("watcher");
+
+    let v1 = writer.put("node.a", b"1").await.expect("put a");
+    // The resume consumer (hand-built, multi-prefix) from just before.
+    let (tx_from, mut rx_from) = mpsc::channel(64);
+    let (w, resume) = (
+        Arc::clone(&watcher),
+        WatchCursor::from_u64(v1.as_u64().unwrap()),
+    );
+    let from_task = tokio::spawn(async move { w.watch_prefixes_from(&["node."], &resume, tx_from).await });
+    // Attach the resume consumer BEFORE anything supersedes node.a@1: with
+    // history 1, once every message after the cursor is superseded the
+    // stream's first sequence passes it, and the (conservative) resume check
+    // reports CursorExpired — it can't tell supersession from eviction.
+    establish_watch(writer.as_ref(), &mut rx_from, "node.__ready__").await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let all_task = tokio::spawn(async move { watcher.watch_all(tx).await });
+    establish_watch(writer.as_ref(), &mut rx, "__ready__").await;
+
+    assert!(
+        writer
+            .delete_with_version("node.a", &v1)
+            .await
+            .expect("cas delete")
+    );
+    let tomb = store
+        .reader()
+        .entry("node.a")
+        .await
+        .expect("entry")
+        .expect("raw tombstone");
+    assert!(tomb.value.is_empty(), "entry() exposes the raw tombstone");
+    let rev = tomb.version.as_u64().unwrap();
+
+    // Skip handshake echoes; the next node.a update is the tombstone. If a
+    // watch ends instead, report how.
+    async fn next_a(
+        rx: &mut mpsc::Receiver<KvUpdate>,
+        task: tokio::task::JoinHandle<Result<(), slipstream::KvError>>,
+        which: &str,
+    ) -> KvUpdate {
+        let got = timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(u) if u.key() == "node.a" => return Some(u),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{which}: timed out waiting for the tombstone"));
+        match got {
+            Some(u) => {
+                task.abort();
+                u
+            }
+            None => panic!("{which}: watch ended early: {:?}", task.await),
+        }
+    }
+    let live = next_a(&mut rx, all_task, "watch_all").await;
+    assert!(
+        matches!(&live, KvUpdate::Delete { version, .. } if version.as_u64() == Some(rev)),
+        "watch: {live:?}"
+    );
+    let from = next_a(&mut rx_from, from_task, "watch_prefixes_from").await;
+    assert!(
+        matches!(&from, KvUpdate::Delete { version, .. } if version.as_u64() == Some(rev)),
+        "multi-prefix resume: {from:?}"
+    );
+    assert!(store.reader().get("node.a").await.expect("get").is_none());
+}
+
 #[tokio::test]
 async fn watch_prefix_filters_by_subject() {
     let nats = TestNats::start().await;
