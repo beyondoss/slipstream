@@ -11,14 +11,20 @@ Disk ──► load(path) ──► replay_log() ──► HashMap<key, KvEntry>
                                                     │
                                     watcher.watch_all_from(cursor, tx)
                                                     │
-                                              CursorExpired?
-                                             /              \
+                                              CursorExpired?   (at resume, or mid-watch
+                                             /              \    from the floor guard)
                                            Yes               No
                                             │                 │
-                            stale-key resync (synthetic      delta stream
-                            deletes) + watch_all(tx)              │
-                            (state-sync re-list)                  │
-                                            └───────┬─────────────┘
+                              bucket evicts current values?   delta stream
+                               /                      \           │
+                             No                       Yes         │
+                              │                        │          │
+                key-listing diff (synthetic   artifact restore:   │
+                deletes) + watch_all(tx)      fold := artifact,   │
+                (state-sync re-list)          resume from its     │
+                              │               cursor              │
+                              └──────────┬─────────┘              │
+                                         └──────────┬─────────────┘
                                                     │
                                    KvUpdate → cache.apply() + snap.write_update()
                                                     │
@@ -123,14 +129,17 @@ Every non-`_from` watch is a **state-sync** stream (NATS `DeliverPolicy::LastPer
 | `AppendLogSnapshot`      | Default `SnapshotStore`: append-only log + in-RAM fold (pure-Rust)   | Not for folds larger than RAM                     |
 | `FjallSnapshot`          | On-disk `SnapshotStore` (fjall LSM, `feature = "fjall"`) for large folds | Not in the pure-Rust core; opt-in feature        |
 | `RocksDbSnapshot`        | On-disk `SnapshotStore` (RocksDB, `feature = "rocksdb"`) for large folds | Not pure-Rust; opt-in feature with a C++ build dep |
-| `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore`; resyncs stale keys on cursor expiry | Not a raw watch; the cursor follows `apply`, not receipt |
+| `watch_applied`          | Combinator: batch → apply → *then* advance cursor / fold into `SnapshotStore`; repairs the fold when its cursor expires | Not a raw watch; the cursor follows `apply`, not receipt |
+| `ExpiryRepair`           | How `watch_applied` repairs an expired cursor: `Relist` (key-listing diff), `Restore { reader, restore }` (artifact; the reader's live listing keeps it from deleting live keys), `Auto` (by bucket retention), `None` | Not a retry policy; it decides what the fold may trust |
+| `Retention`              | What a watcher's log can evict: `evicts_current_values` + `first_revision`, read live from the stream (`KvWatcher::retention`) | Not config; read at the moment of expiry |
+| `RestoreSource` / `ArtifactRestore` | Supplies the newest published artifact, opened as a temporary fold of the consumer's backend | Not a bootstrap tool for new nodes' paths; feeds `ExpiryRepair::Restore` |
 | `WatchScope`             | What `watch_applied` watches: `All`, `Prefix`, or `Prefixes` (multi-filter union) | Not N consumers; `Prefixes` costs one consumer    |
 | `ConnectionCapabilities` | Feature flags for runtime branching (CAS, streaming watch, …)        | Not enforced; purely advisory                    |
 | `ExportRequest`          | One-shot channel message that asks `watch_applied` to flush + export the current fold | Not a store operation; handled between flushes   |
 | `ExportLease`            | Fleet-wide at-most-one coordinator: CAS key that prevents N nodes exporting the same round | Not a correctness gate; only dedup. Pointer monotonicity is the gate |
 | `LeaseGuard`             | RAII guard for a won export round: `complete(cursor)` stamps success, `abandon()` frees it early via CAS delete | Not held across restarts; process crash → expiry → next node steals |
 | `LeaseRecord`            | Value stored in the lease key: holder, acquired/expires timestamps (wall-clock, embedded — no server TTL), optional completed cursor | Expiry is compared by callers, not the store; requires NTP-sane clocks |
-| `ExportManifest`         | Artifact metadata committed to disk and object store: backend identity, format generation, cursor, per-file BLAKE3 hashes | The manifest bytes are their own content address (blake3[..8]) |
+| `ExportManifest`         | Artifact metadata committed to disk and object store: backend identity, format generation, cursor, per-file BLAKE3 hashes, and (schema 2) the exporting watch's key scope | The manifest bytes are their own content address (blake3[..8]) |
 | `ArtifactTransport`      | Trait: `upload(key, dir) → ManifestAndOutcome`, `download(key) → ManifestAndDir`, `pointer(key)`, `prune(key, grace)` | Not an object store; adapts `ObjectStore` for the pointer-swap protocol |
 | `ObjectStoreTransport`   | Concrete `ArtifactTransport` over any `object_store` backend (S3, GCS, Azure, local) | `file://` lacks CAS and FAILS CLOSED unless `with_non_atomic_pointer_fallback()` (dev only) |
 | `PublishOutcome`         | `Published` (pointer advanced) or `SupersededByNewer` (refused — a newer pointer exists) | Not an error; a slow exporter's normal exit under concurrent rounds |
@@ -173,7 +182,7 @@ Every non-`_from` watch is a **state-sync** stream (NATS `DeliverPolicy::LastPer
 
 The cursor is the NATS stream sequence number at the last checkpoint. On restart, pass it to `watch_all_from()` to subscribe at `cursor+1` — only the delta arrives, not the full history.
 
-When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The fallback `watch_all()` re-list re-delivers the current value of every live key, but it cannot cover keys **deleted during the gap whose delete markers were also evicted** — those need synthetic `Delete` events diffed from prior state. `watch_applied` does this automatically when given a reader (see below). A raw-API caller hand-rolls the same diff with `Snapshot::stale_keys()`:
+When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The fallback `watch_all()` re-list re-delivers the current value of every live key, but it cannot cover keys **deleted during the gap whose delete markers were also evicted** — those need synthetic `Delete` events diffed from prior state. On a bucket whose retention never evicts current values, `watch_applied` does this automatically (see below), and a raw-API caller hand-rolls the same diff with `Snapshot::stale_keys()`:
 
 ```rust
 match watcher.watch_all_from(&snap.cursor, tx).await {
@@ -188,6 +197,8 @@ match watcher.watch_all_from(&snap.cursor, tx).await {
     Err(e) => return Err(e.into()),
 }
 ```
+
+That diff is only sound where "not in the bucket" means "deleted". On a bucket with `max_age`, per-message TTLs, or `discard: old` under a limit, retention evicts **current** values too: a key can age out with nobody deleting it, and a write made during the gap can age out before the consumer returns. NATS cannot tell "deleted, marker evicted" from "aged out", so no listing diff can be made correct there — `watch_applied` restores from an artifact instead (see [Cursor-expiry repair](#cursor-expiry-repair)).
 
 ### Applied-Cursor Watch (`watch_applied`)
 
@@ -207,13 +218,29 @@ This is the lesson of Saltzer, Reed & Clark, *End-to-End Arguments in System Des
 
 The one exception: an update carrying the **unknown** version (an unparseable ACK subject on the hand-built multi-prefix consumer path) never touches `batch_high` — it can neither mint a cursor position nor clobber the real high from earlier in the batch. The update is still applied; skipping it under-advances at worst, and re-delivery on resume is idempotent. (The pre-guard code fabricated revision 0 for these, which the loop adopted as a real position — regressing the persisted cursor to 0 and forcing a full replay on the next restart.)
 
+**Persist the store's cursor, not `on_applied`'s, when there is a store.** Across a transient store failure the batch is re-queued, but `apply` has run and `on_applied` fires with the advanced cursor — ahead of what the store made durable. Resume from the cursor the store reports (`load`/`open`), never from one persisted separately in `on_applied`: that one can skip the re-queued batch. Without a store, `on_applied`'s cursor is the one to persist.
+
 **Snapshot consistency.** Raw `KvUpdate`s stream to the snapshot log as they arrive, but the *checkpoint* cursor is the post-apply cursor. A crash after a raw record is written but before its `apply`/checkpoint leaves the log holding data *ahead* of its cursor — which is safe: the cursor never names a revision whose `apply` had not returned, so resume re-delivers and re-applies that tail rather than skipping it. Compaction runs off the hot path via `spawn_blocking`, as everywhere else in the snapshot subsystem.
 
 **Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning).
 
 **Transient store failures re-queue, not drop.** If `store.apply()` returns an error, the raw batch is prepended to the next flush's accumulation and the watch continues. The streak counter increments; at 16 consecutive failures the watch fail-stops with `KvError::WatchError`. Dropping the failed batch and continuing was the shipped behavior until `transient_store_failure_never_leaves_a_cursor_gap` reproduced the bug: a transient failure followed by a successful flush advanced the cursor over a hole that survived every restart, because the restart re-folds from the advanced cursor, skipping the missing range. Cursor authority requires the store's cursor and contents to advance together, always (`applied.rs:303–394`, `tests/model_applied.rs`).
 
-**Cursor-expired resync.** On `CursorExpired` from the resume path the combinator falls back to the full-scope watch (`watch_all` / `watch_prefix` / `watch_prefixes`), whose state-sync re-list re-delivers every live key as puts. The re-list cannot cover keys deleted during the gap whose markers were evicted with the cursor, so — when the combinator is given a `KvReader` and a store — it closes that hole first: the watch task lists the bucket's live keys, hands them to the main loop, and waits for an ack; the main loop flushes, diffs the fold's in-scope keys against the listing, and runs a synthetic `KvUpdate::Delete` (unknown version — never advances the cursor) through `parse`/`apply`/store for each key that vanished; only then does the fallback watch start. That ack ordering is the invariant: a synthetic delete always precedes the re-list put for the same key, so delete-then-recreate during the gap converges. Without a reader the fallback is re-list-only and logs the possible stale keys.
+**Cursor-expiry repair.** <a id="cursor-expiry-repair"></a> The cursor expires at resume (`CursorExpired` from the `*_from` watch) or mid-watch (the live floor guard ends an All-scope watch with `CursorExpired` when retention overruns it). Both take one path. Correct means **every write minus every real delete** — not "whatever NATS still lists"; the two agree only when retention never evicts current values. The repair (`ExpiryRepair`, `src/repair.rs`) is chosen accordingly:
+
+- **Key-listing diff** (`Relist`; `Auto` on a bucket that keeps current values). The watch task lists the bucket's live keys, hands them to the main loop, and waits for an ack; the main loop diffs the fold's in-scope keys against the listing and runs a synthetic `KvUpdate::Delete` (unknown version — never advances the cursor) through `parse`/`apply`/store for each key that vanished; only then does the full-scope re-list (`watch_all` / `watch_prefix` / `watch_prefixes`) start. That ack ordering is the invariant: a synthetic delete always precedes the re-list put for the same key, so delete-then-recreate during the gap converges. **Refused** — the watch fails — when the watcher reports retention that evicts current values (`KvWatcher::retention`, read live from the stream config): there it deletes valid keys. `tests/eviction.rs` reproduced exactly that against a live server before the fix.
+- **Artifact restore** (`Restore`; `Auto` on a bucket that evicts current values or can't say). The watch task peeks the newest artifact's manifest and checks it before downloading: it must cover the watch scope (recorded in the manifest by the exporting `watch_applied`), and pass `protocol::restore_allowed` — strictly ahead of the local fold, cursor still inside retention. It then downloads and imports it into scratch as a temporary fold of the consumer's backend, re-checks what actually arrived, lists the bucket's live keys, and hands both to the main loop. The main loop re-checks "ahead" against its own applied cursor (a mid-watch expiry delivered past the resume cursor), diffs the in-scope fold against the artifact (keys only), and folds the difference through `parse`/`apply`/store in `max`-sized chunks, then advances the cursor to the artifact's in one final commit and replies. The diff takes an artifact entry only when it is newer than the local one, and deletes a key the artifact lacks only when the bucket does not list it live. An artifact is complete *together with the log after its cursor* — a NATS cursor C means every retained message ≤ C is applied, not "the truth at C": a key whose latest write is after C may be missing or older in an artifact exported mid catch-up — and in both skipped cases the key's latest write is after C, so the resume delivers it. The consumer therefore never sees a key move backward or a live key deleted, not even transiently. The watch resumes from that cursor (which can itself expire later and go round again, each time only for a strictly newer artifact). A failed check fails the watch and logs the reason at `error`: a stale artifact has no safe recovery.
+- **None** (`None`, or no store): the re-list alone, with a warning that deleted keys may persist.
+
+Whichever runs, the main loop first **drains** the watch channel: a mid-watch expiry leaves delivered updates buffered there, and the repair must fold them first — one applied after the repair would resurrect pre-repair state and could move the cursor backward. The watch task is parked on the ack/reply, so the drain takes exactly that backlog.
+
+A cursor-less start is repaired before it watches in two cases. A fold that holds **data but no cursor** (a torn first checkpoint, or a populated store started without one) runs the planned repair like an expiry at revision 0: a re-list alone never removes what it doesn't deliver. An **empty** fold with `Restore`/`Auto` on a bucket that has already evicted current values seeds from the artifact, since a re-list would be incomplete.
+
+The listing counts as the truth — "not listed" means "deleted" — when retention never evicts current values, or when it can but has never evicted anything yet (first retained revision ≤ 1). Otherwise the key-listing diff is refused.
+
+Before diffing, both repairs flush until the store holds every delivered update: a batch re-queued by a transient store failure is invisible to a diff of the store, and a re-queued put of a key deleted during the gap would otherwise commit after the diff and resurrect it.
+
+**The key-listing repair's one axiom.** Between taking the listing and the full re-list delivering what the bucket holds, retention must not evict a delete marker (axiom 6 of `tests/model.rs`, narrowed to this window). On a bucket that keeps current values, the only such eviction is an admin purge of markers, and NATS's `purge_deletes` keeps markers younger than 30 minutes by default. `tests/model_repair.rs` drops the axiom and the checker reaches the purge-inside-the-window trace; the artifact restore resumes on a floor-guarded watch and holds without it.
 
 This is the layer the tunnel router (swap route table) and edge origin watcher (rebuild hashrings) both collapse onto: `parse` extracts the domain registration, `apply` swaps the live state, `on_applied` persists the cursor.
 
@@ -221,7 +248,7 @@ This is the layer the tunnel router (swap route table) and edge origin watcher (
 
 NATS does **not** error when a live consumer's position is overrun by retention — it silently skips evicted messages (the same silent-clamp behaviour that `resume_window_ok` closes at resume time). For an All-scope watch, a skipped delete marker permanently diverges the fold, with zero log lines. The floor guard closes this mid-stream:
 
-- **In-band (primary):** when a delivered revision jumps the frontier by more than 1, fetch `first_sequence` and call `resume_window_ok(frontier, first_seq)`. A benign interior gap — per-subject overwrites below the floor threshold — passes. Head eviction past the frontier fails the watch into the restart → `CursorExpired` → resync repair path. The check runs *before* the entry is processed: the fold never advances past unexamined evidence of loss.
+- **In-band (primary):** when a delivered revision jumps the frontier by more than 1, fetch `first_sequence` and call `resume_window_ok(frontier, first_seq)`. A benign interior gap — per-subject overwrites below the floor threshold — passes. Head eviction past the frontier ends the watch with `CursorExpired`, which `watch_applied` routes in process into the same [cursor-expiry repair](#cursor-expiry-repair) a resume takes — the artifact restore on a bucket that evicts current values, never the key-listing diff there. The check runs *before* the entry is processed: the fold never advances past unexamined evidence of loss.
 - **Backstop (30 s):** when no deliveries arrive, the periodic probe catches the no-traffic case where there is no in-band evidence to act on.
 
 A periodic-only design was rejected by the model checker: deliveries catching the frontier up past a gap between probes erase the evidence, leaving permanent silent divergence with the guard running. The in-band check is what makes the design correct (`tests/model_live_watch.rs`).
@@ -265,7 +292,7 @@ Every NATS operation is wrapped in `timed()` (30 s). Without it, a CLOSE_WAIT co
 
 ### Machine-Checked Protocol Kernels (`protocol.rs`)
 
-Three pure-function guards live in `protocol.rs`. Production code and the Stateright exhaustive model checker (`tests/model.rs`) call the **same functions** — not two hand-synchronized copies. A change to any guard is re-verified against the full bounded state space on the next `cargo test --test model`. Mutation tests prove each guard is load-bearing: substituting a broken variant produces a counterexample.
+Four pure-function guards live in `protocol.rs`. Production code and the Stateright exhaustive model checker (`tests/model.rs`) call the **same functions** — not two hand-synchronized copies. A change to any guard is re-verified against the full bounded state space on the next `cargo test --test model`. Mutation tests prove each guard is load-bearing: substituting a broken variant produces a counterexample.
 
 **`pointer_publish_allowed(current: &PointerState, candidate_rank: u64) → bool`**
 
@@ -303,6 +330,16 @@ first_sequence >  revision + 1               → CursorExpired
 ```
 
 Machine-checked as: _"bootstrap never silently diverges."_ Empirically pinned by `tests/resync.rs::nats_silently_clamps_resume_below_first_seq`.
+
+**`restore_allowed(artifact_revision, local_revision, first_sequence) → bool`**
+
+The restore guard. An expired fold may be replaced by an artifact only if the artifact is strictly ahead of it (a restore never moves the fold, or the consumer's domain state, backward) and its cursor is still inside retention (`resume_window_ok`), so the resume from it is gap-free.
+
+```
+artifact_revision > local_revision && resume_window_ok(artifact_revision, first_sequence)
+```
+
+Machine-checked as: _"bootstrap never silently diverges from every write minus every real delete"_ on an evicting bucket (`tests/model.rs`), and _"a repair never moves the fold backward"_ (`tests/model_live_watch.rs`, where removing the guard is a mutation the checker catches).
 
 ### Export Round State Machine
 
@@ -356,10 +393,11 @@ Machine-checked as: _"bootstrap never silently diverges."_ Empirically pinned by
 | Flush | `store.apply()` succeeds | streak < 16 | Streak reset; `on_applied` fired; continue watching |
 | Flush | `store.apply()` transient error | streak < 16 | Raw batch prepended to next `raw_batch`; streak++; warn; continue |
 | Flush | `store.apply()` error | streak ≥ 16 | `KvError::WatchError` returned; watch fail-stops |
-| Watching | Watch task returns `CursorExpired` | first_seq > cursor+1 | Resync (if reader wired): list keys → synthetic deletes → ack; then `watch_all()` fallback |
-| Resync | `reader.keys()` fails | — | Fatal: `KvError::WatchError`; restart re-runs the full resume → expiry → resync path |
-| Resync | Fold range fails | — | Fatal: same |
-| Watching | `GuardTrip` (in-band gap or 30s backstop) | `!resume_window_ok(frontier, first_seq)` | Watch task fails; `KvError::WatchError` surfaces; caller's restart hits `CursorExpired` and runs resync |
+| Watching | Watch task gets `CursorExpired` (resume, or floor-guard trip mid-watch) | bucket keeps current values (or `Relist` chosen on unknown retention) | Drain channel + flush; key-listing diff: list keys → synthetic deletes → ack; then full re-list |
+| Watching | Same | bucket evicts current values, `Restore`/`Auto` | Peek + check artifact (scope, ahead, fresh) → download → re-check → drain + flush → diff → chunked fold → cursor := artifact's → reply; resume `*_from(artifact cursor)` |
+| Watching | Same | bucket evicts current values, `Relist` | Fatal: `KvError::WatchError` ("evicts current values"); fold untouched |
+| Repair | listing / fold scan / download / check fails | — | Fatal: `KvError::WatchError`; restart re-runs the full resume → expiry → repair path (a part-done restore committed under the old cursor, so it re-runs idempotently) |
+| Watching | `GuardTrip` (in-band gap or 30s backstop) | `!resume_window_ok(frontier, first_seq)` | Floor-guarded watch ends with `CursorExpired` → the repair rows above, in process |
 | Watching | `ExportRequest` | — | Flush pending batch; `store.export_to()` on blocking task; reply on oneshot; continue |
 | Any | Shutdown signal | — | Flush pending batch; abort watch task; return applied cursor |
 | Any | Channel closes cleanly | — | Flush remaining batch; return applied cursor |
@@ -467,7 +505,7 @@ After upload: `completed_cursor_hex` and `completed_at_unix` are filled in by `c
 
 When the watched bucket is a **bounded** log (size-capped, history evicted), a fold is no longer rebuildable from NATS alone — the folds become the only full replicas. Export/import makes them transferable, which is what lets a new node, a node with a lost/corrupt fold, or a node whose cursor aged out of the log bootstrap at all.
 
-**Artifact anatomy.** A directory: the backend's files under `data/`, plus `MANIFEST.json` carrying the artifact schema version, the backend identity and its on-disk format generation, per-file sizes + BLAKE3 digests, and — the load-bearing field — the **watch cursor the payload is exactly consistent with**. Import resumes the watch from that cursor and replays only the log tail. The manifest is written last and the whole stage is atomically renamed, so an artifact that exists is complete; a crash mid-export leaves only a hidden temp dir.
+**Artifact anatomy.** A directory: the backend's files under `data/`, plus `MANIFEST.json` carrying the artifact schema version, the backend identity and its on-disk format generation, per-file sizes + BLAKE3 digests, and — the load-bearing field — the **watch cursor the payload is exactly consistent with**. Import resumes the watch from that cursor and replays only the log tail. The manifest is written last and the whole stage is atomically renamed, so an artifact that exists is complete; a crash mid-export leaves only a hidden temp dir. Artifacts exported through `watch_applied` also record the exporting watch's key **scope** (schema 2; the manifest is rewritten atomically after the seal), which the expiry restore checks covers the restoring watcher. Schema 1 (no scope) is still read; builds older than schema 2 refuse schema-2 manifests, so upgrade importers before exporters.
 
 **The cursor-consistency invariant.** `export_to(&mut self)` cannot run concurrently with `apply` (exclusive borrow), and inside `watch_applied` exports run between flushes via the `ExportRequest` channel (pending batch flushed first) — so the embedded cursor equals the applied cursor, exactly. Every backend re-proves it at export time by **reopening the copy** and checking cursor equality: because every `apply` commits the cursor in the same atomic batch as its data, a recovered cursor that matches the live one is a complete tail-loss detector.
 
@@ -527,6 +565,22 @@ async-nats's bare `watch`/`watch_all`/`watch_many` ride `DeliverPolicy::New` —
 ### Why does the cursor-expired resync list keys instead of re-scanning values?
 
 The fallback watch's re-list already carries every live key's value, so the resync only needs to learn which keys *no longer exist* — `reader.keys()` (headers only, no value bytes) is sufficient and cheap. The fold side of the diff is equally key-only: it streams via `for_each_in_range` rather than `range()`, so an All-scope resync against an on-disk backend never materializes the whole fold (values included) on the repair path. The synthetic deletes carry an unknown version and never advance the cursor: the fold's persisted cursor stays at its (expired) position until real re-list revisions move it, so a crash mid-resync just re-runs the same idempotent diff on the next start. Ordering, not versioning, provides correctness: the resync acks before the fallback watch is established, so a synthetic delete can never land after the re-list put that resurrects the same key.
+
+### Why can't the key-listing resync be fixed for buckets that evict current values?
+
+Because the information isn't there. With `max_age` or `discard: old`, a key missing from the bucket is either "deleted, and its delete marker was evicted" or "aged out, never deleted". Both leave nothing in the stream. A listing diff can only guess, and either guess loses data: delete and you drop valid keys (the bug `tests/eviction.rs` reproduced live); keep and you resurrect real deletes. Writes made during the gap that also aged out aren't in the stream either. The only place that still has every write minus every real delete is a fold that was watching at the time, so the repair restores from one: the newest published artifact. Choosing between the two repairs reads the stream's live config at the moment of expiry (`KvWatcher::retention`) rather than trusting `StoreConfig`, which only applies at bucket creation and can be edited out-of-band.
+
+The same reasoning removed the old definition of convergence from the model. `tests/model.rs` used to judge a fold against what the bucket lists and never evicted a current value, so it certified the key-listing resync on evicting buckets as correct. It now judges against every write minus every real delete, has an `AgeOut` step, and keeps the old resync as a mutation the checker must catch.
+
+### Why apply a restore as a diff instead of swapping in the artifact's files?
+
+The result is a wholesale replacement within the watch scope, not a merge: every in-scope key ends up exactly as the artifact has it, and keys it lacks are deleted. But the mechanism is a diff folded through the normal path, for three reasons:
+
+- **Crash safety without a new on-disk protocol.** Swapping a live LSM directory isn't atomic (rename can't replace a non-empty directory), and a half-swapped fold with a cursor is worse than a stale one. The diff commits each chunk under the old, expired cursor and moves the cursor to the artifact's only in the final commit, so a crash mid-restore leaves a fold whose cursor is still expired: the restart runs the restore again, idempotently. That's the same argument the key-listing resync already relies on.
+- **The consumer's domain state.** `apply` built routing tables (or hashrings) from the old fold. A file swap would leave them stale with no signal; the diff delivers exactly the changes through `parse`/`apply`, the same way the synthetic deletes always have.
+- **Bounded memory.** The diff holds keys only; values are read back from the artifact a chunk at a time.
+
+The cost is a scan of both folds over the scope. Restores are rare, and the alternative costs correctness.
 
 ### Why KvError: Clone instead of Box<dyn Error>?
 
@@ -631,7 +685,7 @@ Production code and an exhaustive model checker running the same logic closes th
 
 **What the transport layer does NOT verify:**
 - Object store authorization (delegated to `object_store` credentials)
-- Pointer freshness (callers decide whether the embedded cursor is recent enough)
+- Pointer freshness for manual bootstrap (callers decide whether the embedded cursor is recent enough). The automatic expiry restore does check it: `restore_allowed` refuses an artifact outside retention
 - Whether the exporting node's fold was correct (garbage in, garbage out — the integrity guarantees cover transport, not source correctness)
 
 ## Failure Modes
@@ -640,10 +694,15 @@ Production code and an exhaustive model checker running the same logic closes th
 | ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------- |
 | Transient `store.apply()` failure    | Raw batch re-queued at front; next flush commits cumulatively; streak counter incremented | Automatic up to 16 consecutive failures |
 | 16 consecutive `store.apply()` failures | Watch fail-stops: `KvError::WatchError` returned | Restart re-folds from last good cursor; investigate store (disk, permissions) |
-| Live watch retention overrun (All scope) | Floor guard detects in-band (gapped delivery) or via 30 s backstop; watch fails with `KvError::WatchError` | Caller restarts; resume hits `CursorExpired`; resync repairs stale keys |
+| Live watch retention overrun (All scope) | Floor guard detects in-band (gapped delivery) or via 30 s backstop; the watch ends with `CursorExpired` | `watch_applied` repairs in process (key-listing diff, or artifact restore on an evicting bucket) |
 | Live watch retention overrun (Prefix scope) | **Undetected until the next restart** — prefix watches deliver sparse revisions, so eviction gaps are indistinguishable from non-matching subjects client-side; the floor guard is sound for All scope only (a periodic probe here would false-positive into spurious resyncs, a design the model checker rejected) | Next restart's resume-window check hits `CursorExpired` → resync repairs; operate prefix-scoped watches with retention window comfortably above the restart/redeploy interval |
 | Resync `reader.keys()` failure       | Watch fail-stops (fail-stop, not degrade — degrade semantics proven to leave stale keys permanently) | Restart re-runs full resume → expiry → resync |
-| `CursorExpired`                      | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
+| `CursorExpired`, bucket keeps current values | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
+| `CursorExpired`, bucket evicts current values | `watch_applied` restores the in-scope fold from the newest artifact and resumes from its cursor | Automatic with `ExpiryRepair::Restore`/`Auto` |
+| Fold holds data but no cursor (torn first checkpoint) | Repaired like an expiry at revision 0 before watching | Automatic with a repair armed |
+| A write ages out before ANY node folds it | Every node that needed it fail-stops (no fold anywhere holds it; `tests/model_fleet.rs` proves this is the only way the fleet fail-stops) | Data loss by retention; widen retention or export more often |
+| Key-listing resync on a bucket that evicts current values | Refused: `KvError::WatchError` ("evicts current values"); fold untouched | Wire `ExpiryRepair::Restore`/`Auto` with an artifact source |
+| Restore: no artifact ahead, stale artifact, or one that doesn't cover the scope | `KvError::WatchError`, reason logged at `error`; fold untouched | Fix the export pipeline (run exports well inside `max_age` / `discard: old` turnover); restart |
 | `WatchError`                         | Watch stream dropped (NATS restart, reconnect)                              | Re-subscribe                                      |
 | `Timeout` on any NATS op             | CLOSE_WAIT half-dead TCP parks the `await` without this guard              | Call `shutdown()` + `connect()`                   |
 | `RevisionMismatch` on CAS            | Concurrent writer won the race                                              | Re-read with `entry()`, resolve, retry            |
@@ -659,7 +718,7 @@ Production code and an exhaustive model checker running the same logic closes th
 | Artifact backend/format mismatch     | `ArtifactInvalid` before any open; engine format markers re-checked internally | Fetch another artifact                        |
 | Export under churn — fjall copy      | File GC'd mid-copy; retry ×3; verify-by-reopen catches anything torn       | Abandon lease on persistent failure               |
 | Export/upload fails mid-round        | Lease abandoned (CAS delete); local artifact deleted                       | Next trigger elects a new node                    |
-| Artifact cursor older than NATS log  | `CursorExpired` on resume → full watch fallback + stale-key resync          | Checkpoint more often than log retention window   |
+| Artifact cursor older than NATS log  | `CursorExpired` on resume → the cursor-expiry repair; on an evicting bucket a stale artifact fails the restore | Export more often than the log's retention window |
 | Corrupt lease value                  | Treated as expired: CAS-stolen by next acquirer                             | Non-fatal; one bad write cannot wedge the fleet   |
 | `prune()` I/O error                  | Stale payloads linger; warning logged                                       | Retried next export round; correctness unaffected |
 
@@ -678,7 +737,8 @@ Production code and an exhaustive model checker running the same logic closes th
 | `src/artifact.rs`          | `ExportManifest`, `ArtifactFile`, BLAKE3 integrity; stage-then-rename discipline; backend `export_to` + `import` (append-log, fjall, RocksDB) |
 | `src/export_lease.rs`      | `ExportLease`, `LeaseGuard`, `LeaseRecord`: fleet-wide at-most-one via embedded-expiry CAS |
 | `src/transport.rs`         | `ObjectStoreTransport`, `ArtifactTransport` trait, `run_export_round`: monotonic pointer swap, multipart upload, prune, content-addressed keys (`feature = "transport"`) |
-| `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expired stale-key resync, `ExportRequest` handling |
+| `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expiry repair (drain, key-listing diff, artifact restore), `ExportRequest` handling (stamps the scope) |
+| `src/repair.rs`            | `ExpiryRepair`, `RestoreSource`, `RestoredFold`; scope coverage, restore checks, the in-scope restore diff |
 | `src/lib.rs`               | Re-exports all public types; no logic                                                |
 | `benches/`                 | Criterion benchmarks: snapshot write/checkpoint/load throughput, batch throughput, ACK subject parsing |
 | `tests/integration.rs`     | NATS JetStream backend integration suite: each test boots its own `nats-server` on a free port; covers bucket create, CAS, watch semantics, cursor resume, and delete reconciliation |
@@ -688,10 +748,14 @@ Production code and an exhaustive model checker running the same logic closes th
 | `tests/bootstrap.rs`       | Tier-2 bootstrap proofs on live NATS + on-disk backends: exports from a live `watch_applied` loop under churn, imports as a second node, and asserts **delta-only resume** via delivery count (not just convergence — a full replay would produce the same end state) |
 | `tests/multi_export.rs`    | Prevention proofs on live NATS + real fjall/RocksDB: slow-exporter clobber refused, crash window keeps bootstrap available, multi-SST post-compaction fidelity |
 | `tests/resync.rs`          | Live-NATS conformance: NATS silent-clamp pinned; full expiry → resync chain e2e; no-reader divergence pinned |
-| `tests/model.rs`           | Stateright exhaustive model (~250M states, fleet size 2–3, unbounded rounds): pointer swap theorems (no regression, no torn pair, no dangling pointer, no silent divergence, terminal liveness); mutation tests prove each protocol guard load-bearing |
+| `tests/repair_dst.rs`      | Deterministic fault injection over the REAL `watch_applied`, on every backend: a simulated NATS log and a fault store (transient failure, crash before/after/torn) at every store-apply call, across 17 scenarios (expiry repairs and the normal path; All, Prefix, multi-prefix; complete and mid-catch-up artifacts) × both delivery orders × batch sizes — ~32k schedules on the append log, every single fault on fjall and RocksDB (deep tier for the full sweep). Asserts convergence to every write minus every real delete, domain state == fold, cursor monotone, no revision regression or phantom delete seen by `apply`, and every mid-run export resumes to the truth. Reverting any of nine repair steps fails it |
+| `tests/model_repair.rs`    | Stateright model of the repair AS STEPS (drain, pre-repair flush retry, diff, chunk, cursor commit, ack/reply) interleaved with deliveries, writes, eviction, publishes, transient failures, and crashes; checks that a resumable cursor reaches the truth, cursors are monotone, the domain never regresses or loses a current value, and every run converges; eleven mutations, each caught |
+| `tests/model_fleet.rs`     | Stateright fleet model where the exporters themselves expire, restore, start cursor-less, and publish their actual folds: every published artifact is the truth at its cursor (discharges the "exporters are correct" axiom); fleet-poisoning mutations caught |
+| `tests/eviction.rs`        | Live NATS + local object store, on `discard: old` and `max_age` buckets: expiry restores from the artifact (aged-out key kept, aged-out gap write recovered, real delete applied, identical to the exporter); key-listing resync refused; stale artifact fails the watch; a stalled, floor-guarded watcher overrun by a 20 MB burst trips mid-stream and is restored in process, identical to the exporter |
+| `tests/model.rs`           | Stateright exhaustive model (fleet size 2–3, unbounded rounds): pointer swap theorems (no regression, no torn pair, no dangling pointer, terminal liveness) and convergence to every write minus every real delete, on buckets that keep and that evict current values (`AgeOut`, artifact restore); mutation tests prove each protocol guard load-bearing, and keep the key-listing resync on an evicting bucket as a mutation the checker must catch |
 | `tests/model_applied.rs`   | Stateright cursor-authority model: delivery → flush → transient failure → crash/restart; `DropFailedBatch` and `ResumeFromMemApplied` mutations pin both pre-fix bug classes |
 | `tests/model_resync_order.rs` | Stateright resync ack-barrier model: proves synthetic deletes strictly precede re-list puts; `NoAckBarrier` mutation reaches lost-recreate divergence |
-| `tests/model_live_watch.rs` | Stateright floor-guard model: guarded variant proves fold always converges; unguarded variant pins permanent silent divergence as the machine-checked record of the pre-guard code |
+| `tests/model_live_watch.rs` | Stateright floor-guard model: guarded variant proves the fold always converges to the truth, repaired by the key-listing diff or (evicting bucket) the artifact restore; unguarded variant pins permanent silent divergence; mutations: relist on an evicting bucket, restore without `restore_allowed` |
 | `tests/common/mod.rs`      | Shared test helpers: ephemeral NATS server, MinIO harness, `ManifestPutCrash` transport injection |
 
 ## Configuration
@@ -705,7 +769,7 @@ Config applies only at creation. If the bucket already exists, the existing one 
 | `max_bytes`    | 10 MiB     | Required by Synadia Cloud; omit only for self-hosted NATS          |
 | `max_history`  | 1          | Config stores rarely need change history                           |
 | `num_replicas` | 1          | Set to 3 for production HA clusters                                |
-| `max_age`      | None       | Set to gate retention window (also determines when cursors expire) |
+| `max_age`      | None       | Set to gate retention window (also determines when cursors expire). Evicts current values: expired consumers must restore from artifacts, exported well inside `max_age` |
 
 ### NatsConnectionConfig
 

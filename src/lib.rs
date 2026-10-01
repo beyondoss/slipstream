@@ -30,6 +30,7 @@ mod export_lease;
 mod kv;
 mod nats;
 pub mod protocol;
+mod repair;
 pub mod snapshot;
 #[cfg(feature = "fjall")]
 mod snapshot_fjall;
@@ -45,10 +46,11 @@ pub use applied::{BatchConfig, ExportRequest, WatchScope, watch_applied};
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
 pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
 pub use kv::{
-    KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, VersionToken,
-    WatchCursor,
+    KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, Retention,
+    VersionToken, WatchCursor,
 };
 pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
+pub use repair::{ExpiryRepair, RestoreSource, RestoredFold};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
 pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
@@ -58,4 +60,6 @@ pub use stores::{
     Connection, ConnectionCapabilities, DiscardPolicy, KvStore, StorageType, StoreConfig,
 };
 #[cfg(feature = "transport")]
-pub use transport::{ArtifactTransport, ObjectStoreTransport, PublishOutcome, run_export_round};
+pub use transport::{
+    ArtifactRestore, ArtifactTransport, ObjectStoreTransport, PublishOutcome, run_export_round,
+};

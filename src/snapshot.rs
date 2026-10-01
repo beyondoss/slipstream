@@ -107,6 +107,12 @@ impl Snapshot {
     /// After a cursor-expired fallback to full `watch_all()`, callers should
     /// compare the snapshot against the live key set and emit synthetic
     /// `Delete` events for stale keys to ensure convergence.
+    ///
+    /// Only on a bucket that never evicts current values (`discard: new`, no
+    /// `max_age`). Where retention evicts current values, a key absent from
+    /// the scan may simply have aged out, and deleting it loses data; repair
+    /// from an exported artifact instead
+    /// ([`ExpiryRepair`](crate::ExpiryRepair)).
     pub fn stale_keys<'a, I>(&'a self, current_keys: I) -> Vec<&'a str>
     where
         I: IntoIterator<Item = &'a str>,

@@ -27,7 +27,15 @@
 //!   current pointer's target is never pruned.
 //! - The source stream with **retention**: a floor that advances freely;
 //!   resuming below the floor is `CursorExpired`; delete markers at or below
-//!   the floor are evicted (the re-list cannot see them).
+//!   the floor are evicted (the re-list cannot see them). Under
+//!   `BucketRetention::EvictsCurrent` (`max_age`, `discard: old`) retention
+//!   ALSO evicts the sentinel key's current value (`AgeOut`, FIFO-consistent:
+//!   only once the floor has passed that value's revision), so the bucket
+//!   stops listing a key nobody deleted.
+//! - The sentinel key's full history: its initial put, an optional real
+//!   delete, and an optional later write (`PutKey` — an update, or a
+//!   re-create after the delete). A write made while the importer is behind
+//!   that then ages out is exactly the gap write a re-list can never deliver.
 //! - A bootstrapping importer whose two reads (sibling manifest, then
 //!   payload) interleave with all of the above, whose cross-check compares
 //!   them, and whose post-import resume either replays the tail, or falls
@@ -37,6 +45,23 @@
 //!   (`FailStop` — `applied.rs` as it ships). The checker proves `Degrade`
 //!   breaks the convergence theorem, which is the machine-checked
 //!   justification for the fail-stop change in `resync_stale_keys`.
+//!   `FailStop` repairs the way `ExpiryRepair::Auto` does: the key-listing
+//!   diff on a bucket that keeps current values, an ARTIFACT RESTORE on one
+//!   that evicts them (`Restoring` → `RestoreRead`, gated by the shared
+//!   `protocol::restore_allowed` kernel: ahead of the local fold and still
+//!   inside retention). The pre-fix behavior — the key-listing diff on an
+//!   evicting bucket — is the `RelistOnEvicting` mutation, which the checker
+//!   must catch.
+//!
+//! ## What "converged" means
+//!
+//! The fold is correct when it holds **every write minus every real delete**
+//! (`key_at(head)`), not when it matches what NATS still lists. The two agree
+//! on a bucket that keeps current values; on one that evicts them they
+//! diverge, and the pre-fix resync — which defined correct as "matches
+//! NATS" — deleted valid keys to match. `FoldStatus` judges against the
+//! truth: `StaleKey` holds a really-deleted key, `Lost` lacks a write the
+//! truth has (dropped a key that aged out, or missed an aged-out gap write).
 //!
 //! The empirical coupling runs both directions: the legacy configuration's
 //! `sometimes` hazards are the interleavings `tests/multi_export.rs` drives
@@ -82,8 +107,16 @@
 //!    (empirical tier: tampered-artifact and multi-SST round-trip tests).
 //!    NATS KV CAS semantics for the lease are unneeded here (see above); the
 //!    lease layer is verified by `integration.rs` contention tests.
-//! 5. Retention outlives consumer lag — NARROWED to prefix-scoped watches
-//!    and the fresh full watch's initial history scan. The ALL-scope resume
+//! 5. Exporters are correct folds: an artifact holds `key_at(cursor)`.
+//!    DISCHARGED by `tests/model_fleet.rs`, where the exporters are watchers
+//!    that themselves expire, restore, start cursor-less, and publish their
+//!    actual folds, and the checker proves every published artifact is the
+//!    truth at its cursor.
+//! 6. Retention outlives consumer lag — NARROWED to prefix-scoped watches,
+//!    the fresh full watch's initial history scan, and the key-listing
+//!    repair's window between its listing and its re-list
+//!    (`tests/model_repair.rs` drops it and reaches that trace; the artifact
+//!    restore does not depend on it). The ALL-scope resume
 //!    watch (steady-state operation) no longer relies on it: the live floor
 //!    guard (`tests/model_live_watch.rs`, `stream_watch_floor_guarded`)
 //!    fail-stops on in-band evidence of retention overrunning the consumer
@@ -96,13 +129,17 @@
 //! ## Bounds and the small-scope argument
 //!
 //! Default: 2 exporters (a const-generic parameter), revisions ≤ 3, one
-//! importer, one deletable sentinel key — and **unbounded rounds**: a
+//! importer, one sentinel key (initial put, at most one delete, at most one
+//! later write, and — on an evicting bucket — aging out) — and **unbounded
+//! rounds**: a
 //! publisher re-enters the pipeline whenever it has applied past its last
 //! publish (`NextRound`), so every theorem quantifies over repeated rounds,
 //! including a node racing its own previous publish. Every hazard class
 //! needs at most: two distinct cursors (regression), one crash window (torn
-//! pair), one delete + floor advance (stale key) — and every `sometimes`
-//! witness fails loudly if a bound ever clips its scenario.
+//! pair), one delete + floor advance (stale key), one write + age-out + floor
+//! advance (lost write) — and every `sometimes` witness fails loudly if a
+//! bound ever clips its scenario. The evicting configuration's deep tier
+//! (revisions ≤ 4, ~124M unique states) is ignored by default.
 //!
 //! The ignored deep tier (release mode, scheduled runs) pushes both axes:
 //! revisions ≤ 5 (~154M unique states) and THREE exporters (~95M unique
@@ -122,6 +159,10 @@
 
 use stateright::{Checker, Model, Property};
 
+/// The convergence theorem's name (looked up by the mutation tests).
+const DIVERGENCE_THEOREM: &str =
+    "bootstrap never silently diverges from every write minus every real delete";
+
 /// Default bucket-revision bound (1..=MAX_REV). 3 suffices for every hazard
 /// class and witness (two distinct export cursors plus a delete revision —
 /// each `sometimes` property fails loudly if a bound ever clips its
@@ -130,13 +171,14 @@ use stateright::{Checker, Model, Property};
 const MAX_REV: u8 = 3;
 
 /// An export artifact's identity: who exported, at which applied cursor, and
-/// whether the sentinel key was still present at that cursor. Two artifacts
-/// are byte-identical iff this identity is equal (BLAKE3 axiom).
+/// the sentinel key's value at that cursor (the revision of the put it holds,
+/// `None` if deleted). Two artifacts are byte-identical iff this identity is
+/// equal (BLAKE3 axiom).
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct Artifact {
     node: u8,
     cursor: u8,
-    has_key: bool,
+    key: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -154,13 +196,18 @@ enum ExporterPc {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum FoldStatus {
-    /// The bootstrapped fold converges to the bucket (tail replay, or
-    /// fallback with resync, or fallback where the re-list happens to cover).
+    /// The bootstrapped fold holds every write minus every real delete (tail
+    /// replay, a repaired fallback, or a fallback the re-list happens to
+    /// cover).
     Synced,
-    /// Silent divergence: the fold holds a key the bucket deleted, and
+    /// Silent divergence: the fold holds a key that was really deleted, and
     /// nothing will ever remove it (expired cursor + evicted marker + no
     /// resync).
     StaleKey,
+    /// Silent divergence: the fold lacks a write the truth has — a key that
+    /// aged out of NATS (never deleted) was dropped, or a write made during
+    /// the gap aged out before the fold could see it.
+    Lost,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -180,6 +227,12 @@ enum ImporterPc {
     FetchMissed,
     /// Resume ran; final verdict on this bootstrap.
     Resumed(Artifact, FoldStatus),
+    /// Resume hit an expired cursor on a bucket that evicts current values:
+    /// the fold (at this artifact) must be restored from a newer published
+    /// artifact still inside retention. Fail-stop until one exists — in code
+    /// the watch fails and the caller's restart retries; here `RestoreRead`
+    /// is simply disabled until the pointer qualifies.
+    Restoring(Artifact),
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -188,6 +241,12 @@ struct St<const N: usize> {
     head: u8,
     /// Revision at which the sentinel key was deleted, if it was.
     delete_rev: Option<u8>,
+    /// Revision of the sentinel's later write (`PutKey`), if any. Its initial
+    /// put is revision 0, before every replica's first cursor.
+    reput_rev: Option<u8>,
+    /// `EvictsCurrent` only: retention evicted the sentinel's CURRENT value
+    /// (it was never deleted; the bucket just stopped listing it).
+    aged: bool,
     /// Stream retention floor: resuming from cursor < floor is CursorExpired;
     /// a delete marker at rev ≤ floor has been evicted.
     floor: u8,
@@ -207,6 +266,11 @@ struct St<const N: usize> {
     /// FIXED: latched when the monotonic swap refused an older publish —
     /// vacuity witness that the guard actually fires within the bounds.
     refused: bool,
+    /// Latched when the importer's fold was restored from a newer artifact
+    /// (vacuity witness for the restore theorem).
+    restored: bool,
+    /// `TrustRestoredCursor` only: the next resume skips its window check.
+    trust_next_resume: bool,
     importer: ImporterPc,
 }
 
@@ -216,6 +280,11 @@ enum Act {
     Churn,
     /// The sentinel key is deleted (consumes a revision).
     DeleteKey,
+    /// The sentinel key is written again (consumes a revision): an update, or
+    /// a re-create after the delete.
+    PutKey,
+    /// `EvictsCurrent` only: retention evicts the sentinel's current value.
+    AgeOut,
     /// Retention floor advances by one.
     Compact,
     /// Replica n applies the next revision.
@@ -240,12 +309,29 @@ enum Act {
     Prune,
     Retry,
     Resume,
+    /// `Restoring` only: read the current pointer and, if
+    /// `protocol::restore_allowed` accepts it, import it. Collapses the
+    /// payload fetch: the CURRENT pointer's target is always fetchable
+    /// (`pointer target always fetchable`), and the stale-read fetch miss is
+    /// already explored on the initial import.
+    RestoreRead,
     /// Degrade mode only: the resume completed but its resync failed
     /// mid-flight and the code warned-and-continued re-list-only.
     ResumeResyncDegraded,
 }
 
 /// How the bootstrapping node handles the cursor-expired stale-key resync.
+/// What the bucket's retention can evict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BucketRetention {
+    /// Only superseded history and delete markers (`discard: new`, no
+    /// `max_age`): a key missing from the bucket was deleted.
+    KeepsCurrent,
+    /// Current values too (`max_age`, `discard: old`): a key missing from the
+    /// bucket may simply have aged out.
+    EvictsCurrent,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResyncMode {
     /// No reader wired (`watch_applied(reader: None, ..)`): expiry falls back
@@ -282,6 +368,16 @@ enum Mutation {
     /// silent clamp (gap skipped, resync never triggered) — the live bug
     /// `tests/resync.rs` pinned.
     SilentClamp,
+    /// The pre-fix repair: the key-listing diff even on a bucket that evicts
+    /// current values (absence from NATS taken as deletion). The bug
+    /// `tests/eviction.rs` reproduced live.
+    RelistOnEvicting,
+    /// The restore accepts any published artifact (no
+    /// `protocol::restore_allowed`) — the resume window re-check still runs.
+    NoRestoreGuard,
+    /// The resume after a restore skips its window check, trusting the
+    /// restored cursor (the restore guard still runs).
+    TrustRestoredCursor,
 }
 
 /// Model parameters: which protocol, the importer's resync mode, an optional
@@ -290,6 +386,7 @@ enum Mutation {
 struct SnapshotProtocol<const N: usize> {
     pointer_swap: bool,
     resync: ResyncMode,
+    retention: BucketRetention,
     mutation: Mutation,
     max_rev: u8,
 }
@@ -299,26 +396,60 @@ impl<const N: usize> SnapshotProtocol<N> {
         Self {
             pointer_swap: true,
             resync,
+            retention: BucketRetention::KeepsCurrent,
             mutation: Mutation::None,
             max_rev: MAX_REV,
+        }
+    }
+
+    /// The shipped protocol on a bucket whose retention evicts current
+    /// values.
+    fn evicting(resync: ResyncMode) -> Self {
+        Self {
+            retention: BucketRetention::EvictsCurrent,
+            ..Self::shipped(resync)
         }
     }
 
     fn legacy(resync: ResyncMode) -> Self {
         Self {
             pointer_swap: false,
-            resync,
-            mutation: Mutation::None,
-            max_rev: MAX_REV,
+            ..Self::shipped(resync)
         }
     }
 
-    fn key_present_at(s: &St<N>, cursor: u8) -> bool {
-        s.delete_rev.is_none_or(|d| cursor < d)
+    /// THE TRUTH: the sentinel's value after every write and every real
+    /// delete up to `cursor` — the revision of the put it holds, `None` if
+    /// deleted. Initial put at 0; the delete and the later write apply in
+    /// revision order.
+    fn key_at(s: &St<N>, cursor: u8) -> Option<u8> {
+        let mut key = Some(0);
+        let mut events = [
+            s.delete_rev.map(|d| (d, None)),
+            s.reput_rev.map(|r| (r, Some(r))),
+        ];
+        events.sort();
+        for (rev, value) in events.into_iter().flatten() {
+            if rev <= cursor {
+                key = value;
+            }
+        }
+        key
     }
 
-    fn bucket_has_key(s: &St<N>) -> bool {
-        s.delete_rev.is_none()
+    /// What NATS still lists for the sentinel (its live-key listing, and the
+    /// current value a re-list delivers): the truth, minus a current value
+    /// retention evicted.
+    fn listed(s: &St<N>) -> Option<u8> {
+        Self::key_at(s, s.head).filter(|_| !s.aged)
+    }
+
+    fn status(fold: Option<u8>, truth: Option<u8>) -> FoldStatus {
+        match (fold, truth) {
+            (f, t) if f == t => FoldStatus::Synced,
+            (Some(_), None) => FoldStatus::StaleKey,
+            _ => FoldStatus::Lost,
+        }
     }
 
     /// The expiry guard — THE SHARED KERNEL (`slipstream::protocol`), the
@@ -330,17 +461,30 @@ impl<const N: usize> SnapshotProtocol<N> {
     }
 
     /// Outcome of an expired-cursor fallback WITHOUT a working resync: the
-    /// re-list delivers current values only, so a key deleted during the gap
-    /// is covered iff its delete marker survived retention (delete_rev >
-    /// floor — the fallback watch replays retained history, markers
-    /// included).
+    /// re-list delivers the current values NATS still holds, so a key deleted
+    /// during the gap is covered iff its delete marker survived retention
+    /// (delete_rev > floor, and no later write superseded it — the fallback
+    /// watch replays retained history, markers included); anything else the
+    /// re-list can't deliver (an aged-out current value) leaves the
+    /// artifact's value in place.
     fn relist_only_status(s: &St<N>, a: Artifact) -> FoldStatus {
-        let marker_evicted = s.delete_rev.is_some_and(|d| d <= s.floor);
-        if a.has_key && !Self::bucket_has_key(s) && marker_evicted {
-            FoldStatus::StaleKey
+        let truth = Self::key_at(s, s.head);
+        let marker_delivered = truth.is_none() && s.delete_rev.is_some_and(|d| d > s.floor);
+        let fold = if Self::listed(s).is_some() {
+            truth
+        } else if marker_delivered {
+            None
         } else {
-            FoldStatus::Synced
-        }
+            a.key
+        };
+        Self::status(fold, truth)
+    }
+
+    /// Outcome of the key-listing resync: synthetic deletes for whatever NATS
+    /// no longer lists, then the re-list. The fold becomes the LISTING —
+    /// the truth only on a bucket that keeps current values.
+    fn relist_status(s: &St<N>) -> FoldStatus {
+        Self::status(Self::listed(s), Self::key_at(s, s.head))
     }
 }
 
@@ -352,6 +496,8 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
         vec![St {
             head: 0,
             delete_rev: None,
+            reput_rev: None,
+            aged: false,
             floor: 0,
             applied: [0; N],
             exporters: [ExporterPc::Idle; N],
@@ -360,6 +506,8 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
             uploaded: Default::default(),
             regressed: false,
             refused: false,
+            restored: false,
+            trust_next_resume: false,
             importer: ImporterPc::Start,
         }]
     }
@@ -370,6 +518,17 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
             if s.delete_rev.is_none() {
                 acts.push(Act::DeleteKey);
             }
+            if s.reput_rev.is_none() {
+                acts.push(Act::PutKey);
+            }
+        }
+        // FIFO eviction: a current value ages out only once everything up to
+        // its revision has (the initial put, at 0, predates every message).
+        if self.retention == BucketRetention::EvictsCurrent
+            && !s.aged
+            && Self::key_at(s, s.head).is_some_and(|w| w == 0 || s.floor >= w)
+        {
+            acts.push(Act::AgeOut);
         }
         if s.floor < s.head {
             acts.push(Act::Compact);
@@ -418,6 +577,24 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     acts.push(Act::ResumeResyncDegraded);
                 }
             }
+            // The restore guard — THE SHARED KERNEL
+            // (`slipstream::protocol::restore_allowed`), the same function
+            // `applied.rs`'s restore path executes (`check_restore`): the
+            // pointer must be ahead of the local fold and still inside
+            // retention. Otherwise fail-stop: no enabled action until the
+            // fleet publishes one that is.
+            ImporterPc::Restoring(a) => {
+                if let Some(m) = s.manifest
+                    && (self.mutation == Mutation::NoRestoreGuard
+                        || slipstream::protocol::restore_allowed(
+                            m.cursor as u64,
+                            a.cursor as u64,
+                            s.floor as u64 + 1,
+                        ))
+                {
+                    acts.push(Act::RestoreRead);
+                }
+            }
             _ => {}
         }
     }
@@ -430,6 +607,12 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 s.head += 1;
                 s.delete_rev = Some(s.head);
             }
+            Act::PutKey => {
+                s.head += 1;
+                s.reput_rev = Some(s.head);
+                s.aged = false; // a fresh current value
+            }
+            Act::AgeOut => s.aged = true,
             Act::Compact => s.floor += 1,
             Act::Apply(n) => s.applied[n as usize] += 1,
             Act::Export(n) => {
@@ -437,7 +620,7 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 s.exporters[n as usize] = ExporterPc::Exported(Artifact {
                     node: n,
                     cursor,
-                    has_key: Self::key_present_at(&s, cursor),
+                    key: Self::key_at(&s, cursor),
                 });
             }
             Act::UploadPayload(n) => {
@@ -561,31 +744,68 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 let ImporterPc::Imported(a) = s.importer else {
                     return None;
                 };
-                let status = if self.resume_ok(&s, a) {
+                let trusted = std::mem::take(&mut s.trust_next_resume);
+                if trusted && !self.resume_ok(&s, a) {
+                    // The unchecked resume from a restored cursor that
+                    // retention overran since the restore's check: NATS
+                    // silently clamps, skipping the evicted gap.
+                    s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
+                } else if self.resume_ok(&s, a) {
                     // Window intact (shared kernel `resume_window_ok` — the
                     // same guard `nats.rs` executes): tail replay from the
-                    // embedded cursor. Any delete in the gap has its marker
-                    // retained (delete_rev > a.cursor >= floor), so the
-                    // replay delivers it.
-                    FoldStatus::Synced
+                    // embedded cursor delivers every event past it (all
+                    // retained: > a.cursor >= floor), so the fold reaches
+                    // the truth. A current value that aged out has revision
+                    // <= floor <= a.cursor, so the artifact already holds it.
+                    s.importer = ImporterPc::Resumed(a, FoldStatus::Synced);
                 } else if self.mutation == Mutation::SilentClamp {
                     // Expiry detection removed: the resume silently skips
                     // the gap (NATS's native clamp behavior) — deletes whose
                     // markers were evicted are lost and the resync never
                     // triggers, regardless of the resync mode.
-                    Self::relist_only_status(&s, a)
-                } else if self.resync != ResyncMode::None {
-                    // CursorExpired -> full re-list + a SUCCESSFUL stale-key
-                    // resync: live keys diffed against the fold, vanished
-                    // keys get synthetic deletes. (Under FailStop a failed
-                    // resync fails the watch and changes nothing — this
-                    // action stays enabled for the retry. Under Degrade the
-                    // failed-resync outcome is ResumeResyncDegraded.)
-                    FoldStatus::Synced
+                    s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
+                } else if self.resync == ResyncMode::None {
+                    s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
+                } else if self.retention == BucketRetention::EvictsCurrent
+                    && self.mutation != Mutation::RelistOnEvicting
+                {
+                    // CursorExpired on a bucket that evicts current values:
+                    // NATS's listing can't separate deleted from aged out,
+                    // so the fold is restored from an artifact
+                    // (`ExpiryRepair::Auto` → Restore).
+                    s.importer = ImporterPc::Restoring(a);
                 } else {
-                    Self::relist_only_status(&s, a)
+                    // CursorExpired -> full re-list + a SUCCESSFUL key-
+                    // listing resync: live keys diffed against the fold,
+                    // vanished keys get synthetic deletes. (Under FailStop a
+                    // failed resync fails the watch and changes nothing —
+                    // this action stays enabled for the retry. Under Degrade
+                    // the failed-resync outcome is ResumeResyncDegraded.)
+                    // Sound exactly when the listing is the truth.
+                    s.importer = ImporterPc::Resumed(a, Self::relist_status(&s));
+                }
+            }
+            Act::RestoreRead => {
+                let ImporterPc::Restoring(a) = s.importer else {
+                    return None;
                 };
-                s.importer = ImporterPc::Resumed(a, status);
+                let m = s.manifest?;
+                if self.mutation != Mutation::NoRestoreGuard
+                    && !slipstream::protocol::restore_allowed(
+                        m.cursor as u64,
+                        a.cursor as u64,
+                        s.floor as u64 + 1,
+                    )
+                {
+                    return None;
+                }
+                s.trust_next_resume = self.mutation == Mutation::TrustRestoredCursor;
+                // The in-scope fold becomes the artifact's; the watch then
+                // resumes from its cursor (the next `Resume`, which re-checks
+                // the window — retention can still overrun it, and the
+                // restore runs again for a newer pointer).
+                s.restored = true;
+                s.importer = ImporterPc::Imported(m);
             }
             Act::ResumeResyncDegraded => {
                 let ImporterPc::Imported(a) = s.importer else {
@@ -620,6 +840,7 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     // from an earlier pointer read has cursor <= m.cursor.
                     (ImporterPc::GotManifest(g), Some(m))
                     | (ImporterPc::Imported(g), Some(m))
+                    | (ImporterPc::Restoring(g), Some(m))
                     | (ImporterPc::Resumed(g, _), Some(m)) => g.cursor <= m.cursor,
                     _ => true,
                 },
@@ -684,30 +905,37 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
         props.push(Property::<Self>::always(
             "no mixed import: an installed fold is one exporter's exported state",
             |_, s| match s.importer {
-                ImporterPc::Imported(a) | ImporterPc::Resumed(a, _) => {
+                ImporterPc::Imported(a) | ImporterPc::Restoring(a) | ImporterPc::Resumed(a, _) => {
                     a.node < N as u8
                         && a.cursor >= 1
                         && a.cursor <= s.head
-                        // The artifact's key-set is exactly the bucket state
-                        // at its cursor — imports never Frankenstein.
-                        && a.has_key == s.delete_rev.is_none_or(|d| a.cursor < d)
+                        // The artifact's key-set is exactly the truth at its
+                        // cursor — imports never Frankenstein.
+                        && a.key == Self::key_at(s, a.cursor)
                 }
                 _ => true,
             },
         ));
 
+        fn diverged<const N: usize>(s: &St<N>) -> bool {
+            matches!(
+                s.importer,
+                ImporterPc::Resumed(_, FoldStatus::StaleKey | FoldStatus::Lost)
+            )
+        }
         match self.resync {
             ResyncMode::FailStop => {
-                // ---- THE convergence claim: resync wired with fail-stop
-                // error semantics (`applied.rs` as it ships): bootstrap NEVER
-                // silently diverges — over every interleaving of churn,
-                // deletes, compaction, crashes, racing exporters, and resync
-                // failures (a failed resync fails the watch; only a
-                // successful one completes a bootstrap). -------------------
-                props.push(Property::<Self>::always(
-                    "bootstrap never silently diverges (stale is merely stale)",
-                    |_, s| !matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::StaleKey)),
-                ));
+                // ---- THE convergence claim: repair wired with fail-stop
+                // error semantics (`applied.rs` as it ships, choosing like
+                // `ExpiryRepair::Auto`): a bootstrap NEVER silently diverges
+                // from every write minus every real delete — over every
+                // interleaving of churn, writes, deletes, compaction, aging
+                // out, crashes, racing exporters, and repair failures (a
+                // failed repair fails the watch; only a successful one
+                // completes a bootstrap). ---------------------------------
+                props.push(Property::<Self>::always(DIVERGENCE_THEOREM, |_, s| {
+                    !diverged(s)
+                }));
             }
             ResyncMode::Degrade => {
                 // ---- The PRE-FIX code semantics (resync failure → warn →
@@ -718,7 +946,7 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 // remains an honest record of why.
                 props.push(Property::<Self>::sometimes(
                     "HAZARD reachable: armed resync that degrades on error diverges silently",
-                    |_, s| matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::StaleKey)),
+                    |_, s| diverged(s),
                 ));
             }
             ResyncMode::None => {
@@ -730,7 +958,43 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     "HAZARD reachable: silent stale-key divergence without resync",
                     |_, s| matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::StaleKey)),
                 ));
+                if self.retention == BucketRetention::EvictsCurrent {
+                    // And the eviction hazard: the re-list can't deliver a
+                    // gap write whose current value aged out.
+                    props.push(Property::<Self>::sometimes(
+                        "HAZARD reachable: the re-list alone misses a write that aged out",
+                        |_, s| matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::Lost)),
+                    ));
+                }
             }
+        }
+
+        if self.retention == BucketRetention::EvictsCurrent
+            && self.resync == ResyncMode::FailStop
+            && self.mutation == Mutation::None
+        {
+            // Vacuity witnesses for the theorem on an evicting bucket: it is
+            // earned by restores that really happen past evicted current
+            // values — an aged-out key that was never deleted, and an
+            // aged-out later write — not by the hazard never arising.
+            props.push(Property::<Self>::sometimes(
+                "a restore resumes synced past a key that aged out but was never deleted",
+                |_, s| {
+                    s.restored
+                        && s.aged
+                        && matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::Synced))
+                },
+            ));
+            props.push(Property::<Self>::sometimes(
+                "a restore recovers a later write that aged out",
+                |_, s| {
+                    s.restored
+                        && s.aged
+                        && s.reput_rev.is_some()
+                        && s.delete_rev.is_none()
+                        && matches!(s.importer, ImporterPc::Resumed(_, FoldStatus::Synced))
+                },
+            ));
         }
 
         // Vacuity witness for every always-property above: bootstraps really
@@ -807,6 +1071,77 @@ fn shipped_protocol_pointer_swap_failstop_resync() {
     check(
         SnapshotProtocol::<2>::shipped(ResyncMode::FailStop),
         "shipped: pointer-swap + failstop",
+    );
+}
+
+/// THE EVICTION FIX: on a bucket whose retention evicts current values, the
+/// shipped repair (artifact restore, gated by `protocol::restore_allowed`)
+/// keeps every write minus every real delete — aged-out keys kept, aged-out
+/// gap writes recovered — and every maximal run still ends synced.
+#[test]
+fn evicting_bucket_restores_from_artifact() {
+    check(
+        SnapshotProtocol::<2>::evicting(ResyncMode::FailStop),
+        "evicting: pointer-swap + restore",
+    );
+}
+
+/// The pre-fix repair on an evicting bucket — the key-listing diff, which
+/// takes "NATS no longer lists it" as "deleted" — MUST be caught: the checker
+/// produces a fold that lost a write (a valid key deleted, or an aged-out gap
+/// write never seen).
+#[test]
+fn mutation_relist_on_evicting_bucket_is_caught() {
+    let mut model = SnapshotProtocol::<2>::evicting(ResyncMode::FailStop);
+    model.mutation = Mutation::RelistOnEvicting;
+    let checker = run(model, "mutation: relist on evicting bucket");
+    let path = checker
+        .discovery(DIVERGENCE_THEOREM)
+        .expect("the checker must find the relist-on-evicting divergence");
+    assert!(
+        matches!(
+            path.last_state().importer,
+            ImporterPc::Resumed(_, FoldStatus::Lost)
+        ),
+        "the counterexample is a LOST write (not a stale key): {:?}",
+        path.last_state().importer
+    );
+}
+
+/// The restore's two defenses, separated. The window re-check on the resume
+/// that follows a restore is LOAD-BEARING: retention can overrun the
+/// restored cursor between the restore's check and the resume, and without
+/// the re-check that gap is skipped silently. The restore guard
+/// (`restore_allowed`) is FAIL-FAST: without it a stale artifact is imported
+/// and the resume refuses it, so the theorem still holds (the guard turns a
+/// pointless download-and-retry into an immediate, explained refusal).
+#[test]
+fn restore_defenses_resume_recheck_is_load_bearing_guard_is_fail_fast() {
+    // One exporter suffices: the race is retention vs the importer.
+    let mut model = SnapshotProtocol::<1>::evicting(ResyncMode::FailStop);
+    model.mutation = Mutation::TrustRestoredCursor;
+    let checker = run(model, "mutation: trust restored cursor");
+    assert!(
+        checker.discovery(DIVERGENCE_THEOREM).is_some(),
+        "skipping the post-restore window check must be caught"
+    );
+
+    let mut model = SnapshotProtocol::<1>::evicting(ResyncMode::FailStop);
+    model.mutation = Mutation::NoRestoreGuard;
+    let checker = run(model, "mutation: no restore guard");
+    assert!(
+        checker.discovery(DIVERGENCE_THEOREM).is_none(),
+        "the restore guard is fail-fast, not the safety gate: without it the resume re-check \
+         still refuses a stale artifact"
+    );
+}
+
+/// No repair on an evicting bucket: both divergence classes reachable.
+#[test]
+fn evicting_bucket_without_repair_diverges() {
+    check(
+        SnapshotProtocol::<2>::evicting(ResyncMode::None),
+        "evicting: no repair",
     );
 }
 
@@ -895,9 +1230,7 @@ fn mutation_silent_clamp_is_caught() {
     model.mutation = Mutation::SilentClamp;
     let checker = run(model, "mutation: silent clamp");
     assert!(
-        checker
-            .discovery("bootstrap never silently diverges (stale is merely stale)")
-            .is_some(),
+        checker.discovery(DIVERGENCE_THEOREM).is_some(),
         "the checker must produce a silent-divergence counterexample when \
          expiry detection is removed (the live NATS clamp bug class)"
     );
@@ -915,6 +1248,16 @@ fn deep_more_revisions() {
     let mut model = SnapshotProtocol::<2>::shipped(ResyncMode::FailStop);
     model.max_rev = 5;
     check(model, "deep: 2 exporters, rev <= 5");
+}
+
+/// The eviction axis at more revisions: restores racing more churn, aging,
+/// and compaction.
+#[test]
+#[ignore = "deep bounds: run in release"]
+fn deep_evicting_more_revisions() {
+    let mut model = SnapshotProtocol::<2>::evicting(ResyncMode::FailStop);
+    model.max_rev = 4;
+    check(model, "deep: evicting, 2 exporters, rev <= 4");
 }
 
 /// THREE exporters: the classic check that nothing in the protocol is

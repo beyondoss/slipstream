@@ -10,7 +10,8 @@ use tokio::sync::{RwLock, mpsc::Sender};
 use tracing::{debug, error, info, warn};
 
 use crate::kv::{
-    KvEntry, KvError, KvPurge, KvReader, KvUpdate, KvWatcher, KvWriter, VersionToken, WatchCursor,
+    KvEntry, KvError, KvPurge, KvReader, KvUpdate, KvWatcher, KvWriter, Retention, VersionToken,
+    WatchCursor,
 };
 use crate::stores::{Connection, ConnectionCapabilities, DiscardPolicy, KvStore, StoreConfig};
 
@@ -1053,22 +1054,24 @@ const FLOOR_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 /// before the entry is processed: fetch `first_sequence` and apply the
 /// shared kernel (`protocol::resume_window_ok`) to the frontier. A benign
 /// gap (interior per-subject eviction with the floor still at or below the
-/// frontier) passes; head eviction past the frontier fails the watch, and
-/// the caller's restart routes into the verified resume → `CursorExpired` →
-/// resync repair path. The periodic probe backstops the no-traffic case.
+/// frontier) passes; head eviction past the frontier ends the watch with
+/// [`KvError::CursorExpired`], after everything up to the frontier has been
+/// delivered. `watch_applied` routes that into the same expiry repair a
+/// resume-time expiry takes (artifact restore on a bucket that evicts current
+/// values, the key-listing diff otherwise), in process. The periodic probe
+/// backstops the no-traffic case.
 ///
 /// Scope: sound only where density holds — the unfiltered resume watch.
 /// Prefix-scoped watches deliver sparse revisions by design and cannot
 /// distinguish benign from hazardous eviction client-side; they retain the
 /// (narrowed) retention-outlives-lag operating axiom plus the resume-time
-/// check on every restart (model axiom 5).
+/// check on every restart (model axiom 6).
 ///
 /// The guarantee split, precisely: the SAFETY half — never folding past
 /// unexamined evidence of loss — is unconditional in this loop (the gap
 /// check precedes processing, and a stalled downstream stalls folding too).
-/// The REPAIR half is conditional on the caller restarting the failed watch
-/// (standard supervision; same posture as the resync fail-stop): a trip
-/// with no restart is a loudly dead watch, never a silently wrong one.
+/// The REPAIR half belongs to the caller of the `_from` watch: a raw caller
+/// that ignores the error has a loudly dead watch, never a silently wrong one.
 async fn stream_watch_floor_guarded(
     mut watcher: async_nats::jetstream::kv::Watch,
     tx: &Sender<KvUpdate>,
@@ -1083,18 +1086,19 @@ async fn stream_watch_floor_guarded(
             .map_err(|e| KvError::OperationFailed(format!("floor guard stream lookup: {e}")))?;
         Ok::<u64, KvError>(stream.cached_info().state.first_sequence)
     };
+    // The frontier's position has expired exactly as a resume cursor would
+    // have: surface it as `CursorExpired` (mid-stream) so `watch_applied`
+    // routes it into the same expiry repair as a resume-time expiry, in
+    // process, instead of failing the watch and depending on a restart.
     fn trip(frontier: u64, first: u64, bucket: &str) -> KvError {
         warn!(
             frontier,
             first_sequence = first,
             bucket,
-            "stream retention overran this live watch; failing so the restart can resync \
-             (messages in the gap were evicted unseen)"
+            "stream retention overran this live watch (messages in the gap were evicted \
+             unseen); reporting the frontier as an expired cursor so it is repaired"
         );
-        KvError::WatchError(format!(
-            "stream retention overran live watch (first_sequence {first} > delivered \
-             frontier {frontier} + 1); restart will resync"
-        ))
+        KvError::CursorExpired
     }
 
     let mut frontier = resume_revision;
@@ -1300,6 +1304,24 @@ impl NatsKvWatcher {
         }
         Ok(())
     }
+}
+
+/// Whether a KV stream's retention can evict a key's CURRENT value — not just
+/// history its own later revisions superseded. Any of these can:
+/// - `max_age`: every message ages out, the newest revision of a key included.
+/// - per-message TTLs (`allow_msg_ttl`): a key's value can carry its own expiry.
+/// - `discard: old` under a byte or message limit: the oldest messages go when
+///   the stream fills, whether or not they are still current.
+///
+/// `discard: new` rejects writes at the limit instead of evicting, and the
+/// per-subject history limit only drops superseded revisions, so neither
+/// counts. When this returns false, a key missing from the bucket was deleted;
+/// when it returns true, it may simply have aged out.
+fn evicts_current_values(config: &async_nats::jetstream::stream::Config) -> bool {
+    use async_nats::jetstream::stream::DiscardPolicy as NatsDiscard;
+    !config.max_age.is_zero()
+        || config.allow_message_ttl
+        || (config.discard == NatsDiscard::Old && (config.max_bytes > 0 || config.max_messages > 0))
 }
 
 #[async_trait]
@@ -1537,6 +1559,21 @@ impl KvWatcher for NatsKvWatcher {
         }
         Ok(())
     }
+
+    async fn retention(&self) -> Result<Option<Retention>, KvError> {
+        // Fresh stream info, not a cached handle: the expiry repair decides
+        // from this whether the key listing can be trusted, so it must reflect
+        // the bucket's config now (an operator can edit a live stream), and
+        // `first_revision` gates an artifact's freshness.
+        let stream = timed(self.js.get_stream(format!("KV_{}", self.bucket)))
+            .await?
+            .map_err(|e| KvError::OperationFailed(format!("get KV stream for retention: {e}")))?;
+        let info = stream.cached_info();
+        Ok(Some(Retention {
+            evicts_current_values: evicts_current_values(&info.config),
+            first_revision: info.state.first_sequence,
+        }))
+    }
 }
 
 struct NatsKvWriterImpl {
@@ -1648,6 +1685,53 @@ impl std::fmt::Debug for NatsConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evicts_current_values_classifies_retention() {
+        use async_nats::jetstream::stream::{Config, DiscardPolicy as NatsDiscard};
+        let kv = |f: fn(&mut Config)| {
+            // KV defaults: discard:new, unlimited age, per-subject history.
+            let mut c = Config {
+                max_messages_per_subject: 1,
+                discard: NatsDiscard::New,
+                ..Default::default()
+            };
+            f(&mut c);
+            evicts_current_values(&c)
+        };
+        assert!(
+            !kv(|_| {}),
+            "history-only eviction drops superseded revisions only"
+        );
+        assert!(
+            !kv(|c| c.max_bytes = 1 << 20),
+            "discard:new rejects at the limit"
+        );
+        assert!(kv(|c| c.max_age = Duration::from_secs(60)), "max_age");
+        assert!(kv(|c| c.allow_message_ttl = true), "per-message TTLs");
+        assert!(
+            kv(|c| {
+                c.discard = NatsDiscard::Old;
+                c.max_bytes = 1 << 20;
+            }),
+            "discard:old under a byte limit"
+        );
+        assert!(
+            kv(|c| {
+                c.discard = NatsDiscard::Old;
+                c.max_messages = 100;
+            }),
+            "discard:old under a message limit"
+        );
+        assert!(
+            !kv(|c| {
+                c.discard = NatsDiscard::Old;
+                c.max_bytes = -1;
+                c.max_messages = -1;
+            }),
+            "discard:old with no limit has nothing to discard"
+        );
+    }
 
     #[test]
     fn raw_create_success_has_no_error() {
@@ -2070,10 +2154,9 @@ mod floor_guard_tests {
         .await
         .expect("the trip must be IN-BAND (immediate), not backstop-paced")
         .expect_err("a gapped delivery over an advanced floor must trip");
-        assert!(
-            err.to_string().contains("retention overran live watch"),
-            "{err}"
-        );
+        // Reported as an expired cursor so `watch_applied` repairs it in
+        // process through the same path as a resume-time expiry.
+        assert!(matches!(err, KvError::CursorExpired), "{err:?}");
         drop(tx);
         let _ = drain.await;
     }
@@ -2114,5 +2197,134 @@ mod floor_guard_tests {
         }
         assert_eq!(got, vec![4, 5, 6, 7], "interior gaps jumped, tail dense");
         guard.abort(); // endless live watch; the assertion above is the test
+    }
+
+    /// `retention()` reads the live stream: `discard: old` under a byte limit
+    /// and `max_age` both evict current values; the default `discard: new`
+    /// bucket does not. `first_revision` tracks the stream's head.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_reports_current_value_eviction() {
+        let server = start_server().await;
+        let conn = crate::NatsConnection::new(crate::NatsConnectionConfig {
+            url: server.url.clone(),
+            creds: None,
+            creds_file: None,
+        });
+        conn.connect().await.unwrap();
+        let open = |name: &str, max_age, discard| StoreConfig {
+            name: name.to_string(),
+            max_age,
+            max_bytes: Some(1 << 20),
+            discard,
+            ..Default::default()
+        };
+
+        let config = conn
+            .store_with_config(open("config", None, DiscardPolicy::New))
+            .await
+            .unwrap();
+        let log = conn
+            .store_with_config(open("log", None, DiscardPolicy::Old))
+            .await
+            .unwrap();
+        let aged = conn
+            .store_with_config(open(
+                "aged",
+                Some(Duration::from_secs(3600)),
+                DiscardPolicy::New,
+            ))
+            .await
+            .unwrap();
+
+        let r = |s: &Arc<dyn KvStore>| {
+            let w = s.watcher().unwrap();
+            async move {
+                w.retention()
+                    .await
+                    .unwrap()
+                    .expect("NATS reports retention")
+            }
+        };
+        assert!(
+            !r(&config).await.evicts_current_values,
+            "discard:new never evicts"
+        );
+        assert!(
+            r(&log).await.evicts_current_values,
+            "discard:old under max_bytes"
+        );
+        assert!(r(&aged).await.evicts_current_values, "max_age");
+
+        // The two inputs no StoreConfig expresses, set on live streams:
+        // per-message TTLs, and discard:old under a message-count limit.
+        let raw = async_nats::connect(&server.url).await.unwrap();
+        let js = async_nats::jetstream::new(raw);
+        let ttl = conn
+            .store_with_config(open("ttl", None, DiscardPolicy::New))
+            .await
+            .unwrap();
+        let mut cfg = js
+            .get_stream("KV_ttl")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.allow_message_ttl = true;
+        js.update_stream(cfg)
+            .await
+            .expect("enable per-message TTLs");
+        assert!(r(&ttl).await.evicts_current_values, "per-message TTLs");
+
+        let counted = conn
+            .store_with_config(open("counted", None, DiscardPolicy::New))
+            .await
+            .unwrap();
+        let mut cfg = js
+            .get_stream("KV_counted")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.max_bytes = -1;
+        cfg.max_messages = 100;
+        cfg.discard = async_nats::jetstream::stream::DiscardPolicy::Old;
+        js.update_stream(cfg)
+            .await
+            .expect("discard:old under max_msgs");
+        assert!(
+            r(&counted).await.evicts_current_values,
+            "discard:old under max_msgs"
+        );
+
+        // And an edit to a live stream is seen: retention is read live, not
+        // remembered from creation.
+        let mut cfg = js
+            .get_stream("KV_config")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.max_age = Duration::from_secs(3600);
+        js.update_stream(cfg)
+            .await
+            .expect("add max_age to a live bucket");
+        assert!(
+            r(&config).await.evicts_current_values,
+            "max_age added out-of-band"
+        );
+
+        // first_revision follows head eviction.
+        let w = config.writer().unwrap();
+        for _ in 0..3 {
+            w.put("k", b"v").await.unwrap();
+        }
+        assert_eq!(
+            r(&config).await.first_revision,
+            3,
+            "history 1 superseded revs 1-2"
+        );
     }
 }

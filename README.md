@@ -195,6 +195,8 @@ match watcher.watch_all_from(&cursor, tx.clone()).await {
 }
 ```
 
+The full replay only re-delivers what NATS still holds. On a bucket with `max_age` or `discard: old`, values that aged out are gone from it; [`watch_applied`](#cursor-expiry) restores those from an artifact.
+
 `watch_prefix_from()` works the same way for prefix-filtered streams, and
 `watch_prefixes_from()` resumes the union of several prefixes on one
 multi-filter consumer.
@@ -298,7 +300,7 @@ let (resume, store) = AppendLogSnapshot::load(Path::new("/var/lib/svc/state.snap
 
 let final_cursor = watch_applied(
     watcher, WatchScope::All, Some(resume),
-    Some(reader),       // arms the cursor-expired stale-key resync; None to skip
+    repair,             // cursor-expiry repair (see "Cursor expiry"); None to skip
     Some(store), None,  // store; export-request channel
     BatchConfig::default(),
     parse, apply, on_applied, shutdown,
@@ -318,8 +320,8 @@ let final_cursor = watch_applied(
     watcher,
     WatchScope::All,                  // or Prefix("node.".into()) / Prefixes(vec![...])
     Some(resume),                     // Option<WatchCursor> — resume here, or None
-    Some(reader),                     // Option<Arc<dyn KvReader>> — arms the
-                                      //   cursor-expired stale-key resync, or None
+    repair,                           // ExpiryRepair — how an expired cursor is
+                                      //   repaired (see below), or None
     Some(store),                      // any SnapshotStore (e.g. AppendLogSnapshot), or None
     None,                             // Option<mpsc::Receiver<ExportRequest>> — live exports
     BatchConfig::default(),           // 10ms window, 100 updates per batch
@@ -332,13 +334,45 @@ let final_cursor = watch_applied(
 
 A batch closes when `window` elapses or it hits `max` updates, whichever comes first. Then, in order: `apply(batch)` runs to completion, the cursor advances to the batch's highest revision, the batch + cursor are folded into the `store` atomically (on a blocking task), and `on_applied` fires.
 
+With a `store`, resume from the cursor the store reports (`load`/`open`), not one you persisted in `on_applied`: across a transient store failure, `on_applied` reports a cursor ahead of what the store has made durable.
+
 Persist the cursor on receipt instead and a crash between receive and apply loses data: the cursor reads "caught up to rev N" while rev N sits in an unapplied buffer, and the next resume starts past it. `watch_applied` checkpoints at the applied cursor, so a persisted cursor always means every update up to it has been applied.
 
 - `parse` returning `None` (corrupt bytes, irrelevant key) still advances the cursor — nothing to apply means nothing to skip.
-- On `CursorExpired`, it falls back to a full watch automatically. With a `reader` wired, it first diffs the fold against the bucket's live keys and applies synthetic deletes for keys that vanished during the gap (their delete markers were evicted with the cursor) — the one case the fallback re-list can't cover.
+- On `CursorExpired` it repairs the fold, then keeps watching. See [Cursor expiry](#cursor-expiry).
 - It returns the final applied cursor on shutdown or stream close.
 
 `apply` runs inline. If it panics, the panic aborts the watch.
+
+### Cursor expiry
+
+A cursor expires when NATS has evicted the revisions after it: at resume, or mid-watch when retention overruns a live All-scope watch (the floor guard). Both take the same repair, and the right repair depends on what the bucket's retention evicts.
+
+**Buckets that keep current values** (`discard: new`, no `max_age`). Only old history and delete markers get evicted, so a key missing from the bucket was deleted. `ExpiryRepair::Relist(reader)` lists the bucket's live keys, deletes the fold's in-scope keys that are gone, then re-lists every live value.
+
+**Buckets that evict current values** (`max_age`, or `discard: old` under `max_bytes`). A key missing from the bucket may just have aged out, and a write made while the node was offline may have aged out too. NATS can't tell those apart from a delete, so the key list can't be trusted. `ExpiryRepair::Restore { reader, restore }` replaces the in-scope fold with the newest published artifact (which holds every write minus every real delete) and resumes from its cursor. It never moves a key to an older revision and never deletes a key the bucket lists as live, so even an artifact exported while its exporter was catching up produces no transient phantom deletes or regressions. `Relist` is refused on these buckets: the watch fails rather than delete valid keys.
+
+`ExpiryRepair::Auto { reader, restore }` reads the bucket's retention at expiry and picks for you:
+
+```rust
+use slipstream::{ArtifactRestore, ExpiryRepair};
+
+let repair = ExpiryRepair::Auto {
+    reader: bucket.reader(),
+    restore: Arc::new(ArtifactRestore::new(
+        transport,                 // Arc<dyn ArtifactTransport>, same key the fleet exports to
+        "routes/latest",
+        "/var/lib/svc/scratch",    // same filesystem as the fold
+        |artifact, dest| FjallSnapshot::import(artifact, dest, config.clone()),
+    )),
+};
+```
+
+A restore only accepts an artifact that is ahead of the local fold, covers the watch's scope (recorded in the artifact by the exporting `watch_applied`), and whose cursor NATS still retains. Otherwise there is no safe recovery: the watch fails and logs the reason at `error`. **Run exports well inside `max_age`** (or the `discard: old` turnover), or an expired node has nothing fresh to restore from.
+
+A node with no cursor on a bucket that has already evicted current values seeds from the artifact too, since a re-list alone would miss whatever aged out.
+
+`Some(reader)` from older code still compiles and means `Relist`. `None` (or no `store`) falls back to the re-list alone and warns that deleted keys may persist.
 
 ## NATS mapping
 
@@ -371,7 +405,7 @@ if caps.global_ordering { /* VersionToken is globally ordered across keys */ }
 | `NotConnected`     | Operation before `connect()`                         | Call `connect()`           |
 | `AlreadyExists`    | `create()` on a live key                             | Read current state, decide |
 | `RevisionMismatch` | CAS conflict on `update()` / `delete_with_version()` | Re-read, retry             |
-| `CursorExpired`    | `watch_*_from()` cursor compacted by NATS            | Fall back to `watch_all()` |
+| `CursorExpired`    | `watch_*_from()` cursor compacted by NATS (at resume, or mid-stream when retention overruns an All-scope watch) | `watch_applied` repairs it; raw callers fall back to `watch_all()` on buckets that keep current values |
 | `WatchError`       | NATS stream dropped                                  | Re-subscribe               |
 
 ## Credentials

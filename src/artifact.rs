@@ -45,7 +45,17 @@ use crate::snapshot::SnapshotError;
 /// Version of the artifact layout itself (`MANIFEST.json` schema + `data/`
 /// payload convention). Bumped only when the artifact shape changes; the
 /// *payload* format is governed separately by [`ExportManifest::backend_version`].
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+///
+/// This is the newest layout this build writes and reads: schema 2 adds the
+/// exporter's key [`scope`](ExportManifest::scope). Schema 1 (no scope) is
+/// still read, and still written for artifacts exported outside
+/// [`watch_applied`](crate::watch_applied), which has no scope to record.
+/// Builds older than schema 2 refuse a schema-2 manifest, so upgrade the
+/// importing nodes before the exporting ones.
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 2;
+
+/// The pre-scope artifact layout: identical to schema 2 minus `scope`.
+pub(crate) const SCHEMA_UNSCOPED: u32 = 1;
 
 /// Manifest file name at the artifact root. Written last and fsynced, so its
 /// presence (after the atomic rename) means the artifact is complete.
@@ -78,6 +88,13 @@ pub struct ExportManifest {
     /// Every payload file, with size and BLAKE3 digest. Import verifies all of
     /// them and rejects undeclared extras.
     pub files: Vec<ArtifactFile>,
+    /// The key scope the exporting fold covered, as key prefixes (`[""]` is
+    /// every key). [`watch_applied`](crate::watch_applied) records its
+    /// [`WatchScope`](crate::WatchScope) on every export it serves. `None` for
+    /// an artifact exported directly through `export_to` or by a pre-scope
+    /// build (schema 1): its coverage is unknown, so the automatic expiry
+    /// restore refuses it.
+    pub scope: Option<Vec<String>>,
 }
 
 /// One payload file in an [`ExportManifest`].
@@ -116,6 +133,9 @@ struct ManifestWire {
     cursor_hex: String,
     created_at_unix: u64,
     files: Vec<FileWire>,
+    /// Schema 2 only (required there, forbidden in schema 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,6 +214,7 @@ pub(crate) fn write_manifest(
                 blake3: f.blake3.clone(),
             })
             .collect(),
+        scope: manifest.scope.clone(),
     };
     let json = serde_json::to_vec_pretty(&wire)
         .map_err(|e| SnapshotError::Backend(format!("manifest serialization failed: {e}")))?;
@@ -228,11 +249,24 @@ pub(crate) fn manifest_from_slice(data: &[u8]) -> Result<ExportManifest, Snapsho
     let wire: ManifestWire =
         serde_json::from_slice(data).map_err(|e| invalid(format!("malformed manifest: {e}")))?;
 
-    if wire.schema_version != ARTIFACT_SCHEMA_VERSION {
-        return Err(invalid(format!(
-            "unsupported artifact schema_version {} (this build supports {})",
-            wire.schema_version, ARTIFACT_SCHEMA_VERSION
-        )));
+    match (wire.schema_version, &wire.scope) {
+        (SCHEMA_UNSCOPED, None) | (ARTIFACT_SCHEMA_VERSION, Some(_)) => {}
+        (SCHEMA_UNSCOPED, Some(_)) => {
+            return Err(invalid(format!(
+                "schema_version {SCHEMA_UNSCOPED} manifest carries a scope (introduced in {ARTIFACT_SCHEMA_VERSION})"
+            )));
+        }
+        (ARTIFACT_SCHEMA_VERSION, None) => {
+            return Err(invalid(format!(
+                "schema_version {ARTIFACT_SCHEMA_VERSION} manifest is missing its scope"
+            )));
+        }
+        (v, _) => {
+            return Err(invalid(format!(
+                "unsupported artifact schema_version {v} (this build supports \
+                 {SCHEMA_UNSCOPED}..={ARTIFACT_SCHEMA_VERSION})"
+            )));
+        }
     }
     for f in &wire.files {
         validate_payload_path(&f.path)?;
@@ -253,7 +287,28 @@ pub(crate) fn manifest_from_slice(data: &[u8]) -> Result<ExportManifest, Snapsho
                 blake3: f.blake3,
             })
             .collect(),
+        scope: wire.scope,
     })
+}
+
+/// Record the exporting fold's key `scope` in a sealed artifact's manifest,
+/// upgrading it to schema 2 — what [`watch_applied`](crate::watch_applied)
+/// does to every artifact it exports, so a restore can check the artifact
+/// covers the restoring watcher's scope.
+///
+/// The rewrite is the same tempfile + fsync + atomic rename as every manifest
+/// write, so the artifact is complete and verifiable at every instant (the
+/// payload and its hashes are untouched). Returns the updated manifest.
+pub(crate) fn stamp_scope(
+    artifact_dir: &Path,
+    scope: &[String],
+) -> Result<ExportManifest, SnapshotError> {
+    let mut manifest = read_manifest(artifact_dir)?;
+    manifest.schema_version = ARTIFACT_SCHEMA_VERSION;
+    manifest.scope = Some(scope.to_vec());
+    write_manifest(artifact_dir, &manifest)?;
+    fsync_dir(artifact_dir)?;
+    Ok(manifest)
 }
 
 /// Reject any manifest path that could escape the artifact when joined: it must
@@ -494,7 +549,9 @@ impl ExportStage {
         let root = self.dir.path();
         let files = hash_payload(root)?;
         let manifest = ExportManifest {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
+            // Unscoped: the backend doesn't know the watch scope. The
+            // `watch_applied` export path stamps it (`stamp_scope`).
+            schema_version: SCHEMA_UNSCOPED,
             backend: backend.to_string(),
             backend_version: backend_version.to_string(),
             cursor: cursor.clone(),
@@ -503,6 +560,7 @@ impl ExportStage {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             files,
+            scope: None,
         };
         write_manifest(root, &manifest)?;
         fsync_dir(root)?;
@@ -660,12 +718,13 @@ mod tests {
 
     fn manifest_with(files: Vec<ArtifactFile>, cursor: WatchCursor) -> ExportManifest {
         ExportManifest {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
+            schema_version: SCHEMA_UNSCOPED,
             backend: "append-log".into(),
             backend_version: "2".into(),
             cursor,
             created_at_unix: 1_765_400_000,
             files,
+            scope: None,
         }
     }
 
@@ -690,6 +749,56 @@ mod tests {
         assert_eq!(got.files.len(), 1);
         assert_eq!(got.files[0].path, "data/fold.snap");
         assert_eq!(got.files[0].size, 42);
+    }
+
+    /// `stamp_scope` upgrades a sealed (schema 1) manifest to schema 2 with
+    /// the scope, and the result reads back; schema/scope disagreement in
+    /// either direction is refused.
+    #[test]
+    fn scope_stamp_round_trips_and_schema_must_agree() {
+        let dir = TempDir::new().unwrap();
+        write_manifest(dir.path(), &manifest_with(vec![], WatchCursor::from_u64(9))).unwrap();
+        let scope = vec!["node.".to_string(), "edge.".to_string()];
+        let stamped = stamp_scope(dir.path(), &scope).unwrap();
+        assert_eq!(stamped.schema_version, ARTIFACT_SCHEMA_VERSION);
+        let got = read_manifest(dir.path()).unwrap();
+        assert_eq!(got.scope.as_deref(), Some(&scope[..]));
+        assert_eq!(got.cursor, WatchCursor::from_u64(9));
+
+        // Schema 1 with a scope, schema 2 without one: both refused.
+        write_raw_manifest(
+            dir.path(),
+            &wire_json("", "[]", SCHEMA_UNSCOPED).replace('}', r#","scope":[""]}"#),
+        );
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(SnapshotError::ArtifactInvalid(_))
+        ));
+        write_raw_manifest(dir.path(), &wire_json("", "[]", ARTIFACT_SCHEMA_VERSION));
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(SnapshotError::ArtifactInvalid(_))
+        ));
+    }
+
+    /// The whole schema/scope matrix: a manifest is accepted iff it is
+    /// schema 1 without a scope or schema 2 with one.
+    #[test]
+    fn schema_scope_matrix() {
+        let dir = TempDir::new().unwrap();
+        for schema in 0..=3u32 {
+            for scoped in [false, true] {
+                let mut json = wire_json("", "[]", schema);
+                if scoped {
+                    json = json.replace('}', r#","scope":["node."]}"#);
+                }
+                write_raw_manifest(dir.path(), &json);
+                let accepted = read_manifest(dir.path()).is_ok();
+                let want = (schema == SCHEMA_UNSCOPED && !scoped)
+                    || (schema == ARTIFACT_SCHEMA_VERSION && scoped);
+                assert_eq!(accepted, want, "schema {schema}, scoped {scoped}");
+            }
+        }
     }
 
     #[test]
@@ -728,7 +837,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for bad in ["zz", "abc", "0102030405060708090a0b"] {
             // non-hex, odd length, 11 bytes (> token capacity)
-            write_raw_manifest(dir.path(), &wire_json(bad, "[]", ARTIFACT_SCHEMA_VERSION));
+            write_raw_manifest(dir.path(), &wire_json(bad, "[]", SCHEMA_UNSCOPED));
             match read_manifest(dir.path()) {
                 Err(SnapshotError::ArtifactInvalid(_)) => {}
                 other => panic!("cursor_hex {bad:?}: expected ArtifactInvalid, got {other:?}"),
@@ -767,7 +876,7 @@ mod tests {
                 r#"[{{"path":"{}","size":0,"blake3":""}}]"#,
                 bad.replace('\\', "\\\\")
             );
-            write_raw_manifest(dir.path(), &wire_json("", &files, ARTIFACT_SCHEMA_VERSION));
+            write_raw_manifest(dir.path(), &wire_json("", &files, SCHEMA_UNSCOPED));
             match read_manifest(dir.path()) {
                 Err(SnapshotError::ArtifactInvalid(_)) => {}
                 other => panic!("path {bad:?}: expected ArtifactInvalid, got {other:?}"),
