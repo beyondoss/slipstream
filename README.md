@@ -334,6 +334,8 @@ let final_cursor = watch_applied(
 
 A batch closes when `window` elapses or it hits `max` updates, whichever comes first. Then, in order: `apply(batch)` runs to completion, the cursor advances to the batch's highest revision, the batch + cursor are folded into the `store` atomically (on a blocking task), and `on_applied` fires.
 
+With a `store`, resume from the cursor the store reports (`load`/`open`), not one you persisted in `on_applied`: across a transient store failure, `on_applied` reports a cursor ahead of what the store has made durable.
+
 Persist the cursor on receipt instead and a crash between receive and apply loses data: the cursor reads "caught up to rev N" while rev N sits in an unapplied buffer, and the next resume starts past it. `watch_applied` checkpoints at the applied cursor, so a persisted cursor always means every update up to it has been applied.
 
 - `parse` returning `None` (corrupt bytes, irrelevant key) still advances the cursor — nothing to apply means nothing to skip.
@@ -348,7 +350,7 @@ A cursor expires when NATS has evicted the revisions after it: at resume, or mid
 
 **Buckets that keep current values** (`discard: new`, no `max_age`). Only old history and delete markers get evicted, so a key missing from the bucket was deleted. `ExpiryRepair::Relist(reader)` lists the bucket's live keys, deletes the fold's in-scope keys that are gone, then re-lists every live value.
 
-**Buckets that evict current values** (`max_age`, or `discard: old` under `max_bytes`). A key missing from the bucket may just have aged out, and a write made while the node was offline may have aged out too. NATS can't tell those apart from a delete, so the key list can't be trusted. `ExpiryRepair::Restore(source)` replaces the in-scope fold with the newest published artifact (which holds every write minus every real delete) and resumes from its cursor. `Relist` is refused on these buckets: the watch fails rather than delete valid keys.
+**Buckets that evict current values** (`max_age`, or `discard: old` under `max_bytes`). A key missing from the bucket may just have aged out, and a write made while the node was offline may have aged out too. NATS can't tell those apart from a delete, so the key list can't be trusted. `ExpiryRepair::Restore { reader, restore }` replaces the in-scope fold with the newest published artifact (which holds every write minus every real delete) and resumes from its cursor. It never moves a key to an older revision and never deletes a key the bucket lists as live, so even an artifact exported while its exporter was catching up produces no transient phantom deletes or regressions. `Relist` is refused on these buckets: the watch fails rather than delete valid keys.
 
 `ExpiryRepair::Auto { reader, restore }` reads the bucket's retention at expiry and picks for you:
 

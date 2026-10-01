@@ -64,12 +64,24 @@ pub enum ExpiryRepair<S> {
     /// Also used at a cursor-less start when the watcher reports that
     /// retention has already evicted current values: the bucket alone can no
     /// longer seed a complete fold.
-    Restore(Arc<dyn RestoreSource<S>>),
+    ///
+    /// The `reader` lists the bucket's live keys at restore time. A restore
+    /// never deletes a key that is listed live, nor moves a key to an older
+    /// revision: an artifact exported while its exporter was catching up
+    /// lacks (or holds older values for) keys whose latest write is after
+    /// its cursor, and the resume delivers those — so the consumer never
+    /// sees a phantom delete or a regression, even transiently.
+    Restore {
+        /// Lists live keys, so the restore never deletes a live one.
+        reader: Arc<dyn KvReader>,
+        /// Supplies the artifact.
+        restore: Arc<dyn RestoreSource<S>>,
+    },
     /// Decide by the bucket's live retention, read at the moment of expiry:
     /// [`Relist`](Self::Relist) when it never evicts current values,
     /// [`Restore`](Self::Restore) when it does or can't say.
     Auto {
-        /// Lists live keys for the key-listing diff.
+        /// Lists live keys (for either repair).
         reader: Arc<dyn KvReader>,
         /// Supplies the artifact for a restore.
         restore: Arc<dyn RestoreSource<S>>,
@@ -219,34 +231,57 @@ impl RestoreOp {
     }
 }
 
-/// The in-scope keys whose state differs between the `local` fold and the
-/// `artifact` fold: what turns the local fold into the artifact's, scope by
-/// scope. Keys only, in key order — values are read back in bounded chunks
-/// ([`materialize`]), so a restore never holds the whole changed set's values
-/// at once (the same discipline as the key-listing diff).
+/// Does the local entry already hold the artifact's value or a newer one?
+/// Revisions decide when both have one; otherwise only identical entries
+/// count.
+fn local_is_current(local: &KvEntry, artifact: &KvEntry) -> bool {
+    match (local.version.as_u64(), artifact.version.as_u64()) {
+        (Some(l), Some(a)) if l != a => l > a,
+        _ => local.version == artifact.version && local.value == artifact.value,
+    }
+}
+
+/// The in-scope ops that bring the `local` fold to the `artifact` fold's
+/// state at its cursor `C`, without ever moving a key backward or deleting a
+/// live one. Keys only, in key order — values are read back in bounded
+/// chunks ([`materialize`]), so a restore never holds the whole changed set's
+/// values at once (the same discipline as the key-listing diff).
 ///
-/// Wholesale replacement within the scope: an artifact key whose entry
-/// differs is a `Put`, a local key the artifact lacks is a `Delete` (its
-/// exporter folded a real delete). Out-of-scope keys are untouched on both
-/// sides.
+/// An artifact is complete together with the log after its cursor: every
+/// RETAINED message at or below `C` is in it, but a key whose latest write is
+/// after `C` may be missing or older (its exporter was mid catch-up). The
+/// resume from `C` delivers those. So, per in-scope key:
+///
+/// - **artifact has it**: `Put`, unless the local entry is already the same
+///   or NEWER — then the key's latest write must be after `C` (the artifact
+///   would hold it otherwise), and the resume delivers it; taking the older
+///   artifact value would move the key backward.
+/// - **artifact lacks it, local has it**: `Delete`, unless the bucket lists
+///   it as `live` — then its current value is a write after `C` (again, the
+///   artifact would hold it otherwise), which the resume delivers; deleting
+///   it would drop a live key. A key not listed was really deleted (or its
+///   delete marker evicted), which is exactly what the exporter folded.
+///
+/// Out-of-scope keys are untouched on both sides.
 pub(crate) fn restore_diff<S: SnapshotStore>(
     local: &S,
     artifact: &S,
     prefixes: &[String],
+    live: &std::collections::HashSet<String>,
 ) -> Result<Vec<RestoreOp>, SnapshotError> {
     let mut ops = Vec::new();
     for prefix in prefixes {
         artifact.for_each_in_range(prefix, |entry| {
-            let same = local
+            let current = local
                 .get(&entry.key)?
-                .is_some_and(|l| l.version == entry.version && l.value == entry.value);
-            if !same {
+                .is_some_and(|l| local_is_current(&l, &entry));
+            if !current {
                 ops.push(RestoreOp::Put(entry.key));
             }
             Ok(())
         })?;
         local.for_each_in_range(prefix, |entry| {
-            if artifact.get(&entry.key)?.is_none() {
+            if !live.contains(&entry.key) && artifact.get(&entry.key)?.is_none() {
                 ops.push(RestoreOp::Delete(entry.key));
             }
             Ok(())
@@ -394,7 +429,13 @@ mod tests {
             ],
             9,
         );
-        let ops = restore_diff(&local, &artifact, &["node.".to_string()]).unwrap();
+        let ops = restore_diff(
+            &local,
+            &artifact,
+            &["node.".to_string()],
+            &Default::default(),
+        )
+        .unwrap();
         let got: Vec<(String, bool)> = ops
             .iter()
             .map(|o| (o.key().to_string(), matches!(o, RestoreOp::Put(_))))
@@ -431,7 +472,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let local = fold(&dir, "local", &[put("node.a", b"1", 1)], 1);
         let artifact = fold(&dir, "artifact", &[put("node.b", b"2", 2)], 2);
-        let ops = restore_diff(&local, &artifact, &["node.".into(), "node".into()]).unwrap();
+        let ops = restore_diff(
+            &local,
+            &artifact,
+            &["node.".into(), "node".into()],
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(ops.len(), 2, "each key once despite two covering prefixes");
     }
 
@@ -568,74 +615,102 @@ mod tests {
     }
 
     /// THE RESTORE, exhaustively over every pair of 3-key folds (each key
-    /// absent or at one of two revisions: 729 pairs) and four scopes,
-    /// including overlapping prefixes, using the real `restore_diff` and
-    /// `materialize` and a real store:
+    /// absent or at one of two revisions: 729 pairs), four scopes including
+    /// overlapping prefixes, and every live-key listing (8), using the real
+    /// `restore_diff` and `materialize` and a real store. Per in-scope key,
+    /// the restored fold holds:
     ///
-    /// - applying the diff makes the in-scope fold EXACTLY the artifact's
-    ///   (values and revisions) and leaves out-of-scope keys untouched;
-    /// - a crash after any prefix of the diff's ops (committed under the old
-    ///   cursor, as `watch_applied` does) followed by a fresh diff against
-    ///   the partial fold converges to the same result — the restore is
-    ///   idempotent, which is what makes re-running it on restart safe;
-    /// - a converged fold diffs empty.
+    /// - the artifact's entry, unless the local one is NEWER (or the same) —
+    ///   never a move backward;
+    /// - nothing where the artifact has nothing, unless the key is listed
+    ///   live — never a phantom delete;
+    ///
+    /// and out-of-scope keys are untouched. A crash after any prefix of the
+    /// ops (committed under the old cursor, as `watch_applied` does) followed
+    /// by a fresh diff converges to the same result — the restore is
+    /// idempotent, which is what makes re-running it on restart safe — and a
+    /// converged fold diffs empty.
     #[test]
-    fn exhaustive_restore_diff_replaces_scope_and_survives_partial_application() {
+    fn exhaustive_restore_diff_never_regresses_never_drops_live_and_survives_partial_application() {
         let scopes: [&[&str]; 4] = [&[""], &["a."], &["b."], &["a.", "a.1"]];
         let in_scope = |scope: &[&str], key: &str| scope.iter().any(|p| key.starts_with(p));
+        let lives: Vec<std::collections::HashSet<String>> = (0..8u8)
+            .map(|mask| {
+                KEYS.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, k)| k.to_string())
+                    .collect()
+            })
+            .collect();
         let mut cases = 0usize;
         for local_states in itertools_product(&STATES) {
             for artifact_states in itertools_product(&STATES) {
+                let dir = tempfile::TempDir::new().unwrap();
+                let artifact = fold_of(&dir, "artifact", &artifact_states, 9);
                 for scope in scopes {
                     let prefixes: Vec<String> = scope.iter().map(|p| p.to_string()).collect();
-                    let dir = tempfile::TempDir::new().unwrap();
-                    let artifact = fold_of(&dir, "artifact", &artifact_states, 9);
-                    let full = restore_diff(
-                        &fold_of(&dir, "probe", &local_states, 3),
-                        &artifact,
-                        &prefixes,
-                    )
-                    .unwrap();
-                    // Crash after `cut` ops: apply them, then re-diff.
-                    for cut in 0..=full.len() {
-                        let mut local = fold_of(&dir, &format!("local-{cut}"), &local_states, 3);
-                        let first = restore_diff(&local, &artifact, &prefixes).unwrap();
-                        let partial: Vec<RestoreOp> = first.into_iter().take(cut).collect();
-                        let updates = materialize(&artifact, partial).unwrap();
-                        local.apply(&updates, &WatchCursor::from_u64(3)).unwrap();
-                        let rest = restore_diff(&local, &artifact, &prefixes).unwrap();
-                        let updates = materialize(&artifact, rest).unwrap();
-                        local.apply(&updates, &WatchCursor::from_u64(9)).unwrap();
+                    for (li, live) in lives.iter().enumerate() {
+                        let full = restore_diff(
+                            &fold_of(
+                                &dir,
+                                &format!("probe-{li}-{}", scope.join("|")),
+                                &local_states,
+                                3,
+                            ),
+                            &artifact,
+                            &prefixes,
+                            live,
+                        )
+                        .unwrap();
+                        // Crash after `cut` ops: apply them, then re-diff.
+                        for cut in 0..=full.len() {
+                            let name = format!("local-{li}-{cut}-{}", scope.join("|"));
+                            let mut local = fold_of(&dir, &name, &local_states, 3);
+                            let first = restore_diff(&local, &artifact, &prefixes, live).unwrap();
+                            let partial: Vec<RestoreOp> = first.into_iter().take(cut).collect();
+                            let updates = materialize(&artifact, partial).unwrap();
+                            local.apply(&updates, &WatchCursor::from_u64(3)).unwrap();
+                            let rest = restore_diff(&local, &artifact, &prefixes, live).unwrap();
+                            let updates = materialize(&artifact, rest).unwrap();
+                            local.apply(&updates, &WatchCursor::from_u64(9)).unwrap();
 
-                        for (i, key) in KEYS.iter().enumerate() {
-                            let want = if in_scope(scope, key) {
-                                artifact_states[i]
-                            } else {
-                                local_states[i]
-                            };
-                            let got = local
-                                .get(key)
-                                .unwrap()
-                                .map(|e| (e.value, e.version.as_u64()));
-                            assert_eq!(
-                                got,
-                                want.map(|(v, r)| (v.to_vec(), Some(r))),
-                                "key {key} scope {scope:?} local {local_states:?} artifact \
-                                 {artifact_states:?} cut {cut}"
+                            for (i, key) in KEYS.iter().enumerate() {
+                                let (l, a) = (local_states[i], artifact_states[i]);
+                                let want = if !in_scope(scope, key) {
+                                    l
+                                } else {
+                                    match (l, a) {
+                                        (Some(l), Some(a)) if l.1 >= a.1 => Some(l),
+                                        (_, Some(a)) => Some(a),
+                                        (Some(l), None) if live.contains(*key) => Some(l),
+                                        (_, None) => None,
+                                    }
+                                };
+                                let got = local
+                                    .get(key)
+                                    .unwrap()
+                                    .map(|e| (e.value, e.version.as_u64()));
+                                assert_eq!(
+                                    got,
+                                    want.map(|(v, r)| (v.to_vec(), Some(r))),
+                                    "key {key} scope {scope:?} live {live:?} local {local_states:?} \
+                                     artifact {artifact_states:?} cut {cut}"
+                                );
+                            }
+                            assert!(
+                                restore_diff(&local, &artifact, &prefixes, live)
+                                    .unwrap()
+                                    .is_empty(),
+                                "a converged fold must diff empty"
                             );
+                            cases += 1;
                         }
-                        assert!(
-                            restore_diff(&local, &artifact, &prefixes)
-                                .unwrap()
-                                .is_empty(),
-                            "a converged fold must diff empty"
-                        );
-                        cases += 1;
                     }
                 }
             }
         }
-        assert!(cases > 3_000, "the domain is not vacuous ({cases})");
+        assert!(cases > 20_000, "the domain is not vacuous ({cases})");
     }
 
     /// Every assignment of `states` to the three keys.

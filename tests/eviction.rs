@@ -18,6 +18,12 @@
 //!   such a bucket instead of deleting valid keys.
 //! - **Stale artifact**: an artifact whose cursor is outside retention fails
 //!   the watch — there is no safe recovery — and leaves the fold untouched.
+//! - **Live floor-guard trip → restore**: a resumed, floor-guarded watcher is
+//!   stalled while a burst overruns it on a real `discard: old` bucket (the
+//!   server stops pushing to a consumer that doesn't answer flow control,
+//!   and retention evicts what it hadn't sent). Released, it drains, the
+//!   floor guard trips mid-stream, and the in-process restore brings it to
+//!   exactly the exporter's fold.
 #![cfg(feature = "transport")]
 
 mod common;
@@ -43,6 +49,7 @@ const KEY: &str = "routes/latest";
 
 struct Node {
     exports: mpsc::Sender<ExportRequest>,
+    gate: Arc<std::sync::atomic::AtomicBool>,
     applied: Arc<AtomicU64>,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<WatchCursor, KvError>>,
@@ -55,6 +62,19 @@ impl Node {
         resume: Option<WatchCursor>,
         repair: ExpiryRepair<AppendLogSnapshot>,
     ) -> Node {
+        Self::spawn_with(bucket, fold, resume, repair, BatchConfig::default())
+    }
+
+    /// `apply` blocks while the node's gate is closed (see `stall`).
+    fn spawn_with(
+        bucket: &Arc<dyn KvStore>,
+        fold: AppendLogSnapshot,
+        resume: Option<WatchCursor>,
+        repair: ExpiryRepair<AppendLogSnapshot>,
+        config: BatchConfig,
+    ) -> Node {
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let g = Arc::clone(&gate);
         let (ex_tx, ex_rx) = mpsc::channel(1);
         let (sd_tx, sd_rx) = watch::channel(false);
         let applied = Arc::new(AtomicU64::new(
@@ -68,14 +88,19 @@ impl Node {
             repair,
             Some(fold),
             Some(ex_rx),
-            BatchConfig::default(),
+            config,
             |u: &KvUpdate| Some(u.key().to_string()),
-            |_batch: Vec<String>| {},
+            move |_batch: Vec<String>| {
+                while g.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            },
             move |c: WatchCursor| a.store(c.as_u64().unwrap_or(0), Ordering::SeqCst),
             sd_rx,
         ));
         Node {
             exports: ex_tx,
+            gate,
             applied,
             shutdown: sd_tx,
             task,
@@ -454,4 +479,139 @@ async fn stale_artifact_fails_the_watch() {
     let (after, fold) = h.open("watcher.snap");
     assert_eq!(after, cursor);
     assert!(fold.get("route.keep").unwrap().is_some());
+}
+
+/// Counts fetches through to a real `ArtifactRestore` (proves the restore
+/// path ran).
+struct Counted {
+    inner: ArtifactRestore<AppendLogSnapshot>,
+    fetches: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl slipstream::RestoreSource<AppendLogSnapshot> for Counted {
+    async fn latest(&self) -> Result<slipstream::ExportManifest, SnapshotError> {
+        self.inner.latest().await
+    }
+    async fn fetch(&self) -> Result<slipstream::RestoredFold<AppendLogSnapshot>, SnapshotError> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch().await
+    }
+}
+
+/// THE LIVE ROUTE of a mid-watch floor-guard trip into the restore, on a
+/// real `discard: old` bucket. The exporter and the watcher both run the
+/// resumed, floor-guarded watch. The watcher is stalled (its `apply` blocks;
+/// a 1-deep channel backs up into the NATS consumer, which stops answering
+/// flow control, so the server stops pushing — measured at ~2 MB), and a
+/// 20 MB burst overruns it: `discard: old` evicts everything it hadn't been
+/// sent, `route.keep`'s current value included. Released, the watcher
+/// drains what it had, the floor guard sees the gap and trips with
+/// `CursorExpired`, and `watch_applied` restores in process from the
+/// exporter's artifact — then matches the exporter exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_floor_guard_trip_restores_in_process() {
+    let h = Harness::new(StoreConfig {
+        name: "routes".into(),
+        max_bytes: Some(4 << 20),
+        discard: DiscardPolicy::Old,
+        ..Default::default()
+    })
+    .await;
+    let w = h.bucket.writer().unwrap();
+    let restore = Arc::new(Counted {
+        inner: ArtifactRestore::new(
+            Arc::clone(&h.transport),
+            KEY,
+            h.dir.path(),
+            |artifact: &Path, dest: &Path| AppendLogSnapshot::import(artifact, dest, u64::MAX),
+        ),
+        fetches: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let auto = |restore: &Arc<Counted>| ExpiryRepair::Auto {
+        reader: h.bucket.reader(),
+        restore: Arc::clone(restore) as Arc<dyn slipstream::RestoreSource<AppendLogSnapshot>>,
+    };
+
+    // Seed, and fold it on both nodes via a first run, so both restart on
+    // the resumed (floor-guarded) watch.
+    w.put("route.keep", b"v1").await.unwrap();
+    let seed = w.put("route.seed", b"s").await.unwrap().as_u64().unwrap();
+    for name in ["exporter.snap", "watcher.snap"] {
+        let (_c, fold) = h.open(name);
+        let node = Node::spawn(&h.bucket, fold, None, auto(&restore));
+        node.wait_applied(seed).await;
+        node.stop().await.unwrap();
+    }
+    let (c, fold) = h.open("exporter.snap");
+    let exporter = Node::spawn(&h.bucket, fold, Some(c), auto(&restore));
+    let (c, fold) = h.open("watcher.snap");
+    let watcher = Node::spawn_with(
+        &h.bucket,
+        fold,
+        Some(c),
+        auto(&restore),
+        BatchConfig {
+            channel_capacity: 1,
+            max: 1,
+            ..BatchConfig::default()
+        },
+    );
+
+    // Stall the watcher, then overrun it.
+    watcher.gate.store(true, Ordering::SeqCst);
+    let value = vec![b'x'; 1024];
+    let mut head = 0;
+    for i in 0..20_000 {
+        head = w
+            .put(&format!("burst.{i}"), &value)
+            .await
+            .unwrap()
+            .as_u64()
+            .unwrap();
+    }
+    let reader = h.bucket.reader();
+    assert!(
+        reader.get("route.keep").await.unwrap().is_none(),
+        "route.keep must have been evicted"
+    );
+    exporter.wait_applied(head).await;
+    let artifact = exporter.publish(&*h.transport, h.dir.path()).await;
+    assert_eq!(artifact, head, "the exporter kept up and exported the head");
+
+    // Release: drain → trip → restore → resume.
+    watcher.gate.store(false, Ordering::SeqCst);
+    watcher.wait_applied(head).await;
+    assert!(
+        restore.fetches.load(Ordering::SeqCst) >= 1,
+        "the watcher must have been overrun and repaired by a restore"
+    );
+    let end = watcher
+        .stop()
+        .await
+        .expect("the trip was repaired in process");
+    assert_eq!(end.as_u64(), Some(head));
+    exporter.stop().await.unwrap();
+
+    let (wc, wfold) = h.open("watcher.snap");
+    let (xc, xfold) = h.open("exporter.snap");
+    assert_eq!(wc, xc);
+    assert_eq!(
+        wfold.get("route.keep").unwrap().map(|e| e.value),
+        Some(b"v1".to_vec()),
+        "the aged-out key survives the restore"
+    );
+    let entries = |f: &AppendLogSnapshot| -> Vec<(String, Vec<u8>)> {
+        f.range("")
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.key, e.value))
+            .collect()
+    };
+    let (we, xe) = (entries(&wfold), entries(&xfold));
+    assert_eq!(we.len(), 20_002);
+    assert!(
+        we == xe,
+        "the restored watcher is identical to the exporter"
+    );
 }

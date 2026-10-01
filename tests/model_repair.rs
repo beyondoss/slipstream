@@ -28,11 +28,15 @@
 //! `tests/repair_dst.rs` (fault injection over the real loop).
 //!
 //! Checked, exhaustively within bounds, for both bucket kinds:
-//! - **The store is never behind its own cursor**: its value is the truth at
-//!   some revision at or after its cursor (data AHEAD of the cursor is the
-//!   torn-write / pending-repair shape and is re-folded; behind never).
+//! - **While the store's cursor is resumable, the store plus the tail is the
+//!   truth**: what a NATS cursor promises — every RETAINED message at or below
+//!   it is applied, so a resume from it reaches every write minus every real
+//!   delete. (An expired cursor promises nothing; the repair that must then
+//!   run fixes it, which the terminal property checks.)
 //! - **The store's cursor never moves backward.**
-//! - **The domain state is never behind the applied cursor.**
+//! - **The same for the domain state at the applied cursor**, and the domain
+//!   never sees a key's revision go backward or a repair delete its current
+//!   value — no transient regressions or phantom deletes.
 //! - **Every maximal run ends with the store and the domain state equal to
 //!   every write minus every real delete.**
 //!
@@ -65,8 +69,9 @@ struct Upd {
 enum Req {
     /// Key-listing diff; what the listing showed for the key.
     Relist { listed: Option<u8> },
-    /// Artifact restore to this cursor.
-    Restore { target: u8 },
+    /// Artifact restore to this cursor, with what the live-key listing (taken
+    /// after the fetch) showed for the key.
+    Restore { target: u8, listed: Option<u8> },
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -140,6 +145,12 @@ struct St {
     crashes: u8,
     transients: u8,
     regressed: bool,
+    /// The domain saw the key's revision go backward.
+    domain_regressed: bool,
+    /// The domain saw a repair delete the key while it was live.
+    phantom_delete: bool,
+    /// The highest revision the domain has seen for the key.
+    domain_max: u8,
     restored: bool,
     relisted: bool,
     drained_backlog: bool,
@@ -186,6 +197,11 @@ enum Mutation {
     RelistOnEvicting,
     /// A fold with data but no cursor re-listed blind (the pre-fix start).
     UnanchoredRelist,
+    /// The restore takes the artifact's value even when the local one is
+    /// newer (the pre-fix diff).
+    RestoreIgnoresVersions,
+    /// The restore deletes keys the bucket lists live (the pre-fix diff).
+    RestoreIgnoresListing,
 }
 
 #[derive(Clone)]
@@ -233,6 +249,21 @@ impl RepairModel {
         if s.evicted { None } else { Self::truth(s) }
     }
 
+    /// What a NATS cursor promises: every RETAINED message at or below it is
+    /// applied. So a value at cursor `c` is correct when a resume from `c`
+    /// reaches the truth — the key's latest message, if after `c` and still
+    /// retained, is delivered; otherwise the value itself must be the truth.
+    /// Vacuous once `c` is outside retention: that cursor is expired, and the
+    /// repair that must then run is what makes it right (the terminal
+    /// property checks that it does).
+    fn resumes_to_truth(s: &St, c: u8, value: Option<u8>) -> bool {
+        if c == 0 || !resume_window_ok(c as u64, Self::first_revision(s)) {
+            return true;
+        }
+        let tail_delivers = s.head > c && !s.evicted;
+        tail_delivers || value == Self::truth(s)
+    }
+
     fn flushable(s: &St) -> bool {
         !s.batch.is_empty() || !s.raw.is_empty() || s.batch_high.is_some()
     }
@@ -246,6 +277,7 @@ impl RepairModel {
         s.batch_high = None;
         s.applied = s.store_cur;
         s.domain = s.store_val;
+        s.domain_max = s.store_val.unwrap_or(0);
         s.streak = 0;
         s.req = None;
         s.reply = None;
@@ -264,7 +296,23 @@ impl RepairModel {
     /// `flush!()`: domain apply, cursor advance, store apply with `outcome`.
     /// Returns false if the process died.
     fn flush(s: &mut St, outcome: FlushOutcome) -> bool {
-        for u in s.batch.drain(..) {
+        for u in std::mem::take(&mut s.batch) {
+            match u.value {
+                Some(rev) => {
+                    if rev < s.domain_max {
+                        s.domain_regressed = true;
+                    }
+                    s.domain_max = s.domain_max.max(rev);
+                }
+                // A PHANTOM delete: a repair's revisionless delete of the value
+                // the domain holds while that value is still the current one.
+                // (Deleting a value a newer write has replaced is just the
+                // domain being behind; the newer write arrives later.)
+                None if u.pos.is_none() && s.domain.is_some() && s.domain == Self::truth(s) => {
+                    s.phantom_delete = true
+                }
+                None => {}
+            }
             s.domain = u.value;
         }
         let advanced = s.batch_high.is_some();
@@ -323,6 +371,31 @@ impl RepairModel {
         }
     }
 
+    /// `restore_diff` on the key: the artifact at `target` holds the truth
+    /// there. Take it unless the store's value is the same or NEWER; delete
+    /// (the artifact lacks the key) unless the listing shows it live.
+    fn restore_op(&self, s: &St, target: u8, listed: Option<u8>) -> Option<Upd> {
+        let want = Self::truth_at(s, target);
+        match (s.store_val, want) {
+            (Some(l), Some(a)) if l >= a && self.mutation != Mutation::RestoreIgnoresVersions => {
+                None
+            }
+            (_, Some(a)) if s.store_val != Some(a) => Some(Upd {
+                pos: None,
+                value: Some(a),
+            }),
+            (Some(_), None)
+                if listed.is_none() || self.mutation == Mutation::RestoreIgnoresListing =>
+            {
+                Some(Upd {
+                    pos: None,
+                    value: None,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn restores(&self) -> bool {
         self.evicting && self.mutation != Mutation::RelistOnEvicting
     }
@@ -374,6 +447,9 @@ impl Model for RepairModel {
             crashes: 0,
             transients: 0,
             regressed: false,
+            domain_regressed: false,
+            phantom_delete: false,
+            domain_max: store_val.unwrap_or(0),
             restored: false,
             relisted: false,
             drained_backlog: false,
@@ -555,7 +631,10 @@ impl Model for RepairModel {
                     // code re-checks what it fetched against now).
                     let target = s.pointer;
                     if self.restore_ok(&s, target, local) && target > 0 {
-                        s.req = Some(Req::Restore { target });
+                        s.req = Some(Req::Restore {
+                            target,
+                            listed: Self::listed(&s),
+                        });
                         s.w = WPhase::AwaitReply;
                     } else {
                         s.w = WPhase::Failed;
@@ -635,7 +714,7 @@ impl Model for RepairModel {
                     s.relisted = true;
                     s.m = MPhase::RelistFlush(false);
                 }
-                MPhase::PreFlush(Req::Restore { target }, _) => {
+                MPhase::PreFlush(Req::Restore { target, listed }, _) => {
                     // The authoritative ahead check.
                     if self.mutation != Mutation::NoRestoreGuard && target <= s.applied {
                         s.reply = Some(Reply::Refused);
@@ -644,12 +723,7 @@ impl Model for RepairModel {
                         s.batch_high = Some(target);
                         s.m = MPhase::RestoreCommit(target, false);
                     } else {
-                        let want = Self::truth_at(&s, target);
-                        if s.store_val != want {
-                            let u = Upd {
-                                pos: None,
-                                value: want,
-                            };
+                        if let Some(u) = self.restore_op(&s, target, listed) {
                             s.batch.push(u);
                             s.raw.push(u);
                         }
@@ -668,12 +742,7 @@ impl Model for RepairModel {
                     if self.mutation == Mutation::CursorBeforeDiff && !s.restored {
                         // The diff, after the cursor already moved.
                         s.restored = true;
-                        let want = Self::truth_at(&s, target);
-                        if s.store_val != want {
-                            let u = Upd {
-                                pos: None,
-                                value: want,
-                            };
+                        if let Some(u) = self.restore_op(&s, target, Self::listed(&s)) {
                             s.batch.push(u);
                             s.raw.push(u);
                         }
@@ -692,15 +761,23 @@ impl Model for RepairModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         let mut props: Vec<Property<Self>> = vec![
-            Property::<Self>::always("the store is never behind its own cursor", |_, s| {
-                (s.store_cur..=s.head).any(|r| RepairModel::truth_at(s, r) == s.store_val)
-            }),
+            Property::<Self>::always(
+                "while the store's cursor is resumable, the store plus the tail is the truth",
+                |_, s| RepairModel::resumes_to_truth(s, s.store_cur, s.store_val),
+            ),
             Property::<Self>::always("the store's cursor never moves backward", |_, s| {
                 !s.regressed
             }),
             Property::<Self>::always(
-                "the domain state is never behind the applied cursor",
-                |_, s| (s.applied..=s.head).any(|r| RepairModel::truth_at(s, r) == s.domain),
+                "the domain never sees the key's revision go backward",
+                |_, s| !s.domain_regressed,
+            ),
+            Property::<Self>::always("a repair never deletes the key's current value", |_, s| {
+                !s.phantom_delete
+            }),
+            Property::<Self>::always(
+                "while the applied cursor is resumable, the domain plus the tail is the truth",
+                |_, s| RepairModel::resumes_to_truth(s, s.applied, s.domain),
             ),
             Property::<Self>::always(
                 "every maximal run ends with the store and domain equal to every write minus every real delete",
@@ -791,11 +868,15 @@ fn every_repair_step_is_load_bearing() {
         (Mutation::NoRestoreGuard, true, false),
         (Mutation::RelistOnEvicting, true, false),
         (Mutation::UnanchoredRelist, false, true),
+        (Mutation::RestoreIgnoresVersions, true, false),
+        (Mutation::RestoreIgnoresListing, true, false),
     ];
     let names = [
-        "the store is never behind its own cursor",
+        "while the store's cursor is resumable, the store plus the tail is the truth",
         "the store's cursor never moves backward",
-        "the domain state is never behind the applied cursor",
+        "the domain never sees the key's revision go backward",
+        "a repair never deletes the key's current value",
+        "while the applied cursor is resumable, the domain plus the tail is the truth",
         "every maximal run ends with the store and domain equal to every write minus every real delete",
     ];
     for (mutation, evicting, fresh) in cases {
@@ -810,6 +891,8 @@ fn every_repair_step_is_load_bearing() {
                 Mutation::NoRestoreGuard => "no restore guard",
                 Mutation::RelistOnEvicting => "relist on evicting",
                 Mutation::UnanchoredRelist => "unanchored fold re-listed blind",
+                Mutation::RestoreIgnoresVersions => "restore ignores versions",
+                Mutation::RestoreIgnoresListing => "restore ignores the live listing",
             },
             if evicting {
                 "evicting"

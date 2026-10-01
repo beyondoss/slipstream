@@ -42,7 +42,11 @@
 //!   logic; for the tunnel router it swaps the route table, for the edge origin
 //!   watcher it rebuilds the hashrings.
 //! - `on_applied`: fires once per flush, *after* `apply` returns, with the new
-//!   applied cursor. Callers use it to persist the cursor for the next restart.
+//!   applied cursor. Without a store, callers use it to persist the cursor for
+//!   the next restart. WITH a store, resume from the store's own cursor
+//!   instead: across a transient store failure the batch is re-queued, but
+//!   `on_applied` has already reported the advanced cursor — ahead of what the
+//!   store made durable — so resuming from it could skip that batch.
 //!
 //! ## Panics
 //!
@@ -130,11 +134,13 @@ enum RepairRequest<S> {
         live_keys: Vec<String>,
         ack: oneshot::Sender<()>,
     },
-    /// The artifact restore: a verified artifact fold. The main loop folds
-    /// the in-scope difference, advances to the artifact's cursor, and replies
+    /// The artifact restore: a verified artifact fold, and the bucket's live
+    /// keys for the scope (listed after the fetch). The main loop folds the
+    /// in-scope difference, advances to the artifact's cursor, and replies
     /// with it so the watch task resumes from there.
     Restore {
         restored: RestoredFold<S>,
+        live: std::collections::HashSet<String>,
         reply: oneshot::Sender<Result<WatchCursor, KvError>>,
     },
 }
@@ -154,6 +160,7 @@ enum Plan<'a, S> {
     Relist(&'a Arc<dyn KvReader>, &'a mpsc::Sender<RepairRequest<S>>),
     /// The artifact restore, then a resume from the artifact's cursor.
     Restore(
+        &'a Arc<dyn KvReader>,
         &'a Arc<dyn RestoreSource<S>>,
         &'a mpsc::Sender<RepairRequest<S>>,
     ),
@@ -700,7 +707,11 @@ where
                                 // apply saw them before this ack either way.
                                 let _ = ack.send(());
                             }
-                            RepairRequest::Restore { restored, reply } => {
+                            RepairRequest::Restore {
+                                restored,
+                                live,
+                                reply,
+                            } => {
                                 let target = restored.manifest().cursor.clone();
                                 // The authoritative ahead check (the watch
                                 // task's ran against its resume cursor; a
@@ -723,7 +734,8 @@ where
                                     let prefixes = scope_prefixes.clone();
                                     let (st, mut restored, diff) =
                                         match tokio::task::spawn_blocking(move || {
-                                            let diff = restore_diff(&st, restored.fold(), &prefixes);
+                                            let diff =
+                                                restore_diff(&st, restored.fold(), &prefixes, &live);
                                             (st, restored, diff)
                                         })
                                         .await
@@ -982,22 +994,23 @@ async fn run_watch<S: Send + 'static>(
                 resync_stale_keys(scope, reader, repairs).await?;
                 return watch_scope(watcher, scope, tx).await;
             }
-            Plan::Restore(source, repairs) => {
+            Plan::Restore(reader, source, repairs) => {
                 warn!("watch cursor expired; restoring the fold from the latest artifact");
-                let restored = restore_from_artifact(watcher, scope, source, repairs, &cursor)
-                    .await
-                    .map_err(|e| match e {
-                        KvError::WatchError(msg) if cursor.is_none() => {
-                            KvError::WatchError(format!(
-                                "{msg}. This node has no cursor, so it can only seed from an \
+                let restored =
+                    restore_from_artifact(watcher, scope, reader, source, repairs, &cursor)
+                        .await
+                        .map_err(|e| match e {
+                            KvError::WatchError(msg) if cursor.is_none() => {
+                                KvError::WatchError(format!(
+                                    "{msg}. This node has no cursor, so it can only seed from an \
                              artifact. If none exists yet (first deploy onto a bucket that \
                              already evicted values), start one node with ExpiryRepair::None \
                              — accepting that values which already aged out are gone — and \
                              publish an export from it"
-                            ))
-                        }
-                        other => other,
-                    })?;
+                                ))
+                            }
+                            other => other,
+                        })?;
                 resume = Some(restored);
             }
         }
@@ -1073,10 +1086,10 @@ async fn plan_repair<'a, S>(
             }
             Plan::Relist(reader, &h.tx)
         }
-        ExpiryRepair::Restore(source) => Plan::Restore(source, &h.tx),
+        ExpiryRepair::Restore { reader, restore } => Plan::Restore(reader, restore, &h.tx),
         ExpiryRepair::Auto { reader, restore } => match watcher.retention().await? {
             Some(r) if listing_is_truth(&r) => Plan::Relist(reader, &h.tx),
-            _ => Plan::Restore(restore, &h.tx),
+            _ => Plan::Restore(reader, restore, &h.tx),
         },
     })
 }
@@ -1088,7 +1101,10 @@ async fn fresh_start_needs_restore<S>(
     watcher: &dyn KvWatcher,
     h: &RepairHandle<S>,
 ) -> Result<bool, KvError> {
-    if !matches!(h.mode, ExpiryRepair::Restore(_) | ExpiryRepair::Auto { .. }) {
+    if !matches!(
+        h.mode,
+        ExpiryRepair::Restore { .. } | ExpiryRepair::Auto { .. }
+    ) {
         return Ok(false);
     }
     Ok(watcher
@@ -1104,6 +1120,7 @@ async fn fresh_start_needs_restore<S>(
 async fn restore_from_artifact<S: Send + 'static>(
     watcher: &dyn KvWatcher,
     scope: &WatchScope,
+    reader: &Arc<dyn KvReader>,
     source: &Arc<dyn RestoreSource<S>>,
     repairs: &mpsc::Sender<RepairRequest<S>>,
     local: &WatchCursor,
@@ -1143,10 +1160,23 @@ async fn restore_from_artifact<S: Send + 'static>(
         "restoring the fold from the latest artifact"
     );
 
+    // The bucket's live keys, listed after the artifact's cursor is fixed:
+    // the restore never deletes one of these (see `restore_diff`). A failed
+    // listing fails the watch, like the key-listing repair's.
+    let mut live = std::collections::HashSet::new();
+    for prefix in &prefixes {
+        let keys = reader
+            .keys(prefix)
+            .await
+            .map_err(|e| fail(format!("listing live keys under {prefix:?} failed: {e}")))?;
+        live.extend(keys);
+    }
+
     let (reply_tx, reply_rx) = oneshot::channel();
     repairs
         .send(RepairRequest::Restore {
             restored,
+            live,
             reply: reply_tx,
         })
         .await
@@ -2881,6 +2911,15 @@ mod tests {
         }
     }
 
+    /// `ExpiryRepair::Restore` with a reader that lists no live keys (every
+    /// key the artifact lacks is really gone).
+    fn restore_mode<S: Send + 'static>(artifact: Arc<dyn RestoreSource<S>>) -> ExpiryRepair<S> {
+        ExpiryRepair::Restore {
+            reader: Arc::new(MockReader { live: vec![] }),
+            restore: artifact,
+        }
+    }
+
     fn evicting(first_revision: u64) -> Option<Retention> {
         Some(Retention {
             evicts_current_values: true,
@@ -3169,7 +3208,7 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(4),
-            ExpiryRepair::Restore(artifact.clone()),
+            restore_mode(artifact.clone()),
             store,
             100,
         )
@@ -3204,7 +3243,7 @@ mod tests {
                 watcher,
                 WatchScope::Prefix("node.".into()),
                 Some(4),
-                ExpiryRepair::Restore(artifact),
+                restore_mode(artifact),
                 store,
                 100,
             )
@@ -3239,7 +3278,7 @@ mod tests {
             watcher,
             WatchScope::Prefix("node.".into()),
             Some(5),
-            ExpiryRepair::Restore(artifact),
+            restore_mode(artifact),
             store,
             100,
         )
@@ -3284,7 +3323,7 @@ mod tests {
             Arc::clone(&watcher),
             WatchScope::All,
             Some(4),
-            ExpiryRepair::Restore(artifact),
+            restore_mode(artifact),
             store,
             100,
         )
@@ -3330,7 +3369,7 @@ mod tests {
             watcher,
             WatchScope::All,
             Some(4),
-            ExpiryRepair::Restore(artifact),
+            restore_mode(artifact),
             store,
             100,
         )
@@ -3365,7 +3404,7 @@ mod tests {
             Arc::clone(&watcher),
             WatchScope::All,
             None,
-            ExpiryRepair::Restore(artifact),
+            restore_mode(artifact),
             store,
             100,
         )
@@ -3534,7 +3573,7 @@ mod tests {
             evicting(9),
             vec![(vec![put("node.new", b"deleted-at-8", 5)], true)],
         ));
-        run_fail_once(watcher, ExpiryRepair::Restore(artifact), store)
+        run_fail_once(watcher, restore_mode(artifact), store)
             .await
             .unwrap();
         let snap = crate::snapshot::load(&path).unwrap().unwrap();
