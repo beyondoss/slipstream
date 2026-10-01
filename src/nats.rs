@@ -2255,6 +2255,67 @@ mod floor_guard_tests {
         );
         assert!(r(&aged).await.evicts_current_values, "max_age");
 
+        // The two inputs no StoreConfig expresses, set on live streams:
+        // per-message TTLs, and discard:old under a message-count limit.
+        let raw = async_nats::connect(&server.url).await.unwrap();
+        let js = async_nats::jetstream::new(raw);
+        let ttl = conn
+            .store_with_config(open("ttl", None, DiscardPolicy::New))
+            .await
+            .unwrap();
+        let mut cfg = js
+            .get_stream("KV_ttl")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.allow_message_ttl = true;
+        js.update_stream(cfg)
+            .await
+            .expect("enable per-message TTLs");
+        assert!(r(&ttl).await.evicts_current_values, "per-message TTLs");
+
+        let counted = conn
+            .store_with_config(open("counted", None, DiscardPolicy::New))
+            .await
+            .unwrap();
+        let mut cfg = js
+            .get_stream("KV_counted")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.max_bytes = -1;
+        cfg.max_messages = 100;
+        cfg.discard = async_nats::jetstream::stream::DiscardPolicy::Old;
+        js.update_stream(cfg)
+            .await
+            .expect("discard:old under max_msgs");
+        assert!(
+            r(&counted).await.evicts_current_values,
+            "discard:old under max_msgs"
+        );
+
+        // And an edit to a live stream is seen: retention is read live, not
+        // remembered from creation.
+        let mut cfg = js
+            .get_stream("KV_config")
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        cfg.max_age = Duration::from_secs(3600);
+        js.update_stream(cfg)
+            .await
+            .expect("add max_age to a live bucket");
+        assert!(
+            r(&config).await.evicts_current_values,
+            "max_age added out-of-band"
+        );
+
         // first_revision follows head eviction.
         let w = config.writer().unwrap();
         for _ in 0..3 {

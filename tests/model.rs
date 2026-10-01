@@ -107,11 +107,16 @@
 //!    (empirical tier: tampered-artifact and multi-SST round-trip tests).
 //!    NATS KV CAS semantics for the lease are unneeded here (see above); the
 //!    lease layer is verified by `integration.rs` contention tests.
-//! 5. Exporters are correct folds: an artifact holds `key_at(cursor)`. The
-//!    restore theorem is relative to it — and it is what this model proves of
-//!    every bootstrapped fold, so the fleet's folds stay correct by induction.
-//! 6. Retention outlives consumer lag — NARROWED to prefix-scoped watches
-//!    and the fresh full watch's initial history scan. The ALL-scope resume
+//! 5. Exporters are correct folds: an artifact holds `key_at(cursor)`.
+//!    DISCHARGED by `tests/model_fleet.rs`, where the exporters are watchers
+//!    that themselves expire, restore, start cursor-less, and publish their
+//!    actual folds, and the checker proves every published artifact is the
+//!    truth at its cursor.
+//! 6. Retention outlives consumer lag — NARROWED to prefix-scoped watches,
+//!    the fresh full watch's initial history scan, and the key-listing
+//!    repair's window between its listing and its re-list
+//!    (`tests/model_repair.rs` drops it and reaches that trace; the artifact
+//!    restore does not depend on it). The ALL-scope resume
 //!    watch (steady-state operation) no longer relies on it: the live floor
 //!    guard (`tests/model_live_watch.rs`, `stream_watch_floor_guarded`)
 //!    fail-stops on in-band evidence of retention overrunning the consumer
@@ -264,6 +269,8 @@ struct St<const N: usize> {
     /// Latched when the importer's fold was restored from a newer artifact
     /// (vacuity witness for the restore theorem).
     restored: bool,
+    /// `TrustRestoredCursor` only: the next resume skips its window check.
+    trust_next_resume: bool,
     importer: ImporterPc,
 }
 
@@ -365,6 +372,12 @@ enum Mutation {
     /// current values (absence from NATS taken as deletion). The bug
     /// `tests/eviction.rs` reproduced live.
     RelistOnEvicting,
+    /// The restore accepts any published artifact (no
+    /// `protocol::restore_allowed`) — the resume window re-check still runs.
+    NoRestoreGuard,
+    /// The resume after a restore skips its window check, trusting the
+    /// restored cursor (the restore guard still runs).
+    TrustRestoredCursor,
 }
 
 /// Model parameters: which protocol, the importer's resync mode, an optional
@@ -494,6 +507,7 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
             regressed: false,
             refused: false,
             restored: false,
+            trust_next_resume: false,
             importer: ImporterPc::Start,
         }]
     }
@@ -571,11 +585,12 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
             // fleet publishes one that is.
             ImporterPc::Restoring(a) => {
                 if let Some(m) = s.manifest
-                    && slipstream::protocol::restore_allowed(
-                        m.cursor as u64,
-                        a.cursor as u64,
-                        s.floor as u64 + 1,
-                    )
+                    && (self.mutation == Mutation::NoRestoreGuard
+                        || slipstream::protocol::restore_allowed(
+                            m.cursor as u64,
+                            a.cursor as u64,
+                            s.floor as u64 + 1,
+                        ))
                 {
                     acts.push(Act::RestoreRead);
                 }
@@ -729,7 +744,13 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 let ImporterPc::Imported(a) = s.importer else {
                     return None;
                 };
-                if self.resume_ok(&s, a) {
+                let trusted = std::mem::take(&mut s.trust_next_resume);
+                if trusted && !self.resume_ok(&s, a) {
+                    // The unchecked resume from a restored cursor that
+                    // retention overran since the restore's check: NATS
+                    // silently clamps, skipping the evicted gap.
+                    s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
+                } else if self.resume_ok(&s, a) {
                     // Window intact (shared kernel `resume_window_ok` — the
                     // same guard `nats.rs` executes): tail replay from the
                     // embedded cursor delivers every event past it (all
@@ -769,13 +790,16 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     return None;
                 };
                 let m = s.manifest?;
-                if !slipstream::protocol::restore_allowed(
-                    m.cursor as u64,
-                    a.cursor as u64,
-                    s.floor as u64 + 1,
-                ) {
+                if self.mutation != Mutation::NoRestoreGuard
+                    && !slipstream::protocol::restore_allowed(
+                        m.cursor as u64,
+                        a.cursor as u64,
+                        s.floor as u64 + 1,
+                    )
+                {
                     return None;
                 }
+                s.trust_next_resume = self.mutation == Mutation::TrustRestoredCursor;
                 // The in-scope fold becomes the artifact's; the watch then
                 // resumes from its cursor (the next `Resume`, which re-checks
                 // the window — retention can still overrun it, and the
@@ -1081,6 +1105,34 @@ fn mutation_relist_on_evicting_bucket_is_caught() {
         ),
         "the counterexample is a LOST write (not a stale key): {:?}",
         path.last_state().importer
+    );
+}
+
+/// The restore's two defenses, separated. The window re-check on the resume
+/// that follows a restore is LOAD-BEARING: retention can overrun the
+/// restored cursor between the restore's check and the resume, and without
+/// the re-check that gap is skipped silently. The restore guard
+/// (`restore_allowed`) is FAIL-FAST: without it a stale artifact is imported
+/// and the resume refuses it, so the theorem still holds (the guard turns a
+/// pointless download-and-retry into an immediate, explained refusal).
+#[test]
+fn restore_defenses_resume_recheck_is_load_bearing_guard_is_fail_fast() {
+    // One exporter suffices: the race is retention vs the importer.
+    let mut model = SnapshotProtocol::<1>::evicting(ResyncMode::FailStop);
+    model.mutation = Mutation::TrustRestoredCursor;
+    let checker = run(model, "mutation: trust restored cursor");
+    assert!(
+        checker.discovery(DIVERGENCE_THEOREM).is_some(),
+        "skipping the post-restore window check must be caught"
+    );
+
+    let mut model = SnapshotProtocol::<1>::evicting(ResyncMode::FailStop);
+    model.mutation = Mutation::NoRestoreGuard;
+    let checker = run(model, "mutation: no restore guard");
+    assert!(
+        checker.discovery(DIVERGENCE_THEOREM).is_none(),
+        "the restore guard is fail-fast, not the safety gate: without it the resume re-check \
+         still refuses a stale artifact"
     );
 }
 

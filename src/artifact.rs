@@ -781,6 +781,26 @@ mod tests {
         ));
     }
 
+    /// The whole schema/scope matrix: a manifest is accepted iff it is
+    /// schema 1 without a scope or schema 2 with one.
+    #[test]
+    fn schema_scope_matrix() {
+        let dir = TempDir::new().unwrap();
+        for schema in 0..=3u32 {
+            for scoped in [false, true] {
+                let mut json = wire_json("", "[]", schema);
+                if scoped {
+                    json = json.replace('}', r#","scope":["node."]}"#);
+                }
+                write_raw_manifest(dir.path(), &json);
+                let accepted = read_manifest(dir.path()).is_ok();
+                let want = (schema == SCHEMA_UNSCOPED && !scoped)
+                    || (schema == ARTIFACT_SCHEMA_VERSION && scoped);
+                assert_eq!(accepted, want, "schema {schema}, scoped {scoped}");
+            }
+        }
+    }
+
     #[test]
     fn manifest_round_trips_none_cursor() {
         let dir = TempDir::new().unwrap();

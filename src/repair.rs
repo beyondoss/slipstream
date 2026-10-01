@@ -434,4 +434,220 @@ mod tests {
         let ops = restore_diff(&local, &artifact, &["node.".into(), "node".into()]).unwrap();
         assert_eq!(ops.len(), 2, "each key once despite two covering prefixes");
     }
+
+    // --- Exhaustive small-domain checks of the real functions ---------------
+
+    /// Every string over `alphabet` of length 0..=max_len.
+    fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for s in &frontier {
+                for c in alphabet {
+                    let mut t = s.clone();
+                    t.push(*c);
+                    next.push(t);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// Every subset of `items` with at most `max` elements.
+    fn subsets(items: &[String], max: usize) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = vec![vec![]];
+        for item in items {
+            let grown: Vec<Vec<String>> = out
+                .iter()
+                .filter(|s| s.len() < max)
+                .map(|s| {
+                    let mut t = s.clone();
+                    t.push(item.clone());
+                    t
+                })
+                .collect();
+            out.extend(grown);
+        }
+        out
+    }
+
+    /// SOUNDNESS of `scope_covers`, exhaustively over every pair of prefix
+    /// sets (≤ 2 prefixes of length ≤ 2 over {a, b, .}) and every key of
+    /// length ≤ 3: whenever it says the exporter covers the watcher, every
+    /// key the watcher can see is one the exporter folded. (It is
+    /// deliberately not complete — a union of narrower exporter prefixes is
+    /// refused — which only ever refuses a restore, never accepts a bad one.)
+    #[test]
+    fn exhaustive_scope_covers_is_sound() {
+        let alphabet = ['a', 'b', '.'];
+        let prefixes = strings(&alphabet, 2);
+        let keys = strings(&alphabet, 3);
+        let sets = subsets(&prefixes, 2);
+        let matches =
+            |scope: &[String], key: &str| scope.iter().any(|p| key.starts_with(p.as_str()));
+        let mut checked = 0usize;
+        for exporter in &sets {
+            for watcher in &sets {
+                if !scope_covers(exporter, watcher) {
+                    continue;
+                }
+                for key in &keys {
+                    assert!(
+                        !matches(watcher, key) || matches(exporter, key),
+                        "covers({exporter:?}, {watcher:?}) but {key:?} is visible to the \
+                         watcher and not in the export"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000, "the domain is not vacuous ({checked})");
+    }
+
+    /// `check_restore` against its specification, exhaustively over cursors
+    /// 0..=6, first retained revisions (unknown, 0..=8), and three scope
+    /// shapes: accept iff the artifact has a scope covering the watcher's, is
+    /// strictly ahead, and (when retention is known) resumes gap-free.
+    #[test]
+    fn exhaustive_check_restore_matches_spec() {
+        let all = vec![String::new()];
+        let node = vec!["node.".to_string()];
+        let scopes: [Option<&[&str]>; 3] = [None, Some(&[""]), Some(&["edge."])];
+        for watcher in [&all, &node] {
+            for scope in scopes {
+                for a in 0..=6u64 {
+                    for l in 0..=6u64 {
+                        for first in std::iter::once(None).chain((0..=8u64).map(Some)) {
+                            let got = check_restore(
+                                &manifest(a, scope),
+                                &WatchCursor::from_u64(l),
+                                first,
+                                watcher,
+                            )
+                            .is_ok();
+                            let covered = scope.is_some_and(|s| {
+                                let s: Vec<String> = s.iter().map(|p| p.to_string()).collect();
+                                watcher
+                                    .iter()
+                                    .all(|w| s.iter().any(|e| w.starts_with(e.as_str())))
+                            });
+                            let want = covered && a > l && first.is_none_or(|f| f <= a + 1);
+                            assert_eq!(
+                                got, want,
+                                "artifact {a} scope {scope:?}, local {l}, first {first:?}, \
+                                 watcher {watcher:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One key's state in the exhaustive restore check: absent, or a value
+    /// at a revision.
+    type KeyState = Option<(&'static [u8], u64)>;
+    const STATES: [KeyState; 3] = [None, Some((b"v1", 1)), Some((b"v2", 2))];
+    const KEYS: [&str; 3] = ["a.1", "a.2", "b.1"];
+
+    fn fold_of(
+        dir: &tempfile::TempDir,
+        name: &str,
+        states: &[KeyState],
+        cursor: u64,
+    ) -> AppendLogSnapshot {
+        let updates: Vec<KvUpdate> = KEYS
+            .iter()
+            .zip(states)
+            .filter_map(|(k, st)| st.map(|(v, rev)| put(k, v, rev)))
+            .collect();
+        fold(dir, name, &updates, cursor)
+    }
+
+    /// THE RESTORE, exhaustively over every pair of 3-key folds (each key
+    /// absent or at one of two revisions: 729 pairs) and four scopes,
+    /// including overlapping prefixes, using the real `restore_diff` and
+    /// `materialize` and a real store:
+    ///
+    /// - applying the diff makes the in-scope fold EXACTLY the artifact's
+    ///   (values and revisions) and leaves out-of-scope keys untouched;
+    /// - a crash after any prefix of the diff's ops (committed under the old
+    ///   cursor, as `watch_applied` does) followed by a fresh diff against
+    ///   the partial fold converges to the same result — the restore is
+    ///   idempotent, which is what makes re-running it on restart safe;
+    /// - a converged fold diffs empty.
+    #[test]
+    fn exhaustive_restore_diff_replaces_scope_and_survives_partial_application() {
+        let scopes: [&[&str]; 4] = [&[""], &["a."], &["b."], &["a.", "a.1"]];
+        let in_scope = |scope: &[&str], key: &str| scope.iter().any(|p| key.starts_with(p));
+        let mut cases = 0usize;
+        for local_states in itertools_product(&STATES) {
+            for artifact_states in itertools_product(&STATES) {
+                for scope in scopes {
+                    let prefixes: Vec<String> = scope.iter().map(|p| p.to_string()).collect();
+                    let dir = tempfile::TempDir::new().unwrap();
+                    let artifact = fold_of(&dir, "artifact", &artifact_states, 9);
+                    let full = restore_diff(
+                        &fold_of(&dir, "probe", &local_states, 3),
+                        &artifact,
+                        &prefixes,
+                    )
+                    .unwrap();
+                    // Crash after `cut` ops: apply them, then re-diff.
+                    for cut in 0..=full.len() {
+                        let mut local = fold_of(&dir, &format!("local-{cut}"), &local_states, 3);
+                        let first = restore_diff(&local, &artifact, &prefixes).unwrap();
+                        let partial: Vec<RestoreOp> = first.into_iter().take(cut).collect();
+                        let updates = materialize(&artifact, partial).unwrap();
+                        local.apply(&updates, &WatchCursor::from_u64(3)).unwrap();
+                        let rest = restore_diff(&local, &artifact, &prefixes).unwrap();
+                        let updates = materialize(&artifact, rest).unwrap();
+                        local.apply(&updates, &WatchCursor::from_u64(9)).unwrap();
+
+                        for (i, key) in KEYS.iter().enumerate() {
+                            let want = if in_scope(scope, key) {
+                                artifact_states[i]
+                            } else {
+                                local_states[i]
+                            };
+                            let got = local
+                                .get(key)
+                                .unwrap()
+                                .map(|e| (e.value, e.version.as_u64()));
+                            assert_eq!(
+                                got,
+                                want.map(|(v, r)| (v.to_vec(), Some(r))),
+                                "key {key} scope {scope:?} local {local_states:?} artifact \
+                                 {artifact_states:?} cut {cut}"
+                            );
+                        }
+                        assert!(
+                            restore_diff(&local, &artifact, &prefixes)
+                                .unwrap()
+                                .is_empty(),
+                            "a converged fold must diff empty"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases > 3_000, "the domain is not vacuous ({cases})");
+    }
+
+    /// Every assignment of `states` to the three keys.
+    fn itertools_product(states: &[KeyState; 3]) -> Vec<[KeyState; 3]> {
+        let mut out = Vec::new();
+        for a in states {
+            for b in states {
+                for c in states {
+                    out.push([*a, *b, *c]);
+                }
+            }
+        }
+        out
+    }
 }

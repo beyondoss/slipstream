@@ -59,7 +59,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::artifact::ExportManifest;
-use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, WatchCursor};
+use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, WatchCursor};
 use crate::protocol::resume_window_ok;
 use crate::repair::{
     ExpiryRepair, RestoreSource, RestoredFold, check_restore, cursor_rank, materialize,
@@ -333,14 +333,30 @@ where
         _ => (None, None),
     };
 
+    // A fold with data but no cursor can't be re-listed blind (see
+    // `run_watch`). Only the first entry is read.
+    let unanchored = match &store {
+        Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => fold_has_entries(st)
+            .map_err(|e| KvError::WatchError(format!("reading the fold at start failed: {e}")))?,
+        _ => false,
+    };
+
     // Spawn the watch task. It owns the cursor-expiry handling so the main loop
     // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
     let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
     let handle = {
         let watcher = Arc::clone(&watcher);
-        tokio::spawn(
-            async move { run_watch(watcher.as_ref(), &scope, resume, repair_handle, tx).await },
-        )
+        tokio::spawn(async move {
+            run_watch(
+                watcher.as_ref(),
+                &scope,
+                resume,
+                unanchored,
+                repair_handle,
+                tx,
+            )
+            .await
+        })
     };
 
     // Batch state.
@@ -873,16 +889,35 @@ where
     }
 }
 
+/// Does the fold hold any entry? Stops at the first.
+fn fold_has_entries<S: SnapshotStore>(store: &S) -> Result<bool, SnapshotError> {
+    let mut found = false;
+    match store.for_each_in_range("", |_| {
+        found = true;
+        // Stop the scan; `found` carries the answer.
+        Err(SnapshotError::Backend(String::new()))
+    }) {
+        Err(e) if !found => Err(e),
+        _ => Ok(found),
+    }
+}
+
 /// Run the underlying watch for `scope`, resuming from `resume` when it carries
 /// a position, with cursor-expiry repair: an expiry (at resume, or mid-watch
 /// from the floor guard) runs the planned repair and then either falls back to
 /// the full-scope re-list (Relist / nothing armed) or resumes from the restored
 /// artifact's cursor (Restore) — which can itself expire later and go round
 /// again, each time only for a strictly newer artifact.
+///
+/// `unanchored`: the fold holds data but no cursor (a torn first checkpoint,
+/// or a populated store started without one). A re-list alone never removes
+/// what it doesn't deliver, so that start is repaired like an expiry at
+/// revision 0 before watching.
 async fn run_watch<S: Send + 'static>(
     watcher: &dyn KvWatcher,
     scope: &WatchScope,
     resume: Option<WatchCursor>,
+    unanchored: bool,
     repair: Option<RepairHandle<S>>,
     tx: mpsc::Sender<KvUpdate>,
 ) -> Result<(), KvError> {
@@ -892,39 +927,45 @@ async fn run_watch<S: Send + 'static>(
     // edit could let drift from the `Some`.
     let mut resume = resume.filter(|c| !c.is_none());
 
-    // A cursor-less start re-lists the bucket — complete only if retention has
-    // never evicted a current value. Where it has, and a restore is armed,
-    // seed from the artifact instead.
-    if resume.is_none()
-        && let Some(h) = &repair
-        && let Some(source) = fresh_start_restore_source(watcher, h).await?
-    {
-        warn!(
-            "no resume cursor, and the bucket has already evicted current values: a re-list \
-             would seed an incomplete fold; restoring from the latest artifact"
-        );
-        let restored = restore_from_artifact(watcher, scope, source, &h.tx, &WatchCursor::none())
-            .await
-            .map_err(|e| match e {
-                KvError::WatchError(msg) => KvError::WatchError(format!(
-                    "{msg}. This node has no cursor, so it can only seed from an artifact. If \
-                     none exists yet (first deploy onto a bucket that already evicted values), \
-                     start one node with ExpiryRepair::None — accepting that values which \
-                     already aged out are gone — and publish an export from it"
-                )),
-                other => other,
-            })?;
-        resume = Some(restored);
-    }
+    // A cursor-less start that must be repaired before it watches: a fold
+    // with data and no cursor (any repair), or an empty fold on a bucket that
+    // already evicted current values with a restore armed (its re-list would
+    // seed an incomplete fold).
+    let mut repair_first = resume.is_none()
+        && match &repair {
+            // (A handle exists only for a real repair mode.)
+            Some(_) if unanchored => {
+                warn!(
+                    "the fold holds data but no cursor; repairing it like an expired cursor \
+                     before watching (a re-list alone never removes what it doesn't deliver)"
+                );
+                true
+            }
+            Some(h) => {
+                let seed = fresh_start_needs_restore(watcher, h).await?;
+                if seed {
+                    warn!(
+                        "no resume cursor, and the bucket has already evicted current values: a \
+                         re-list would seed an incomplete fold; restoring from the latest artifact"
+                    );
+                }
+                seed
+            }
+            None => false,
+        };
 
     loop {
-        let Some(cursor) = resume.take() else {
-            return watch_scope(watcher, scope, tx).await;
+        let cursor = if std::mem::take(&mut repair_first) {
+            WatchCursor::none()
+        } else {
+            let Some(cursor) = resume.take() else {
+                return watch_scope(watcher, scope, tx).await;
+            };
+            match watch_scope_from(watcher, scope, &cursor, tx.clone()).await {
+                Err(KvError::CursorExpired) => cursor,
+                other => return other,
+            }
         };
-        match watch_scope_from(watcher, scope, &cursor, tx.clone()).await {
-            Err(KvError::CursorExpired) => {}
-            other => return other,
-        }
         match plan_repair(watcher, repair.as_ref()).await? {
             Plan::ReListOnly => {
                 warn!(
@@ -943,8 +984,21 @@ async fn run_watch<S: Send + 'static>(
             }
             Plan::Restore(source, repairs) => {
                 warn!("watch cursor expired; restoring the fold from the latest artifact");
-                resume =
-                    Some(restore_from_artifact(watcher, scope, source, repairs, &cursor).await?);
+                let restored = restore_from_artifact(watcher, scope, source, repairs, &cursor)
+                    .await
+                    .map_err(|e| match e {
+                        KvError::WatchError(msg) if cursor.is_none() => {
+                            KvError::WatchError(format!(
+                                "{msg}. This node has no cursor, so it can only seed from an \
+                             artifact. If none exists yet (first deploy onto a bucket that \
+                             already evicted values), start one node with ExpiryRepair::None \
+                             — accepting that values which already aged out are gone — and \
+                             publish an export from it"
+                            ))
+                        }
+                        other => other,
+                    })?;
+                resume = Some(restored);
             }
         }
     }
@@ -983,6 +1037,14 @@ async fn watch_scope_from(
     }
 }
 
+/// Is the bucket's key listing the truth — does "not listed" mean "deleted"?
+/// Yes when retention never evicts current values, and also when it can but
+/// has never evicted anything (the first retained revision is still 1). Read
+/// live; `None` when the backend can't say.
+fn listing_is_truth(r: &Retention) -> bool {
+    !r.evicts_current_values || resume_window_ok(0, r.first_revision)
+}
+
 /// Decide how to repair one expiry, reading the bucket's retention live when
 /// the choice depends on it.
 async fn plan_repair<'a, S>(
@@ -998,7 +1060,7 @@ async fn plan_repair<'a, S>(
             if watcher
                 .retention()
                 .await?
-                .is_some_and(|r| r.evicts_current_values)
+                .is_some_and(|r| !listing_is_truth(&r))
             {
                 let msg = "watch cursor expired on a bucket whose retention evicts current \
                            values (max_age, per-message TTL, or discard:old): its key listing \
@@ -1013,33 +1075,26 @@ async fn plan_repair<'a, S>(
         }
         ExpiryRepair::Restore(source) => Plan::Restore(source, &h.tx),
         ExpiryRepair::Auto { reader, restore } => match watcher.retention().await? {
-            Some(r) if !r.evicts_current_values => Plan::Relist(reader, &h.tx),
+            Some(r) if listing_is_truth(&r) => Plan::Relist(reader, &h.tx),
             _ => Plan::Restore(restore, &h.tx),
         },
     })
 }
 
-/// The restore source to seed a cursor-less start from, if one is armed and
-/// the bucket has already evicted current values (so its re-list would be
-/// incomplete). A bucket that never evicts current values, or hasn't evicted
-/// anything yet, re-lists completely.
-async fn fresh_start_restore_source<'a, S>(
+/// Must an EMPTY cursor-less start seed from an artifact? Only with a restore
+/// armed, on a bucket whose re-list is no longer complete (it evicted current
+/// values). A bucket whose listing is the truth re-lists completely.
+async fn fresh_start_needs_restore<S>(
     watcher: &dyn KvWatcher,
-    h: &'a RepairHandle<S>,
-) -> Result<Option<&'a Arc<dyn RestoreSource<S>>>, KvError> {
-    let source = match &h.mode {
-        ExpiryRepair::Restore(source)
-        | ExpiryRepair::Auto {
-            restore: source, ..
-        } => source,
-        ExpiryRepair::None | ExpiryRepair::Relist(_) => return Ok(None),
-    };
-    Ok(match watcher.retention().await? {
-        Some(r) if r.evicts_current_values && !resume_window_ok(0, r.first_revision) => {
-            Some(source)
-        }
-        _ => None,
-    })
+    h: &RepairHandle<S>,
+) -> Result<bool, KvError> {
+    if !matches!(h.mode, ExpiryRepair::Restore(_) | ExpiryRepair::Auto { .. }) {
+        return Ok(false);
+    }
+    Ok(watcher
+        .retention()
+        .await?
+        .is_some_and(|r| !listing_is_truth(&r)))
 }
 
 /// The artifact restore, watch-task half: check the newest artifact before
