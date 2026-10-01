@@ -615,3 +615,56 @@ async fn live_floor_guard_trip_restores_in_process() {
         "the restored watcher is identical to the exporter"
     );
 }
+
+/// PINNED BEHAVIOR (availability, not safety): the resume check is
+/// conservative — it sees only the stream's first retained revision, so when
+/// every message after a node's cursor has been SUPERSEDED (every key
+/// rewritten since), the cursor looks expired though nothing was evicted.
+/// On an evicting bucket that routes to a restore, and with no artifact
+/// ahead of the node, the watch fail-stops until the next export round —
+/// safe, but unavailable. A heartbeat-style bucket (few keys, all rewritten
+/// often) hits this on a short restart. Telling supersession from eviction
+/// needs information the stream doesn't expose (e.g. the cursor's message
+/// timestamp against `max_age`); this test flips if that lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
+    let h = Harness::new(StoreConfig {
+        name: "routes".into(),
+        max_age: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let w = h.bucket.writer().unwrap();
+    w.put("hb.a", b"1").await.unwrap();
+    let rev = w.put("hb.b", b"1").await.unwrap().as_u64().unwrap();
+    let (_c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, None, h.auto());
+    node.wait_applied(rev).await;
+    let artifact = node.publish(&*h.transport, h.dir.path()).await;
+    let rev = w.put("hb.a", b"2").await.unwrap().as_u64().unwrap();
+    node.wait_applied(rev).await;
+    let cursor = node.stop().await.unwrap().as_u64().unwrap();
+    assert!(artifact < cursor, "the newest artifact is behind the node");
+
+    // While the node is down, every key is rewritten — including the one
+    // right after its cursor. Nothing ages out (max_age is an hour).
+    w.put("hb.a", b"3").await.unwrap();
+    w.put("hb.b", b"3").await.unwrap();
+    w.put("hb.a", b"4").await.unwrap();
+    assert!(
+        h.first_sequence().await > cursor + 1,
+        "supersession alone passed the cursor"
+    );
+
+    let (c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, Some(c), h.auto());
+    let err = tokio::time::timeout(Duration::from_secs(10), node.task)
+        .await
+        .expect("fails fast")
+        .unwrap()
+        .expect_err("no artifact ahead of the node: fail-stop");
+    assert!(
+        err.to_string().contains("not ahead of the local fold"),
+        "{err}"
+    );
+}

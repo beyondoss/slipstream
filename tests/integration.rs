@@ -569,7 +569,8 @@ async fn cas_tombstone_reaches_watchers_as_a_delete() {
         Arc::clone(&watcher),
         WatchCursor::from_u64(v1.as_u64().unwrap()),
     );
-    let from_task = tokio::spawn(async move { w.watch_prefixes_from(&["node."], &resume, tx_from).await });
+    let from_task =
+        tokio::spawn(async move { w.watch_prefixes_from(&["node."], &resume, tx_from).await });
     // Attach the resume consumer BEFORE anything supersedes node.a@1: with
     // history 1, once every message after the cursor is superseded the
     // stream's first sequence passes it, and the (conservative) resume check
