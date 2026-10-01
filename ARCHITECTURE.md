@@ -123,7 +123,7 @@ Every non-`_from` watch is a **state-sync** stream (NATS `DeliverPolicy::LastPer
 | `VersionToken`           | Opaque per-key version (NATS: 8-byte u64; FDB: 10-byte versionstamp) | Not a wall-clock timestamp; not globally ordered |
 | `KvEntry`                | One key + value + version from a read                                | Not a watch event; immutable once returned       |
 | `KvUpdate`               | One watch event: `Put`, `Delete`, or `Purge`                         | Not a read result; carries deletes too           |
-| `Snapshot`               | Deduplicated KV state + cursor persisted to disk                     | Not the source of truth; a cache of NATS         |
+| `Snapshot`               | Deduplicated KV state + cursor persisted to disk; on a bounded log, a replica of record | Not a cache: NATS no longer holds what it evicted |
 | `SnapshotWriter`         | Append-only log of `KvUpdate`s; no in-memory state beyond a counter  | Not the in-memory cache itself                   |
 | `SnapshotStore`          | Trait: the durable-fold contract — atomic `apply(batch, cursor)`, `load`, `get`, `range` | Not a serving index; stops at fold + cursor + query |
 | `AppendLogSnapshot`      | Default `SnapshotStore`: append-only log + in-RAM fold (pure-Rust)   | Not for folds larger than RAM                     |
@@ -417,9 +417,9 @@ fn range(prefix) -> Vec<KvEntry>;              // ordered prefix scan
 
 Three invariants bind every implementation:
 
-- **Pure function of the log.** Delete the store, replay every update with revision `> cursor`, and the state is identical. The store caches the fold; NATS is the source of truth.
+- **Fold + tail = truth.** The fold at cursor C, plus a resume from C, is every write minus every real delete. A NATS cursor means every *retained* message at or below it is applied — not "the truth at C": a key whose latest write is after C arrives with the resume.
 - **Cursor-after-apply.** `apply` makes data and cursor durable together, so the cursor never names a revision whose data is absent — one transaction on a transactional backend, data-then-cursor on the append log (a torn write leaves data *ahead* of the cursor, which replay re-folds, never skips).
-- **Snapshot is a cache.** A tail lost to power loss (under a no-sync durability mode) is rebuilt by resuming the watch from the recovered cursor.
+- **Replica of record.** NATS is a bounded log and keeps only the retained tail, so a fold can't be rebuilt from NATS alone. A tail lost to power loss (under a no-sync durability mode) leaves a consistent fold at an earlier cursor, rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't. A lost or corrupt fold is rebuilt by importing an artifact, never by deleting it and re-listing NATS (complete only on a bucket that has never evicted a current value).
 
 `watch_applied` is generic over `SnapshotStore`: on each flush, after `apply` returns, it hands the raw batch + post-apply cursor to `store.apply(...)` on a blocking task. The trait stops at fold + cursor + query; serving structures built from the fold (routing rings, hashrings) live in the consumer, which reads them out via `get`/`range`.
 
@@ -473,7 +473,7 @@ write_update()                           compact() [blocking: replay → dedup �
 
 `compact()` flushes the BufWriter first so un-checkpointed records survive. It reads the current file, replays it, writes to a same-directory tempfile (same filesystem = atomic rename, no `EXDEV`), `sync_all`s, then renames.
 
-`checkpoint()` writes only a cursor record and calls `BufWriter::flush()` — a `write(2)` into the page cache. This survives a process crash but NOT a power loss. The only `fsync` is in `compact()`. The snapshot is a cache; a lost tail is rebuilt from a NATS scan + watch replay.
+`checkpoint()` writes only a cursor record and calls `BufWriter::flush()` — a `write(2)` into the page cache. This survives a process crash but NOT a power loss. The only `fsync` is in `compact()`. A tail lost to power loss leaves a consistent fold at an earlier cursor, rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't.
 
 ### Export Lease (`export_lease.rs`)
 
@@ -610,7 +610,7 @@ async-nats ≤0.46 has a race: the server can deliver the first batch of push-co
 
 ### Why checkpoint() does not fsync?
 
-Checkpoints are frequent (every N watch events). An fsync per checkpoint would add milliseconds of disk-sync latency to the hot watch path. Since the snapshot is a cache backed by NATS, a tail lost to power loss is rebuilt from a NATS replay — not a correctness failure. The only `fsync` is in `compact_to_file()`, where it guarantees the new compact file is durable before the atomic rename replaces the old one.
+Checkpoints are frequent (every N watch events). An fsync per checkpoint would add milliseconds of disk-sync latency to the hot watch path. A tail lost to power loss leaves a consistent fold at an earlier cursor (data and cursor commit together), rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't — not a correctness failure. The only `fsync` is in `compact_to_file()`, where it guarantees the new compact file is durable before the atomic rename replaces the old one.
 
 ### Why raw backend-dir artifacts instead of a logical re-encode?
 
@@ -700,6 +700,7 @@ Production code and an exhaustive model checker running the same logic closes th
 | `CursorExpired`, bucket keeps current values | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
 | `CursorExpired`, bucket evicts current values | `watch_applied` restores the in-scope fold from the newest artifact and resumes from its cursor | Automatic with `ExpiryRepair::Restore`/`Auto` |
 | Fold holds data but no cursor (torn first checkpoint) | Repaired like an expiry at revision 0 before watching | Automatic with a repair armed |
+| Every message after a node's cursor SUPERSEDED (every key rewritten while it was down), evicting bucket | The conservative resume check sees the cursor as expired though nothing was evicted; the restore then needs an artifact ahead of the node, and without one the watch fail-stops (safe, unavailable) — pinned by `tests/eviction.rs::supersession_only_restart_fail_stops_without_a_newer_artifact` | Restarts once the next export round publishes; export more often on small hot buckets. Telling supersession from eviction needs the cursor's message timestamp against `max_age` (not stored today) |
 | A write ages out before ANY node folds it | Every node that needed it fail-stops (no fold anywhere holds it; `tests/model_fleet.rs` proves this is the only way the fleet fail-stops) | Data loss by retention; widen retention or export more often |
 | Key-listing resync on a bucket that evicts current values | Refused: `KvError::WatchError` ("evicts current values"); fold untouched | Wire `ExpiryRepair::Restore`/`Auto` with an artifact source |
 | Restore: no artifact ahead, stale artifact, or one that doesn't cover the scope | `KvError::WatchError`, reason logged at `error`; fold untouched | Fix the export pipeline (run exports well inside `max_age` / `discard: old` turnover); restart |
@@ -708,9 +709,9 @@ Production code and an exhaustive model checker running the same logic closes th
 | `RevisionMismatch` on CAS            | Concurrent writer won the race                                              | Re-read with `entry()`, resolve, retry            |
 | `AlreadyExists` on `create()`        | Key already present; caller's create was not exclusive                      | Read live value, decide whether to proceed        |
 | Snapshot truncated tail              | `load()` discards partial final record; earlier records intact              | Resume from recovered cursor; tail re-folded      |
-| Snapshot mid-file CRC mismatch       | `SnapshotError::Corrupted`                                                  | Delete snapshot, full NATS replay                 |
-| Snapshot wrong format version        | `SnapshotError::InvalidFormat`                                              | Delete snapshot, full NATS replay                 |
-| `compact()` I/O error                | Writer poisoned; subsequent writes return `Io`                              | Delete snapshot, rebuild from NATS                |
+| Snapshot mid-file CRC mismatch       | `SnapshotError::Corrupted`                                                  | Import the latest artifact (a NATS re-list loses everything evicted; complete only on a bucket that never evicted a current value) |
+| Snapshot wrong format version        | `SnapshotError::InvalidFormat`                                              | Same: import the latest artifact                  |
+| `compact()` I/O error                | Writer poisoned; subsequent writes return `Io`                              | Reopen (the old file is intact until the atomic rename); if unreadable, import the latest artifact |
 | Synadia Cloud stream limit           | Raw API path treats as non-fatal; verifies bucket with `get_key_value`      | Non-fatal if bucket exists                        |
 | Crash between payload upload and pointer swap | Old pointer remains fully consistent; payload orphaned | Next export round publishes new pointer; stale payload pruned after grace |
 | Slow exporter after newer round published | `pointer_publish_allowed` returns false → `SupersededByNewer`           | Lease abandoned, local artifact deleted; payload orphaned until prune |

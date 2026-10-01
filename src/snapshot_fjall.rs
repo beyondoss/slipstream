@@ -107,8 +107,8 @@ const DATA_BLOCK_SIZE: u32 = 16 * 1024;
 pub struct FjallConfig {
     /// `fsync` every [`apply`](SnapshotStore::apply) commit when `true`. When
     /// `false` (the default), commits are not fsync'd (NO_SYNC): faster, and a
-    /// tail lost to power loss is rebuilt by resuming the watch from the recovered
-    /// cursor — the snapshot is a cache.
+    /// tail lost to power loss leaves a consistent fold at an earlier cursor,
+    /// rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't.
     pub sync: bool,
 
     /// Block-cache capacity in bytes for the LSM. fjall's own default is 32 MiB,

@@ -82,8 +82,8 @@ use crate::snapshot::{SnapshotError, SnapshotStore};
 /// embedded cursor is exactly the applied cursor at the moment of export.
 ///
 /// The export result (or error) comes back on `reply`; an export failure is
-/// reported there and the watch keeps running (the snapshot is a cache — a
-/// failed artifact is the requester's problem, not the fold's).
+/// reported there and the watch keeps running (a failed export leaves the fold
+/// untouched; the next export round retries).
 pub struct ExportRequest {
     /// Where the artifact directory will be created. Must not exist (or be an
     /// empty directory); same filesystem as the fold for cheap hardlinks.
@@ -328,10 +328,29 @@ where
     // Repair channel, armed only when there is a repair to run AND a store to
     // run it against (both repairs edit the fold). The watch task sends the
     // repair here and waits for the ack/reply before starting its next watch.
+    let mode: ExpiryRepair<S> = repair.into();
+    // A restore replaces the fold, so asking for one without a fold is a
+    // contradiction: on a bounded log such a consumer would silently hold
+    // NATS's retained view (missing everything evicted) while believing it
+    // repairs. Refuse it up front; `ExpiryRepair::None` is the explicit way
+    // to accept the retained view.
+    if store.is_none()
+        && matches!(
+            mode,
+            ExpiryRepair::Restore { .. } | ExpiryRepair::Auto { .. }
+        )
+    {
+        return Err(KvError::WatchError(
+            "ExpiryRepair::Restore / ::Auto repair the fold, so they need a store: a consumer \
+             without one cannot repair a bounded log. Pass a SnapshotStore, or \
+             ExpiryRepair::None to accept NATS's retained view"
+                .into(),
+        ));
+    }
     let (repair_handle, mut repairs): (
         Option<RepairHandle<S>>,
         Option<mpsc::Receiver<RepairRequest<S>>>,
-    ) = match repair.into() {
+    ) = match mode {
         ExpiryRepair::None => (None, None),
         mode if store.is_some() => {
             let (tx, rx) = mpsc::channel(1);
@@ -963,7 +982,23 @@ async fn run_watch<S: Send + 'static>(
                 }
                 seed
             }
-            None => false,
+            None => {
+                // Nothing armed: the re-list stands as the fold. Say so when
+                // the bucket has already evicted current values — the copy
+                // then lacks whatever aged out, and nothing will repair it.
+                if watcher
+                    .retention()
+                    .await?
+                    .is_some_and(|r| !listing_is_truth(&r))
+                {
+                    warn!(
+                        "no resume cursor and no repair armed, on a bucket that has already \
+                         evicted current values: the re-list lacks whatever aged out. Wire a \
+                         store and ExpiryRepair::Auto to seed from an artifact"
+                    );
+                }
+                false
+            }
         };
 
     loop {
@@ -3582,5 +3617,31 @@ mod tests {
             !snap.entries.contains_key("node.new"),
             "the restored fold must equal the artifact's"
         );
+    }
+
+    /// A restore needs a fold to restore into: `Restore`/`Auto` without a
+    /// store is refused up front instead of silently running on NATS's
+    /// retained view.
+    #[tokio::test]
+    async fn restore_without_a_store_is_refused() {
+        let artifact = MockRestore::new(vec![], 10, Some(&[""]));
+        let watcher = Arc::new(ScriptedWatcher::new(evicting(9), vec![]));
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let err = watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            restore_mode::<AppendLogSnapshot>(artifact),
+            None::<AppendLogSnapshot>,
+            None,
+            BatchConfig::default(),
+            parse_put,
+            |_b: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await
+        .expect_err("Restore without a store must be refused");
+        assert!(err.to_string().contains("need a store"), "{err}");
     }
 }

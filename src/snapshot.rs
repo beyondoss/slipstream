@@ -23,8 +23,9 @@
 //! silently flatten it to 0 and break every later CAS.
 //!
 //! Used by edge/tunnel services to survive restarts without a full
-//! NATS KV scan. The snapshot is a cache — delete it and the system
-//! falls back to `load_all()`.
+//! NATS KV scan. On a bounded log the fold is a replica of record, not a
+//! cache: NATS no longer holds what it evicted, so a lost fold is rebuilt by
+//! importing an artifact, not by re-listing NATS.
 //!
 //! ## Blocking I/O
 //!
@@ -49,8 +50,9 @@ use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
 const MAGIC: &[u8; 4] = b"PGSS";
 // v2: Put/Delete records store the version as length-prefixed raw bytes instead
 // of a fixed 8-byte u64, so non-u64 tokens (e.g. FDB versionstamps) survive a
-// round-trip. v1 files are rejected by `replay_log`; the snapshot is a cache, so
-// a rejected file just triggers a fresh NATS scan + watch replay.
+// round-trip. v1 files are rejected by `replay_log` (InvalidFormat); recover
+// such a fold by importing an artifact (a NATS re-list is complete only on a
+// bucket that has never evicted a current value).
 const FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 6;
 
@@ -218,10 +220,10 @@ impl SnapshotWriter {
     ///
     /// The flush is a `write(2)` into the page cache — it survives a process
     /// crash, but NOT power loss: there is no `fsync` on this path. The durable
-    /// `sync_all` happens in [`compact`](Self::compact). That's deliberate — the
-    /// snapshot is a cache backed by NATS and checkpoints are frequent, so an
-    /// fsync per checkpoint isn't worth its latency; a tail lost to power loss is
-    /// rebuilt from a NATS scan + watch replay.
+    /// `sync_all` happens in [`compact`](Self::compact). That's deliberate —
+    /// checkpoints are frequent and an fsync per checkpoint isn't worth its
+    /// latency: a tail lost to power loss leaves a consistent fold at an earlier
+    /// cursor, rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't.
     ///
     /// Returns `true` when the log has grown past the compaction threshold
     /// and the caller should run [`compact`](Self::compact). Separating
@@ -326,18 +328,21 @@ pub fn load(path: &Path) -> Result<Option<Snapshot>, SnapshotError> {
 ///
 /// ## Invariants every implementation must hold
 ///
-/// - **Pure function of the log.** Delete the store, replay every update with
-///   revision `>` the persisted cursor, and you get byte-identical state. The
-///   store caches the fold; it is never the source of truth (that is NATS).
+/// - **Fold + tail = truth.** The fold at cursor `C`, plus a resume from `C`,
+///   is every write minus every real delete. A NATS cursor means every
+///   RETAINED message at or below it is applied — not "the truth at `C`": a key
+///   whose latest write is after `C` arrives with the resume.
 /// - **Cursor-after-apply.** A persisted cursor `C` implies every update with
 ///   revision `≤ C` is durably folded in. [`apply`](Self::apply) writes data and
 ///   cursor together so the cursor never names a revision whose data is absent —
 ///   on a transactional backend in one txn, on the append log data-then-cursor
 ///   (a torn write leaves data *ahead* of the cursor, which replay re-folds, never
 ///   skips).
-/// - **Snapshot is a cache.** Any tail lost to power loss (under a no-sync
-///   durability mode) is rebuilt by resuming the watch from the recovered cursor;
-///   never a correctness failure.
+/// - **Replica of record.** On a bounded log NATS keeps only the retained
+///   tail, so the fold can't be rebuilt from NATS alone. A tail lost to power
+///   loss (under a no-sync durability mode) leaves a consistent fold at an
+///   earlier cursor, rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't. A lost or corrupt fold is rebuilt by
+///   importing an artifact, never by re-listing NATS.
 ///
 /// ## Threading
 ///
@@ -716,8 +721,10 @@ fn replay_log(data: &[u8]) -> Result<(HashMap<String, KvEntry>, WatchCursor, boo
                 // land as `Truncated`, so we stop and silently drop everything
                 // after this point. Detecting it would need a framed, separately-
                 // checksummed length (a format change). Acceptable because the
-                // snapshot is a cache: a short read just triggers a fuller NATS
-                // scan + watch replay, never data loss of record.
+                // result is a consistent fold at an earlier cursor — the same
+                // shape as a tail lost to power loss — which the resume (inside
+                // retention) or the cursor-expiry restore (outside it) brings
+                // back to the truth.
                 clean_eof = false;
                 break;
             }

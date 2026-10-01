@@ -64,7 +64,7 @@ beyond-slipstream = { version = "0.7", features = ["transport"] } # export/impor
 | `VersionToken`       | Opaque version — NATS: u64 revision; FDB: 10-byte versionstamp                   |
 | `KvEntry`            | One key + value + version from a read                                            |
 | `KvUpdate`           | One watch event: `Put`, `Delete`, or `Purge`                                     |
-| `Snapshot`           | Deduplicated KV state + cursor at a point in time. Disk cache, not source of truth |
+| `Snapshot`           | Deduplicated KV state + cursor at a point in time. On a bounded log, a replica of record: NATS no longer holds what it evicted |
 | `SnapshotWriter`     | Append-only log of `KvUpdate`s; survives restarts without a full NATS scan       |
 | `SnapshotStore`      | Trait: the durable-fold contract — `apply` (data + cursor, atomically), `load`, `get`, `range` |
 | `AppendLogSnapshot`  | Default `SnapshotStore`: the append-only log + an in-RAM fold (pure-Rust, small state) |
@@ -216,6 +216,8 @@ if let Some(snap) = snapshot::load(Path::new("/var/lib/svc/state.snap"))? {
     }
     watcher.watch_all_from(&snap.cursor, tx).await?;
 } else {
+    // Complete only if the bucket has never evicted a current value; on a
+    // bounded log, seed a fresh node from an artifact instead.
     watcher.watch_all(tx).await?;
 }
 ```
@@ -244,7 +246,7 @@ while let Some(update) = rx.recv().await {
 
 This loop has a trap: `current_cursor` must track what `cache.apply()` has consumed, not what `rx.recv()` delivered. Get it wrong and a crash skips updates on resume. [`watch_applied`](#applied-watch) runs this loop for you with that invariant enforced.
 
-The snapshot is a cache. Delete it and the service falls back to full replay on next start.
+On a bounded log the snapshot is a replica of record, not a cache. Deleting it and re-listing NATS loses everything NATS has evicted: rebuild a lost or corrupt fold by importing the latest artifact. Re-listing is complete only on a bucket that never evicts current values.
 
 ### File format
 
@@ -276,7 +278,7 @@ pub trait SnapshotStore: Sized + Send {
 }
 ```
 
-Every backend keeps the same invariants: the fold is a pure function of the log (delete the store, replay from the cursor, get identical state), the cursor never names a revision whose data isn't durable (cursor-after-apply), and the store is a cache — a tail lost to power loss is rebuilt by resuming the watch.
+Every backend keeps the same invariants. **Fold + tail = truth**: the fold at cursor C, plus a resume from C, is every write minus every real delete (a cursor means every *retained* message at or below it is applied). **Cursor-after-apply**: the cursor never names a revision whose data isn't durable. **Replica of record**: on a bounded log the fold can't be rebuilt from NATS alone; a tail lost to power loss is rebuilt by resuming from the recovered cursor while it is inside NATS's retention, and by the cursor-expiry repair (an artifact restore) once it isn't, and a lost or corrupt fold is rebuilt by importing an artifact, never by re-listing NATS.
 
 | Backend | When | Notes |
 | ------- | ---- | ----- |
