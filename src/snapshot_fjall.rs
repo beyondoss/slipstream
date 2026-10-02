@@ -132,7 +132,7 @@ impl Default for FjallConfig {
     }
 }
 
-/// On-disk durable fold backed by fjall. See the [module docs](self).
+/// On-disk durable fold backed by fjall. See the module docs in `src/snapshot_fjall.rs`.
 pub struct FjallSnapshot {
     // fjall 3 renamed its types: the database root is `Database` (was `Keyspace`)
     // and each named partition is a `Keyspace` (was `PartitionHandle`).
@@ -514,6 +514,13 @@ impl SnapshotStore for FjallSnapshot {
             f(decode_entry(key, &raw_val)?)?;
         }
         Ok(())
+    }
+
+    fn has_entries(&self) -> Result<bool, SnapshotError> {
+        match self.data.prefix(b"").next() {
+            Some(guard) => guard.into_inner().map(|_| true).map_err(map_fjall),
+            None => Ok(false),
+        }
     }
 
     fn cursor(&self) -> WatchCursor {

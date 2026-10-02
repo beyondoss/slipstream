@@ -2,16 +2,17 @@
 //!
 //! Each test boots its own `nats-server` (JetStream enabled) on a free port with
 //! a throwaway store directory, then talks to it through the public `slipstream`
-//! API. The server is killed when the [`TestNats`] guard drops, so tests are
-//! fully isolated and leave nothing running.
+//! API (the shared harness in `tests/common`). The server is killed when the
+//! [`TestNats`] guard drops, so tests are fully isolated and leave nothing
+//! running.
 //!
 //! `nats-server` comes from mise (`ubi:nats-io/nats-server`). When mise is
 //! activated it's on `PATH`; otherwise set `NATS_SERVER_BIN` to an explicit path.
 
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::TestNats;
 use slipstream::{
     Connection, DiscardPolicy, KvError, KvStore, KvUpdate, KvWriter, NatsConnection,
     NatsConnectionConfig, StoreConfig, VersionToken, WatchCursor,
@@ -19,55 +20,21 @@ use slipstream::{
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+mod common;
+
 // --- Test harness ------------------------------------------------------------
 
-/// A running `nats-server` with JetStream enabled. Killed on drop.
-struct TestNats {
-    child: Child,
-    url: String,
-    // Kept alive so the JetStream store directory survives for the server's
-    // lifetime; removed when the guard drops.
-    _store_dir: tempfile::TempDir,
+/// The public API on a [`TestNats`] server.
+trait PublicApi {
+    /// Connect through the public API and return a ready connection.
+    async fn connect(&self) -> NatsConnection;
+
+    /// Connect and open a store named `bucket`. The connection is returned
+    /// too because it owns the underlying NATS client; keep it in scope.
+    async fn store(&self, bucket: &str) -> (NatsConnection, Arc<dyn KvStore>);
 }
 
-impl TestNats {
-    /// Boot a fresh server and block until it accepts connections.
-    async fn start() -> TestNats {
-        let bin = std::env::var("NATS_SERVER_BIN").unwrap_or_else(|_| "nats-server".to_string());
-        let port = free_port();
-        let store_dir = tempfile::tempdir().expect("create jetstream store dir");
-
-        let child = Command::new(&bin)
-            .args([
-                "--jetstream",
-                "--addr",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--store_dir",
-                store_dir.path().to_str().expect("utf-8 store path"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "failed to spawn `{bin}`: {e}. Is nats-server installed? \
-                     Run `mise install` or set NATS_SERVER_BIN."
-                )
-            });
-
-        let url = format!("nats://127.0.0.1:{port}");
-        wait_until_ready(&url).await;
-
-        TestNats {
-            child,
-            url,
-            _store_dir: store_dir,
-        }
-    }
-
-    /// Connect through the public API and return a ready connection.
+impl PublicApi for TestNats {
     async fn connect(&self) -> NatsConnection {
         let conn = NatsConnection::new(NatsConnectionConfig {
             url: self.url.clone(),
@@ -78,8 +45,6 @@ impl TestNats {
         conn
     }
 
-    /// Connect and open a store named `bucket`. The connection is returned too
-    /// because it owns the underlying NATS client; keep it in scope.
     async fn store(&self, bucket: &str) -> (NatsConnection, Arc<dyn KvStore>) {
         let conn = self.connect().await;
         let store = conn
@@ -92,33 +57,6 @@ impl TestNats {
             .expect("open store");
         (conn, store)
     }
-}
-
-impl Drop for TestNats {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Grab a free TCP port by binding to :0 and reading the assigned port back.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("read local addr")
-        .port()
-}
-
-/// Poll the server until a client connects or we give up.
-async fn wait_until_ready(url: &str) {
-    for _ in 0..100 {
-        if async_nats::connect(url).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("nats-server at {url} never became ready");
 }
 
 /// Deterministically wait until a freshly spawned watch is live.

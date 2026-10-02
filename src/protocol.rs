@@ -1,24 +1,27 @@
-//! Protocol decision kernels — the load-bearing guards of the snapshot
-//! export/import protocol, extracted as pure functions so the PRODUCTION
-//! code and the exhaustive model checker (`tests/model.rs`) execute the
-//! **same logic**, not two hand-synchronized copies of it.
+//! Protocol decision kernels — every decision the snapshot export/import
+//! protocol and the cursor-expiry repair rest on, extracted as pure functions
+//! so the PRODUCTION code and the exhaustive model checkers (`tests/model*.rs`)
+//! execute the **same logic**, not hand-synchronized copies of it.
 //!
-//! Every function here is a guard whose correctness the machine-checked
-//! theorems depend on. The call sites:
-//!
-//! | kernel                     | production                          | model              |
+//! | kernel                     | production                          | models             |
 //! |----------------------------|-------------------------------------|--------------------|
-//! | [`pointer_publish_allowed`]| `transport::swap_pointer`           | `Act::Publish`     |
-//! | [`payload_prunable`]       | `transport::ObjectStoreTransport::prune` | `Act::Prune`  |
-//! | [`resume_window_ok`]       | `nats` resume paths (`check_resume_window`) | `Act::Resume` |
-//! | [`restore_allowed`]        | `applied` artifact restore (`check_restore`) | `Act::RestoreRead`, live `GuardRepair` |
+//! | [`pointer_publish_allowed`]| `transport::swap_pointer`           | `model.rs` `Act::Publish`, fleet `Publish` |
+//! | [`payload_prunable`]       | `transport::ObjectStoreTransport::prune` | `model.rs` `Act::Prune` |
+//! | [`resume_window_ok`]       | `nats` resume paths (`check_resume_window`), the live floor guard | every model |
+//! | [`restore_allowed`]        | `repair::check_restore`             | `model.rs` `Act::RestoreRead`, live `GuardRepair`, repair-steps `WPlan`, fleet `Repair` |
+//! | [`restore_ahead`]          | `repair::check_restore`, the main loop's re-check (`repair::fold_in`) | repair-steps restore reply |
+//! | [`listing_is_truth`]       | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention |
+//! | [`plan_repair`]            | `repair::plan`, `Snapshot::stale_keys` | expiry dispatch in every model |
+//! | [`cursorless_start_needs_repair`] | `repair::run_watch`          | repair-steps `WStart`, fleet `Start` |
+//! | [`restore_key`]            | `repair::restore_diff`              | repair-steps restore op |
 //!
 //! Because the model transitions call these very functions, a change to any
-//! guard is re-verified against the full bounded state space on the next
-//! `cargo test --test model` — the guards cannot drift from the proof. The
-//! mutation tests in `tests/model.rs` additionally prove each guard is
-//! load-bearing: substituting a broken variant makes the checker produce a
-//! counterexample.
+//! of them is re-verified against the full bounded state space on the next
+//! model run — the decisions cannot drift from the proof. A model expresses
+//! a mutation by forging a kernel's INPUT (the listing is "the truth" on an
+//! evicting bucket, the fold looks empty, versions are invisible), never by
+//! re-implementing the decision, and the mutation tests prove each one
+//! load-bearing: the checker must produce a counterexample.
 //!
 //! Kernels operate on plain `u64` ranks (a [`WatchCursor`](crate::WatchCursor)'s
 //! revision, with revisionless cursors ranked 0 by the callers) so they stay
@@ -135,7 +138,136 @@ pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
 /// `tests/model.rs` (`RestoreRead`) and `tests/model_live_watch.rs`
 /// (`GuardRepair`).
 pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
-    artifact_revision > local_revision && resume_window_ok(artifact_revision, first_sequence)
+    restore_ahead(artifact_revision, local_revision)
+        && resume_window_ok(artifact_revision, first_sequence)
+}
+
+/// The "ahead" half of [`restore_allowed`], on its own: what the main loop
+/// re-checks against its own applied cursor (a mid-watch expiry delivered
+/// past the resume cursor the watch task checked against).
+pub fn restore_ahead(artifact_revision: u64, local_revision: u64) -> bool {
+    artifact_revision > local_revision
+}
+
+/// Is the bucket's key listing the truth — does "not listed" mean
+/// "deleted"? Yes when retention never evicts current values, and also when
+/// it can but has evicted nothing yet (first retained revision ≤ 1).
+/// Erring toward `false` is safe: it only routes a repair to an artifact.
+pub fn listing_is_truth(evicts_current_values: bool, first_revision: u64) -> bool {
+    !evicts_current_values || resume_window_ok(0, first_revision)
+}
+
+/// The repair a watch armed for an expired cursor, without its payloads
+/// (`ExpiryRepair` in `watch_applied`; `None` also when there is no store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairMode {
+    /// Nothing armed: the re-list alone.
+    None,
+    /// The key-listing diff.
+    Relist,
+    /// The artifact restore.
+    Restore,
+    /// Decide by retention.
+    Auto,
+}
+
+/// What [`plan_repair`] decided for one expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairPlan {
+    /// Fall back to the re-list alone.
+    ReListOnly,
+    /// The key-listing diff, then the re-list.
+    Relist,
+    /// The artifact restore, then a resume from the artifact's cursor.
+    Restore,
+    /// Refused: the key-listing diff where the listing isn't the truth
+    /// would delete keys that merely aged out. The watch fails.
+    RefuseRelist,
+}
+
+/// THE repair planner. `listing_truth` is [`listing_is_truth`] when the
+/// backend reports retention, `None` when it can't say — then `Relist`
+/// (chosen explicitly) is trusted as the caller's word, and `Auto` restores.
+pub fn plan_repair(mode: RepairMode, listing_truth: Option<bool>) -> RepairPlan {
+    match mode {
+        RepairMode::None => RepairPlan::ReListOnly,
+        RepairMode::Relist if listing_truth == Some(false) => RepairPlan::RefuseRelist,
+        RepairMode::Relist => RepairPlan::Relist,
+        RepairMode::Restore => RepairPlan::Restore,
+        RepairMode::Auto if listing_truth == Some(true) => RepairPlan::Relist,
+        RepairMode::Auto => RepairPlan::Restore,
+    }
+}
+
+/// A start with no cursor: must the fold be repaired before watching? Yes
+/// when it holds data anyway (a torn first checkpoint — a re-list never
+/// removes what it doesn't deliver), and, with a restore armed, when the
+/// bucket's listing is no longer the truth (a re-list would be incomplete).
+pub fn cursorless_start_needs_repair(
+    mode: RepairMode,
+    fold_has_data: bool,
+    listing_truth: Option<bool>,
+) -> bool {
+    match mode {
+        RepairMode::None => false,
+        _ if fold_has_data => true,
+        RepairMode::Restore | RepairMode::Auto => listing_truth == Some(false),
+        RepairMode::Relist => false,
+    }
+}
+
+/// One side of a key in a restore: absent, or present at a revision
+/// (`At(None)`: present but revisionless).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// The key isn't there.
+    Absent,
+    /// The key is there, at this revision if it has one.
+    At(Option<u64>),
+}
+
+/// What a restore does with one in-scope key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRestore {
+    /// Leave the local entry as it is.
+    Keep,
+    /// Take the artifact's entry.
+    TakeArtifact,
+    /// Delete the local entry.
+    Delete,
+}
+
+/// THE per-key restore decision. An artifact at cursor `C` is complete
+/// together with the log after `C`: a key whose latest write is after `C`
+/// may be missing or older in it, and the resume delivers that write. So:
+///
+/// - the artifact has the key: take it, unless the local entry is NEWER
+///   (revisions decide; without both, only `identical` entries are kept) —
+///   never a move backward;
+/// - the artifact lacks it, local has it: delete, unless the bucket lists it
+///   live (`listed_live`) — then its current value is a write after `C` —
+///   never a phantom delete;
+/// - neither has it: nothing to do.
+pub fn restore_key(
+    local: KeyState,
+    artifact: KeyState,
+    identical: bool,
+    listed_live: bool,
+) -> KeyRestore {
+    match (local, artifact) {
+        (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
+            if l > a {
+                KeyRestore::Keep
+            } else {
+                KeyRestore::TakeArtifact
+            }
+        }
+        (KeyState::At(_), KeyState::At(_)) if identical => KeyRestore::Keep,
+        (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
+        (KeyState::At(_), KeyState::Absent) if listed_live => KeyRestore::Keep,
+        (KeyState::At(_), KeyState::Absent) => KeyRestore::Delete,
+        (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
+    }
 }
 
 /// Sequence the watch should start at after applying `revision`.
@@ -184,6 +316,74 @@ mod tests {
         assert!(resume_window_ok(u64::MAX, u64::MAX), "saturating boundary");
         assert_eq!(resume_start_sequence(3), Some(4));
         assert_eq!(resume_start_sequence(u64::MAX), None);
+    }
+
+    #[test]
+    fn repair_planner_is_total() {
+        use RepairMode::*;
+        for truth in [Option::None, Some(true), Some(false)] {
+            assert_eq!(plan_repair(None, truth), RepairPlan::ReListOnly);
+            assert_eq!(plan_repair(Restore, truth), RepairPlan::Restore);
+        }
+        assert_eq!(plan_repair(Relist, Some(false)), RepairPlan::RefuseRelist);
+        assert_eq!(plan_repair(Relist, Some(true)), RepairPlan::Relist);
+        assert_eq!(
+            plan_repair(Relist, Option::None),
+            RepairPlan::Relist,
+            "caller vouches"
+        );
+        assert_eq!(plan_repair(Auto, Some(true)), RepairPlan::Relist);
+        assert_eq!(plan_repair(Auto, Some(false)), RepairPlan::Restore);
+        assert_eq!(
+            plan_repair(Auto, Option::None),
+            RepairPlan::Restore,
+            "unknown: restore"
+        );
+        assert!(listing_is_truth(false, 99));
+        assert!(
+            listing_is_truth(true, 1),
+            "evicting, but nothing evicted yet"
+        );
+        assert!(!listing_is_truth(true, 2));
+        assert!(
+            cursorless_start_needs_repair(Relist, true, Some(true)),
+            "data, no cursor"
+        );
+        assert!(
+            !cursorless_start_needs_repair(None, true, Some(false)),
+            "nothing armed"
+        );
+        assert!(cursorless_start_needs_repair(Auto, false, Some(false)));
+        assert!(!cursorless_start_needs_repair(Relist, false, Some(false)));
+    }
+
+    #[test]
+    fn restore_key_never_regresses_never_drops_live() {
+        use KeyRestore::*;
+        use KeyState::*;
+        assert_eq!(
+            restore_key(At(Some(5)), At(Some(3)), false, false),
+            Keep,
+            "local newer"
+        );
+        assert_eq!(
+            restore_key(At(Some(3)), At(Some(5)), false, false),
+            TakeArtifact
+        );
+        assert_eq!(
+            restore_key(At(Some(3)), At(Some(3)), true, false),
+            Keep,
+            "identical"
+        );
+        assert_eq!(restore_key(At(None), At(None), false, false), TakeArtifact);
+        assert_eq!(restore_key(Absent, At(Some(1)), false, false), TakeArtifact);
+        assert_eq!(
+            restore_key(At(Some(1)), Absent, false, true),
+            Keep,
+            "listed live"
+        );
+        assert_eq!(restore_key(At(Some(1)), Absent, false, false), Delete);
+        assert_eq!(restore_key(Absent, Absent, false, true), Keep);
     }
 
     #[test]

@@ -18,7 +18,19 @@ jobs:
       # requested in mise.toml don't survive every cache round-trip).
       # Idempotent and ~2s when the components are already present.
       - run: rustup component add clippy rustfmt
+      # Unformatted code (Rust or YAML) fails the build rather than drifting
+      # until the next `mise run format` reformats someone else's diff.
+      - run: mise run format:check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Broken intra-doc links fail too (docs.rs renders them).
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Each optional feature compiles alone with its tests: shared test
+      # infrastructure must not quietly depend on another feature.
+      - run: cargo check --tests --features fjall
+      - run: cargo check --tests --features rocksdb
+      - run: cargo check --tests --features transport
       # The full feature matrix, or the fjall/rocksdb conformance suites and
       # the transport tier silently skip (default features exclude them all).
       # Integration tests boot real nats-server + minio binaries (installed

@@ -764,25 +764,40 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     // markers were evicted are lost and the resync never
                     // triggers, regardless of the resync mode.
                     s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
-                } else if self.resync == ResyncMode::None {
-                    s.importer = ImporterPc::Resumed(a, Self::relist_only_status(&s, a));
-                } else if self.retention == BucketRetention::EvictsCurrent
-                    && self.mutation != Mutation::RelistOnEvicting
-                {
-                    // CursorExpired on a bucket that evicts current values:
-                    // NATS's listing can't separate deleted from aged out,
-                    // so the fold is restored from an artifact
-                    // (`ExpiryRepair::Auto` → Restore).
-                    s.importer = ImporterPc::Restoring(a);
                 } else {
-                    // CursorExpired -> full re-list + a SUCCESSFUL key-
-                    // listing resync: live keys diffed against the fold,
-                    // vanished keys get synthetic deletes. (Under FailStop a
-                    // failed resync fails the watch and changes nothing —
-                    // this action stays enabled for the retry. Under Degrade
-                    // the failed-resync outcome is ResumeResyncDegraded.)
-                    // Sound exactly when the listing is the truth.
-                    s.importer = ImporterPc::Resumed(a, Self::relist_status(&s));
+                    // CursorExpired: the shared planner decides, under the
+                    // shipped `ExpiryRepair::Auto` (or `None`, no repair).
+                    // `RelistOnEvicting` forges the listing as the truth.
+                    use slipstream::protocol::{
+                        RepairMode, RepairPlan, listing_is_truth, plan_repair,
+                    };
+                    let mode = match self.resync {
+                        ResyncMode::None => RepairMode::None,
+                        ResyncMode::FailStop | ResyncMode::Degrade => RepairMode::Auto,
+                    };
+                    let truth = self.mutation == Mutation::RelistOnEvicting
+                        || listing_is_truth(
+                            self.retention == BucketRetention::EvictsCurrent,
+                            s.floor as u64 + 1,
+                        );
+                    s.importer = match plan_repair(mode, Some(truth)) {
+                        RepairPlan::ReListOnly => {
+                            ImporterPc::Resumed(a, Self::relist_only_status(&s, a))
+                        }
+                        // On a bucket that evicts current values, NATS's
+                        // listing can't separate deleted from aged out, so
+                        // the fold is restored from an artifact.
+                        RepairPlan::Restore => ImporterPc::Restoring(a),
+                        // Full re-list + a SUCCESSFUL key-listing resync:
+                        // live keys diffed against the fold, vanished keys
+                        // get synthetic deletes. (Under FailStop a failed
+                        // resync fails the watch and changes nothing — this
+                        // action stays enabled for the retry. Under Degrade
+                        // the failed-resync outcome is ResumeResyncDegraded.)
+                        // Sound exactly when the listing is the truth.
+                        RepairPlan::Relist => ImporterPc::Resumed(a, Self::relist_status(&s)),
+                        RepairPlan::RefuseRelist => unreachable!("Auto never refuses"),
+                    };
                 }
             }
             Act::RestoreRead => {

@@ -113,7 +113,7 @@ async fn build_connect_options(
 
 /// Connect to NATS with various authentication methods.
 ///
-/// Supports the auth-priority order documented on [`build_connect_options`].
+/// Supports the auth-priority order documented on `build_connect_options`.
 /// This is the standalone helper; the [`Connection`] impl builds options the
 /// same way but also installs a health-tracking event callback.
 pub async fn nats_connect(
@@ -1298,7 +1298,13 @@ impl NatsKvWatcher {
     /// creation is the same exposure any live consumer has against
     /// aggressive retention; the check bounds the silent gap to that
     /// milliseconds-scale window, where the prior behavior left it unbounded.
-    async fn check_resume_window(&self, revision: u64) -> Result<(), KvError> {
+    ///
+    /// Returns the KV stream handle it read, for a caller that creates its
+    /// consumer on it.
+    async fn check_resume_window(
+        &self,
+        revision: u64,
+    ) -> Result<async_nats::jetstream::stream::Stream, KvError> {
         let stream = timed(self.js.get_stream(format!("KV_{}", self.bucket)))
             .await?
             .map_err(|e| {
@@ -1315,7 +1321,42 @@ impl NatsKvWatcher {
             );
             return Err(KvError::CursorExpired);
         }
-        Ok(())
+        Ok(stream)
+    }
+
+    /// Create a resume consumer (or watch) for `revision`, the ONE way every
+    /// `*_from` path does it: the window checked before creation
+    /// ([`check_resume_window`](Self::check_resume_window); `create` gets the
+    /// stream handle it read), a creation error that names the sequence
+    /// problem classified as [`KvError::CursorExpired`] (servers that do
+    /// error on a compacted start), and the window re-checked AFTER the
+    /// consumer exists — head eviction between the check and the creation
+    /// would otherwise clamp silently. `scope` is for the log line.
+    async fn create_resume<T, E, F, Fut>(
+        &self,
+        revision: u64,
+        scope: &(dyn std::fmt::Debug + Sync),
+        create: F,
+    ) -> Result<T, KvError>
+    where
+        E: std::fmt::Display,
+        F: FnOnce(async_nats::jetstream::stream::Stream) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let stream = self.check_resume_window(revision).await?;
+        let created = match timed(create(stream)).await? {
+            Ok(c) => c,
+            Err(e) => {
+                let err = e.to_string();
+                if is_cursor_expired_error(&err) {
+                    warn!(revision, ?scope, error = %err, "cursor expired at consumer creation");
+                    return Err(KvError::CursorExpired);
+                }
+                return Err(KvError::WatchError(err));
+            }
+        };
+        self.check_resume_window(revision).await?;
+        Ok(created)
     }
 }
 
@@ -1398,24 +1439,10 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_all(tx).await,
         };
-        self.check_resume_window(revision).await?;
-
         let start = resume_start(revision)?;
-        let watcher = match timed(self.kv.watch_all_from_revision(start)).await? {
-            Ok(w) => w,
-            Err(e) => {
-                let err_str = e.to_string();
-                if is_cursor_expired_error(&err_str) {
-                    warn!(revision, error = %err_str, "cursor expired, caller should fall back to full watch");
-                    return Err(KvError::CursorExpired);
-                }
-                return Err(KvError::WatchError(err_str));
-            }
-        };
-        // Re-check AFTER the consumer exists: head eviction in the window
-        // between the pre-flight check and consumer creation would otherwise
-        // clamp silently.
-        self.check_resume_window(revision).await?;
+        let watcher = self
+            .create_resume(revision, &"all", |_| self.kv.watch_all_from_revision(start))
+            .await?;
 
         info!(revision, "resumed watch from cursor");
         // The LIVE floor guard takes over from here: in-band gapped-delivery
@@ -1436,24 +1463,13 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_prefix(prefix, tx).await,
         };
-        self.check_resume_window(revision).await?;
-
         let nats_key = format!("{prefix}>");
         let start = resume_start(revision)?;
-        let watcher = match timed(self.kv.watch_from_revision(&nats_key, start)).await? {
-            Ok(w) => w,
-            Err(e) => {
-                let err_str = e.to_string();
-                if is_cursor_expired_error(&err_str) {
-                    warn!(revision, prefix, error = %err_str, "cursor expired for prefix watch, caller should fall back");
-                    return Err(KvError::CursorExpired);
-                }
-                return Err(KvError::WatchError(err_str));
-            }
-        };
-        // Same post-create re-check as watch_all_from: close the
-        // check→create eviction window.
-        self.check_resume_window(revision).await?;
+        let watcher = self
+            .create_resume(revision, &prefix, |_| {
+                self.kv.watch_from_revision(&nats_key, start)
+            })
+            .await?;
 
         info!(revision, prefix, "resumed prefix watch from cursor");
         stream_watch(watcher, &tx).await
@@ -1491,55 +1507,20 @@ impl KvWatcher for NatsKvWatcher {
             .map(|p| format!("{kv_prefix}{p}>"))
             .collect();
 
-        let stream = timed(self.js.get_stream(format!("KV_{bucket}")))
-            .await?
-            .map_err(|e| KvError::WatchError(format!("get KV stream: {e}")))?;
-
-        // Same proactive expiry detection as `check_resume_window` (NATS
-        // silently clamps a below-head ByStartSequence; see that method's
-        // docs) — checked on the stream handle this path already fetched,
-        // via the shared protocol kernel.
-        let first = stream.cached_info().state.first_sequence;
-        if !crate::protocol::resume_window_ok(revision, first) {
-            warn!(
-                revision,
-                first_sequence = first,
-                ?prefixes,
-                "resume cursor is below the stream's first retained sequence; cursor expired"
-            );
-            return Err(KvError::CursorExpired);
-        }
-
-        let consumer = match timed(stream.create_consumer(push::OrderedConfig {
+        let start_sequence = resume_start(revision)?;
+        let config = push::OrderedConfig {
             deliver_subject: self.client.new_inbox(),
             description: Some("kv multi-prefix resume consumer".to_string()),
             filter_subjects,
             replay_policy: ReplayPolicy::Instant,
-            deliver_policy: DeliverPolicy::ByStartSequence {
-                start_sequence: resume_start(revision)?,
-            },
+            deliver_policy: DeliverPolicy::ByStartSequence { start_sequence },
             ..Default::default()
-        }))
-        .await?
-        {
-            Ok(c) => c,
-            Err(e) => {
-                // Same expiry classification as watch_all_from: a start sequence
-                // the stream has compacted past surfaces as a consumer-create
-                // error whose message names the sequence problem.
-                let err_str = e.to_string();
-                if is_cursor_expired_error(&err_str) {
-                    warn!(revision, ?prefixes, error = %err_str, "cursor expired for multi-prefix watch, caller should fall back");
-                    return Err(KvError::CursorExpired);
-                }
-                return Err(KvError::WatchError(err_str));
-            }
         };
-
-        // Re-check AFTER the consumer exists (fresh stream info, not the
-        // handle's cached copy): closes the check→create eviction window,
-        // same as the single-filter resume paths.
-        self.check_resume_window(revision).await?;
+        let consumer = self
+            .create_resume(revision, &prefixes, |stream| async move {
+                stream.create_consumer(config).await
+            })
+            .await?;
 
         let mut messages = timed(consumer.messages())
             .await?
@@ -1992,67 +1973,23 @@ mod tests {
     }
 }
 
+/// The integration tests' `nats-server` harness, shared rather than copied.
+#[cfg(test)]
+#[path = "../tests/common/nats.rs"]
+mod test_nats;
+
 /// Live-server conformance tests for the floor guard
 /// ([`stream_watch_floor_guarded`]) — these drive the guarded loop DIRECTLY
 /// with a deliberately clamped `Watch`, which reproduces exactly the state
 /// retention leaves behind when it overruns a live consumer (the watcher
 /// methods' resume-time checks can't be raced deterministically from
 /// outside, but the guarded loop neither knows nor cares how its watch got
-/// clamped). Spawns a throwaway `nats-server` (mise-installed, same pattern
-/// as tests/common).
+/// clamped). Spawns a throwaway `nats-server` (the shared `tests/common`
+/// harness).
 #[cfg(test)]
 mod floor_guard_tests {
+    use super::test_nats::TestNats;
     use super::*;
-    use std::process::{Child, Command, Stdio};
-
-    struct TestServer {
-        child: Child,
-        url: String,
-        _dir: tempfile::TempDir,
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    async fn start_server() -> TestServer {
-        let bin = std::env::var("NATS_SERVER_BIN").unwrap_or_else(|_| "nats-server".into());
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let dir = tempfile::tempdir().unwrap();
-        let child = Command::new(&bin)
-            .args([
-                "--jetstream",
-                "--addr",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--store_dir",
-                dir.path().to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {bin}: {e}; run `mise install`"));
-        let server = TestServer {
-            child,
-            url: format!("nats://127.0.0.1:{port}"),
-            _dir: dir,
-        };
-        for _ in 0..100 {
-            if async_nats::connect(&server.url).await.is_ok() {
-                return server;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("nats-server never became ready");
-    }
 
     /// `(js, kv store)` with five revisions across five subjects (history 1).
     async fn seeded_bucket(
@@ -2085,7 +2022,7 @@ mod floor_guard_tests {
     async fn purge_reclaims_bytes() {
         use crate::kv::KvPurge;
 
-        let server = start_server().await;
+        let server = TestNats::start().await;
         let client = async_nats::connect(&server.url).await.unwrap();
         let js = async_nats::jetstream::new(client);
         let kv = js
@@ -2154,7 +2091,7 @@ mod floor_guard_tests {
     /// `GuardRepair`-only-progress gate.
     #[tokio::test(flavor = "multi_thread")]
     async fn gapped_delivery_with_advanced_floor_trips() {
-        let server = start_server().await;
+        let server = TestNats::start().await;
         let (js, kv) = seeded_bucket(&server.url).await;
 
         // Evict revisions 1-3 outright: first_sequence becomes 4.
@@ -2196,7 +2133,7 @@ mod floor_guard_tests {
     /// resume; this pins the discrimination explicitly.)
     #[tokio::test(flavor = "multi_thread")]
     async fn benign_interior_gap_passes() {
-        let server = start_server().await;
+        let server = TestNats::start().await;
         let (js, kv) = seeded_bucket(&server.url).await;
 
         // Overwrite k2 and k3: revisions 2 and 3 are interior-evicted
@@ -2232,7 +2169,7 @@ mod floor_guard_tests {
     /// bucket does not. `first_revision` tracks the stream's head.
     #[tokio::test(flavor = "multi_thread")]
     async fn retention_reports_current_value_eviction() {
-        let server = start_server().await;
+        let server = TestNats::start().await;
         let conn = crate::NatsConnection::new(crate::NatsConnectionConfig {
             url: server.url.clone(),
             creds: None,

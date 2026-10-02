@@ -60,15 +60,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
-use tracing::{error, info, warn};
+use tracing::warn;
 
 use crate::artifact::ExportManifest;
-use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, WatchCursor};
-use crate::protocol::resume_window_ok;
-use crate::repair::{
-    ExpiryRepair, RestoreSource, RestoredFold, check_restore, cursor_rank, materialize,
-    restore_diff,
-};
+use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
+use crate::repair::{self, ExpiryRepair};
 use crate::snapshot::{SnapshotError, SnapshotStore};
 
 /// A request, sent into a running [`watch_applied`] loop, to export the fold it
@@ -112,58 +108,13 @@ pub enum WatchScope {
 impl WatchScope {
     /// The scope as a list of key prefixes (`All` = the empty prefix), for
     /// callers that enumerate scope contents (live listings, fold ranges).
-    fn prefixes(&self) -> Vec<String> {
+    pub(crate) fn prefixes(&self) -> Vec<String> {
         match self {
             WatchScope::All => vec![String::new()],
             WatchScope::Prefix(p) => vec![p.clone()],
             WatchScope::Prefixes(ps) => ps.clone(),
         }
     }
-}
-
-/// Internal: a cursor-expired repair handoff from the watch task to the main
-/// loop, which owns the fold. The watch task stays parked on the ack/reply
-/// until the main loop has folded the repair, so the repair is strictly
-/// ordered between everything delivered before the expiry and everything the
-/// next watch delivers.
-enum RepairRequest<S> {
-    /// The key-listing diff: the bucket's live keys for the watch scope. The
-    /// main loop applies synthetic deletes for in-scope keys missing from it,
-    /// then acks so the watch task can start the fallback re-list.
-    Relist {
-        live_keys: Vec<String>,
-        ack: oneshot::Sender<()>,
-    },
-    /// The artifact restore: a verified artifact fold, and the bucket's live
-    /// keys for the scope (listed after the fetch). The main loop folds the
-    /// in-scope difference, advances to the artifact's cursor, and replies
-    /// with it so the watch task resumes from there.
-    Restore {
-        restored: RestoredFold<S>,
-        live: std::collections::HashSet<String>,
-        reply: oneshot::Sender<Result<WatchCursor, KvError>>,
-    },
-}
-
-/// Internal: what the watch task needs to repair an expiry — the caller's
-/// chosen repair, and the channel into the main loop that owns the fold.
-struct RepairHandle<S> {
-    mode: ExpiryRepair<S>,
-    tx: mpsc::Sender<RepairRequest<S>>,
-}
-
-/// Internal: the repair the watch task settled on for one expiry.
-enum Plan<'a, S> {
-    /// Fall back to the re-list alone (nothing armed).
-    ReListOnly,
-    /// The key-listing diff, then the re-list.
-    Relist(&'a Arc<dyn KvReader>, &'a mpsc::Sender<RepairRequest<S>>),
-    /// The artifact restore, then a resume from the artifact's cursor.
-    Restore(
-        &'a Arc<dyn KvReader>,
-        &'a Arc<dyn RestoreSource<S>>,
-        &'a mpsc::Sender<RepairRequest<S>>,
-    ),
 }
 
 /// Batching policy for [`watch_applied`].
@@ -269,12 +220,6 @@ impl Default for BatchConfig {
 // type and is monomorphized at the call site. Folding them into a builder struct
 // would either box the closures or force a single generic bundle, losing that.
 #[allow(clippy::too_many_arguments)]
-// The flush macro resets `batch_high`/`batch_deadline` for the next loop
-// iteration. At the two flush sites that return immediately afterward (shutdown,
-// channel-close) those resets are dead stores — correct, but flagged. The allow
-// must sit on the function: a statement-scoped `#[allow]` inside the macro body
-// trips the experimental attributes-on-expressions gate (E0658) on stable.
-#[allow(unused_assignments)]
 pub async fn watch_applied<U, S, P, A, O, R>(
     watcher: Arc<dyn KvWatcher>,
     scope: WatchScope,
@@ -284,7 +229,7 @@ pub async fn watch_applied<U, S, P, A, O, R>(
     // bucket that has already evicted current values) — the hot path never
     // touches it.
     repair: R,
-    mut store: Option<S>,
+    store: Option<S>,
     // `Some(rx)` arms an export-request arm in the select loop: each
     // [`ExportRequest`] is handled between flushes (pending batch flushed
     // first), so the exported artifact's cursor is the applied cursor (or,
@@ -295,9 +240,9 @@ pub async fn watch_applied<U, S, P, A, O, R>(
     // unchanged.
     mut exports: Option<mpsc::Receiver<ExportRequest>>,
     config: BatchConfig,
-    mut parse: P,
-    mut apply: A,
-    mut on_applied: O,
+    parse: P,
+    apply: A,
+    on_applied: O,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<WatchCursor, KvError>
 where
@@ -311,281 +256,54 @@ where
     O: FnMut(WatchCursor) + Send,
     R: Into<ExpiryRepair<S>>,
 {
-    // The cursor we'll return. Initialized from the resume position so that a
-    // watch which receives nothing new still reports the position it resumed
-    // from as "applied" (it is — everything up to it was applied before the last
-    // run persisted it).
-    let mut applied = match &resume {
-        Some(c) => c.clone(),
-        None => WatchCursor::none(),
-    };
-
     // The scope's prefixes, for the repair diffs against the fold and the
     // scope recorded in exported artifacts. Cloned out before `scope` moves
     // into the watch task.
-    let scope_prefixes = scope.prefixes();
+    let prefixes = scope.prefixes();
 
-    // Repair channel, armed only when there is a repair to run AND a store to
-    // run it against (both repairs edit the fold). The watch task sends the
-    // repair here and waits for the ack/reply before starting its next watch.
-    let mode: ExpiryRepair<S> = repair.into();
-    // A restore replaces the fold, so asking for one without a fold is a
-    // contradiction: on a bounded log such a consumer would silently hold
-    // NATS's retained view (missing everything evicted) while believing it
-    // repairs. Refuse it up front; `ExpiryRepair::None` is the explicit way
-    // to accept the retained view.
-    if store.is_none()
-        && matches!(
-            mode,
-            ExpiryRepair::Restore { .. } | ExpiryRepair::Auto { .. }
-        )
-    {
-        return Err(KvError::WatchError(
-            "ExpiryRepair::Restore / ::Auto repair the fold, so they need a store: a consumer \
-             without one cannot repair a bounded log. Pass a SnapshotStore, or \
-             ExpiryRepair::None to accept NATS's retained view"
-                .into(),
-        ));
-    }
-    let (repair_handle, mut repairs): (
-        Option<RepairHandle<S>>,
-        Option<mpsc::Receiver<RepairRequest<S>>>,
-    ) = match mode {
-        ExpiryRepair::None => (None, None),
-        mode if store.is_some() => {
-            let (tx, rx) = mpsc::channel(1);
-            (Some(RepairHandle { mode, tx }), Some(rx))
-        }
-        _ => (None, None),
-    };
+    // The repair channel: armed only when there is a repair to run AND a
+    // store to run it against (both repairs edit the fold). The watch task
+    // sends the repair here and waits for the ack/reply before starting its
+    // next watch.
+    let (repair, mut repairs) = repair::arm(repair.into(), store.is_some())?;
 
     // A fold with data but no cursor can't be re-listed blind (see
-    // `run_watch`). Only the first entry is read.
+    // `repair::run_watch`).
     let unanchored = match &store {
-        Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => fold_has_entries(st)
+        Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => st
+            .has_entries()
             .map_err(|e| KvError::WatchError(format!("reading the fold at start failed: {e}")))?,
         _ => false,
     };
 
+    // The cursor we'll return. Initialized from the resume position so that a
+    // watch which receives nothing new still reports the position it resumed
+    // from as "applied" (it is — everything up to it was applied before the last
+    // run persisted it).
+    let applied = resume.clone().unwrap_or_else(WatchCursor::none);
+    let mut fold = Fold::new(store, parse, apply, on_applied, config.max, applied);
+
     // Spawn the watch task. It owns the cursor-expiry handling so the main loop
     // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
     let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
-    let handle = {
-        let watcher = Arc::clone(&watcher);
-        tokio::spawn(async move {
-            run_watch(
-                watcher.as_ref(),
-                &scope,
-                resume,
-                unanchored,
-                repair_handle,
-                tx,
-            )
-            .await
-        })
+    let handle = tokio::spawn(repair::run_watch(
+        watcher, scope, resume, unanchored, repair, tx,
+    ));
+    // A fatal error ends the watch, and the watch task with it.
+    let stop = |e: KvError| {
+        handle.abort();
+        e
     };
-
-    // Batch state.
-    //
-    // `batch_high` tracks the version of the most recently *received* update
-    // since the last flush — including updates `parse` rejected. NATS delivers
-    // in revision order, so the last received is the highest, and advancing the
-    // cursor to it after a single atomic `apply` is correct: having seen the max
-    // means we've seen everything below it, and a rejected entry is still
-    // "nothing to apply", hence covered. Reset to `none()` after every flush.
-    // Pre-size to the flush bound so no batch ever re-climbs the reallocation
-    // ladder; `max(1)` only guards a nonsensical `max = 0` config.
-    let batch_cap = config.max.max(1);
-    let mut batch: Vec<U> = Vec::with_capacity(batch_cap);
-    // Raw received updates for the durable `store`, in revision order. Only
-    // populated when a `store` is present; the store folds the *raw* updates
-    // (including ones `parse` rejected — they are still part of the bucket's
-    // state), whereas the parsed `batch` above is the consumer's domain view.
-    let mut raw_batch: Vec<KvUpdate> = Vec::new();
-    let mut batch_high = WatchCursor::none();
-    // Consecutive store-apply failures. A transient failure re-queues its raw
-    // batch (cursor authority: the store's cursor and contents advance
-    // together, always); a persistent streak fail-stops before the re-queued
-    // backlog grows without bound.
-    const MAX_STORE_APPLY_FAILURES: u32 = 16;
-    let mut store_fail_streak: u32 = 0;
-    // `Some` once a batch has opened and the window timer is armed; `None`
-    // between flushes. Only the armed/idle distinction is read in the loop —
-    // the absolute instant lives in the pinned `sleep` future below.
-    let mut batch_deadline: Option<tokio::time::Instant> = None;
 
     // A single timer future, reset in place each time a batch opens. The old
     // `tokio::time::sleep(timeout)` lived inside the select arm, so it was
     // re-created on every loop iteration — one Arc-backed timer-wheel entry
     // allocated, registered, and immediately dropped per received update.
     // Pinning one future and `reset`-ing it reuses that single allocation; the
-    // `if batch_deadline.is_some()` guard keeps it from firing while idle, so
-    // its initial already-elapsed deadline is never observed.
+    // `if fold.is_open()` guard keeps it from firing while idle, so its
+    // initial already-elapsed deadline is never observed.
     let sleep = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(sleep);
-
-    // Flush the current batch, in order: run the domain `apply` (if non-empty) to
-    // completion, advance the cursor, fold the raw batch + cursor durably into
-    // `store`, then fire `on_applied`. The store fold runs on a blocking task
-    // (its `apply` may block on I/O), moving the store in and taking it back — the
-    // same offload the append log's compaction always used. A TRANSIENT store
-    // error re-queues the raw batch for cumulative commit on the next flush
-    // (the watch continues; the store's cursor never advances past data it
-    // dropped) and a persistent failure streak is fatal; a panicked
-    // blocking task drops the store irrecoverably, which breaks the
-    // resume-after-restart guarantee, so it is surfaced as fatal.
-    macro_rules! flush {
-        () => {{
-            // Nothing received since the last flush → nothing to do at all.
-            // (`raw_batch` can be non-empty with no cursor advance only via a
-            // repair's synthetic updates, which carry no stream position.)
-            if !batch.is_empty() || !raw_batch.is_empty() || !batch_high.is_none() {
-                if !batch.is_empty() {
-                    // INVARIANT: apply() runs and RETURNS before any cursor
-                    // advance below. Move the batch out so a panicking apply
-                    // can't leave half-consumed state behind.
-                    //
-                    // `replace` (not `take`) leaves a pre-sized Vec behind so each
-                    // batch after the first doesn't re-climb the reallocation
-                    // ladder (4→8→…→cap).
-                    apply(std::mem::replace(&mut batch, Vec::with_capacity(batch_cap)));
-                }
-                let advanced = !batch_high.is_none();
-                if advanced {
-                    applied = batch_high.clone();
-                }
-                // A cursor-only advance (nothing raw to fold) still commits
-                // to the store: a restore's final step moves the cursor to the
-                // artifact's with no updates left. In the steady state every
-                // advance carries raw updates, so this changes nothing there.
-                if (!raw_batch.is_empty() || advanced)
-                    && let Some(mut st) = store.take()
-                {
-                    let raw = std::mem::take(&mut raw_batch);
-                    // Fold at the post-advance cursor. A repair-only batch
-                    // (synthetic updates) leaves the cursor where it was (they
-                    // are a state correction, not log entries), which is safe:
-                    // an unchanged — possibly expired — cursor only ever re-runs
-                    // the same repair on the next restart.
-                    let cur = applied.clone();
-                    // Hand the store AND the raw batch back on a clean return:
-                    // a *failed* apply (Ok(Err)) RE-QUEUES the batch so the
-                    // next flush commits it cumulatively — the store's cursor
-                    // and contents always advance together. Dropping the
-                    // failed batch instead lets the NEXT successful flush
-                    // advance the cursor over a hole that survives every
-                    // restart (reproduced by
-                    // `transient_store_failure_never_leaves_a_cursor_gap`).
-                    // Only a *panicked* task (Err) loses the store: fatal.
-                    match tokio::task::spawn_blocking(move || {
-                        let res = st.apply(&raw, &cur);
-                        (st, raw, res)
-                    })
-                    .await
-                    {
-                        Ok((st, _raw, Ok(()))) => {
-                            store = Some(st);
-                            store_fail_streak = 0;
-                        }
-                        Ok((st, raw, Err(e))) => {
-                            store_fail_streak += 1;
-                            if store_fail_streak >= MAX_STORE_APPLY_FAILURES {
-                                // A persistently failing store would otherwise
-                                // grow the re-queued batch without bound while
-                                // the fold silently stales. Fail-stop: the
-                                // restart refolds the tail from the store's
-                                // last good cursor.
-                                warn!(error = %e, streak = store_fail_streak,
-                                    "snapshot store apply failing persistently; aborting watch");
-                                handle.abort();
-                                return Err(KvError::WatchError(format!(
-                                    "snapshot store apply failed {store_fail_streak} consecutive times: {e}"
-                                )));
-                            }
-                            warn!(error = %e, streak = store_fail_streak,
-                                "snapshot store apply failed; batch re-queued for the next flush");
-                            store = Some(st);
-                            // Prepend: the failed range precedes anything
-                            // received since (stream order is preserved for
-                            // the eventual cumulative commit).
-                            let newer = std::mem::replace(&mut raw_batch, raw);
-                            raw_batch.extend(newer);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "snapshot store task panicked; aborting watch");
-                            handle.abort();
-                            return Err(KvError::WatchError(format!(
-                                "snapshot store task panicked: {e}"
-                            )));
-                        }
-                    }
-                }
-                if advanced {
-                    on_applied(applied.clone());
-                    batch_high = WatchCursor::none();
-                }
-            }
-            batch_deadline = None;
-        }};
-    }
-
-    // Take one update off the watch channel into the pending batch.
-    macro_rules! ingest {
-        ($u:expr) => {{
-            let u: KvUpdate = $u;
-            // Cursor authority: every received update bumps the pending
-            // high-water, regardless of whether `parse` keeps it — but only
-            // when it carries a real position. An unknown version (e.g. an
-            // unparseable ACK subject on the hand-built multi-prefix consumer
-            // path) must neither mint a fake cursor nor clobber the real high
-            // from earlier in the batch; skipping it under-advances at worst,
-            // and re-delivery on resume is idempotent.
-            if !u.version().is_unknown() {
-                batch_high = WatchCursor::from_version(u.version().clone());
-            }
-
-            // Buffer the raw update for the durable store fold (which commits
-            // the whole batch + cursor atomically on flush). Done before
-            // `parse` consumes `u` by reference, and only when a store is
-            // present so the no-persistence path keeps its zero-copy cost.
-            if store.is_some() {
-                raw_batch.push(u.clone());
-            }
-
-            if let Some(parsed) = parse(&u) {
-                batch.push(parsed);
-            }
-
-            // Arm the window on the first received update of a batch — even a
-            // parse-rejected one, so the cursor advances within `window` even
-            // through a run of irrelevant keys. Reset the pinned timer to the
-            // new deadline rather than allocating a fresh `Sleep`.
-            if batch_deadline.is_none() {
-                let deadline = tokio::time::Instant::now() + config.window;
-                sleep.as_mut().reset(deadline);
-                batch_deadline = Some(deadline);
-            }
-
-            // Flush on a full parsed batch, or — when persisting — a full raw
-            // batch, so a window packed with parse-rejected updates can't grow
-            // `raw_batch` without bound before the window elapses.
-            if batch.len() >= config.max || raw_batch.len() >= config.max {
-                flush!();
-            }
-        }};
-    }
-
-    // Fail the watch from inside a repair: the fold is either unchanged or
-    // part-way through a repair that commits under its old (expired) cursor,
-    // so the caller's restart re-runs the whole expiry path.
-    macro_rules! repair_fatal {
-        ($($msg:tt)*) => {{
-            let msg = format!($($msg)*);
-            error!(%msg, "cursor-expiry repair failed; aborting watch");
-            handle.abort();
-            return Err(KvError::WatchError(msg));
-        }};
-    }
 
     loop {
         tokio::select! {
@@ -597,7 +315,7 @@ where
             // re-delivered on the next resume — and return the applied cursor.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    flush!();
+                    fold.flush().await.map_err(stop)?;
                     handle.abort();
                     // Observe the task's terminal state. An abort surfaces as a
                     // cancelled JoinError, which we ignore; a genuine panic that
@@ -607,231 +325,27 @@ where
                     {
                         warn!(error = %join, "watch task panicked at shutdown");
                     }
-                    return Ok(applied);
+                    return Ok(fold.applied().clone());
                 }
             }
 
             // Batch window elapsed.
-            () = &mut sleep, if batch_deadline.is_some() => {
-                flush!();
+            () = &mut sleep, if fold.is_open() => {
+                fold.flush().await.map_err(stop)?;
             }
 
             // Cursor-expiry repair. Placed before `rx.recv()` (biased), but
-            // ordering against the update stream comes from the drain below
-            // and the ack/reply protocol: the watch task is parked until this
-            // arm finishes, so nothing from its next watch can interleave.
+            // ordering against the update stream comes from the backlog drain
+            // in `repair::fold_in` and the ack/reply protocol: the watch task
+            // is parked until this arm finishes, so nothing from its next
+            // watch can interleave.
             req = async { repairs.as_mut().expect("arm guarded by is_some").recv().await },
                 if repairs.is_some() => {
                 match req {
                     Some(req) => {
-                        // Fold everything the watch task delivered before it
-                        // asked for this repair. A floor-guard trip ends a
-                        // live watch mid-stream with updates still buffered in
-                        // the channel: the repair must see them (it diffs the
-                        // fold) and supersede them (one applied after the
-                        // repair would resurrect pre-repair state, and could
-                        // even move the cursor backward). The watch task is
-                        // parked on the ack/reply, so this drains exactly that
-                        // backlog.
-                        while let Ok(u) = rx.try_recv() {
-                            ingest!(u);
-                        }
-                        flush!();
-                        // Both repairs diff the STORE, so it must hold
-                        // everything delivered. A transient store failure
-                        // re-queues the batch in `raw_batch`, which the diff
-                        // can't see: it would miss a re-queued put that a
-                        // deletion during the gap has since removed, and the
-                        // put would then commit and resurrect the key. Retry
-                        // until the store has it all; a persistent failure
-                        // hits the flush's own fail-stop bound.
-                        while !raw_batch.is_empty() {
-                            flush!();
-                        }
-                        match req {
-                            RepairRequest::Relist { live_keys, ack } => {
-                                // Diff the fold's in-scope keys against the
-                                // bucket's live listing; anything the fold
-                                // holds that the bucket no longer does vanished
-                                // during the gap (its delete marker evicted with
-                                // the cursor), so synthesize the delete the
-                                // re-list can't deliver.
-                                let live: std::collections::HashSet<&str> =
-                                    live_keys.iter().map(String::as_str).collect();
-                                let mut stale: Vec<String> = Vec::new();
-                                if let Some(st) = &store {
-                                    for prefix in &scope_prefixes {
-                                        // Stream the fold's keys rather than
-                                        // `range()`, which buffers every in-scope
-                                        // entry — values included — into one Vec.
-                                        // On an on-disk backend holding a fold
-                                        // larger than RAM (the case those backends
-                                        // exist for), an All-scope resync would
-                                        // materialize the entire fold on the
-                                        // repair path. Only the keys matter.
-                                        if let Err(e) = st.for_each_in_range(prefix, |entry| {
-                                            if !live.contains(entry.key.as_str()) {
-                                                stale.push(entry.key);
-                                            }
-                                            Ok(())
-                                        }) {
-                                            // FATAL, not a degrade: an incomplete
-                                            // diff silently leaves deleted keys in
-                                            // the fold forever (tests/model.rs
-                                            // proves the divergence reachable
-                                            // under degrade semantics). Fail the
-                                            // watch; the restart re-runs the
-                                            // resume → expiry → resync from
-                                            // scratch.
-                                            warn!(error = %e, prefix = %prefix,
-                                                "resync fold scan failed; aborting watch rather than diverging");
-                                            handle.abort();
-                                            return Err(KvError::WatchError(format!(
-                                                "cursor-expired resync failed listing fold prefix {prefix:?}: {e}"
-                                            )));
-                                        }
-                                    }
-                                }
-                                // Overlapping prefixes can list a key twice.
-                                stale.sort_unstable();
-                                stale.dedup();
-                                if !stale.is_empty() {
-                                    warn!(stale = stale.len(), "cursor-expired resync: deleting keys that vanished during the gap");
-                                }
-                                for key in stale {
-                                    // Synthetic: carries no revision (unknown
-                                    // version) and so never advances the cursor.
-                                    let u = KvUpdate::Delete {
-                                        key,
-                                        version: crate::kv::VersionToken::unknown(),
-                                    };
-                                    if store.is_some() {
-                                        raw_batch.push(u.clone());
-                                    }
-                                    if let Some(parsed) = parse(&u) {
-                                        batch.push(parsed);
-                                    }
-                                }
-                                flush!();
-                                // Ack AFTER the deletes are applied: the watch
-                                // task is holding the fallback watch until it
-                                // hears back, which is what orders deletes
-                                // before the re-list
-                                // (tests/model_resync_order.rs proves the
-                                // barrier load-bearing). If the flush's STORE
-                                // apply failed transiently, the deletes sit
-                                // re-queued at the FRONT of the raw batch —
-                                // still strictly before any re-list put in the
-                                // eventual cumulative commit, and the domain
-                                // apply saw them before this ack either way.
-                                let _ = ack.send(());
-                            }
-                            RepairRequest::Restore {
-                                restored,
-                                live,
-                                reply,
-                            } => {
-                                let target = restored.manifest().cursor.clone();
-                                // The authoritative ahead check (the watch
-                                // task's ran against its resume cursor; a
-                                // mid-watch expiry delivered past that). A
-                                // restore never moves the fold backward.
-                                if cursor_rank(&target) <= cursor_rank(&applied) {
-                                    let msg = format!(
-                                        "cursor-expired restore: the latest artifact (cursor \
-                                         {target:?}) is not ahead of the fold (cursor {applied:?}); \
-                                         nothing newer to restore from"
-                                    );
-                                    error!(%msg, "cursor-expiry repair refused");
-                                    // The watch task fails with this; its
-                                    // channel closing ends the loop.
-                                    let _ = reply.send(Err(KvError::WatchError(msg)));
-                                } else {
-                                    let Some(st) = store.take() else {
-                                        unreachable!("repairs are armed only with a store")
-                                    };
-                                    let prefixes = scope_prefixes.clone();
-                                    let (st, mut restored, diff) =
-                                        match tokio::task::spawn_blocking(move || {
-                                            let diff =
-                                                restore_diff(&st, restored.fold(), &prefixes, &live);
-                                            (st, restored, diff)
-                                        })
-                                        .await
-                                        {
-                                            Ok(v) => v,
-                                            Err(e) => repair_fatal!(
-                                                "cursor-expired restore: diff task panicked: {e}"
-                                            ),
-                                        };
-                                    store = Some(st);
-                                    let diff = match diff {
-                                        Ok(d) => d,
-                                        Err(e) => repair_fatal!(
-                                            "cursor-expired restore: diffing the fold against the \
-                                             artifact failed: {e}"
-                                        ),
-                                    };
-                                    info!(
-                                        from = ?applied,
-                                        to = ?target,
-                                        changed = diff.len(),
-                                        "cursor-expired restore: replacing the in-scope fold with the artifact's"
-                                    );
-                                    // Fold the difference through parse/apply/
-                                    // store in `max`-sized chunks, values read
-                                    // back per chunk. These carry no stream
-                                    // position: every chunk commits under the
-                                    // old cursor, so a crash part-way re-runs
-                                    // the (idempotent) restore on restart.
-                                    let mut ops = diff.into_iter();
-                                    loop {
-                                        let chunk: Vec<_> = ops.by_ref().take(batch_cap).collect();
-                                        if chunk.is_empty() {
-                                            break;
-                                        }
-                                        let (r, updates) = match tokio::task::spawn_blocking(move || {
-                                            let updates = materialize(restored.fold(), chunk);
-                                            (restored, updates)
-                                        })
-                                        .await
-                                        {
-                                            Ok(v) => v,
-                                            Err(e) => repair_fatal!(
-                                                "cursor-expired restore: read task panicked: {e}"
-                                            ),
-                                        };
-                                        restored = r;
-                                        let updates = match updates {
-                                            Ok(u) => u,
-                                            Err(e) => repair_fatal!(
-                                                "cursor-expired restore: reading the artifact failed: {e}"
-                                            ),
-                                        };
-                                        for u in updates {
-                                            if store.is_some() {
-                                                raw_batch.push(u.clone());
-                                            }
-                                            if let Some(parsed) = parse(&u) {
-                                                batch.push(parsed);
-                                            }
-                                        }
-                                        flush!();
-                                    }
-                                    // Now the fold IS the artifact's (in
-                                    // scope): take its cursor, committed to
-                                    // the store with the final chunk's
-                                    // re-queued remainder, if any.
-                                    batch_high = target.clone();
-                                    flush!();
-                                    // Closing an LSM can block; drop the
-                                    // temporary fold and its scratch dir off
-                                    // the async thread.
-                                    let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
-                                    let _ = reply.send(Ok(target));
-                                }
-                            }
-                        }
+                        repair::fold_in(&mut fold, req, &mut rx, &prefixes)
+                            .await
+                            .map_err(stop)?;
                     }
                     None => repairs = None,
                 }
@@ -839,60 +353,11 @@ where
 
             // Export request. Placed after shutdown/window (they stay prompt)
             // and before `rx.recv()` so a firehose of updates cannot starve an
-            // export indefinitely. The pending batch is flushed first, so the
-            // exported cursor is exactly the applied cursor — except when
-            // that flush's store apply transiently failed (batch re-queued):
-            // the export then captures the store's OWN lagging cursor, which
-            // is still self-consistent with its contents (cursor authority,
-            // tests/model_applied.rs); the artifact never includes unfolded
-            // data, and a bootstrap from it simply replays the short gap.
-            // The export itself runs on a blocking task with the store moved
-            // in and taken back — the same offload the flush path uses. The
-            // artifact's manifest records this watch's scope, so a restore can
-            // tell whether it covers the restoring watcher.
+            // export indefinitely.
             req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
                 if exports.is_some() => {
                 match req {
-                    Some(ExportRequest { dest_dir, reply }) => {
-                        flush!();
-                        match store.take() {
-                            Some(mut st) => {
-                                let scope = scope_prefixes.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                    let res = st.export_to(&dest_dir).and_then(|_| {
-                                        crate::artifact::stamp_scope(&dest_dir, &scope)
-                                    });
-                                    (st, res)
-                                })
-                                .await
-                                {
-                                    // Hand the store back on any clean return; an
-                                    // export failure goes to the requester only —
-                                    // the watch keeps running (the snapshot is a
-                                    // cache). A panicked task lost the store,
-                                    // which breaks the resume guarantee: fatal,
-                                    // same as the flush path's apply panic.
-                                    Ok((st, res)) => {
-                                        store = Some(st);
-                                        let _ = reply.send(res);
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "snapshot export task panicked; aborting watch");
-                                        handle.abort();
-                                        return Err(KvError::WatchError(format!(
-                                            "snapshot export task panicked: {e}"
-                                        )));
-                                    }
-                                }
-                            }
-                            None => {
-                                let _ = reply.send(Err(SnapshotError::Backend(
-                                    "watch_applied runs without a snapshot store; nothing to export"
-                                        .into(),
-                                )));
-                            }
-                        }
-                    }
+                    Some(req) => fold.export(req, &prefixes).await.map_err(stop)?,
                     // Sender dropped: disarm the arm for the rest of the run.
                     None => exports = None,
                 }
@@ -900,14 +365,25 @@ where
 
             update = rx.recv() => {
                 match update {
-                    Some(u) => ingest!(u),
+                    Some(u) => {
+                        // Arm the window on the first received update of a
+                        // batch — even a parse-rejected one, so the cursor
+                        // advances within `window` even through a run of
+                        // irrelevant keys.
+                        if !fold.is_open() {
+                            sleep.as_mut().reset(tokio::time::Instant::now() + config.window);
+                        }
+                        if fold.ingest(u) {
+                            fold.flush().await.map_err(stop)?;
+                        }
+                    }
                     None => {
                         // Stream closed. Flush the remainder, then surface the
                         // watch task's terminal result: a clean end returns the
                         // applied cursor, an error propagates.
-                        flush!();
+                        fold.flush().await.map_err(stop)?;
                         return match handle.await {
-                            Ok(Ok(())) => Ok(applied),
+                            Ok(Ok(())) => Ok(fold.applied().clone()),
                             Ok(Err(e)) => Err(e),
                             Err(join) => Err(KvError::WatchError(format!(
                                 "watch task panicked: {join}"
@@ -920,362 +396,324 @@ where
     }
 }
 
-/// Does the fold hold any entry? Stops at the first.
-fn fold_has_entries<S: SnapshotStore>(store: &S) -> Result<bool, SnapshotError> {
-    let mut found = false;
-    match store.for_each_in_range("", |_| {
-        found = true;
-        // Stop the scan; `found` carries the answer.
-        Err(SnapshotError::Backend(String::new()))
-    }) {
-        Err(e) if !found => Err(e),
-        _ => Ok(found),
-    }
+/// Consecutive store-apply failures that fail-stop the watch. A transient
+/// failure re-queues its raw batch (cursor authority: the store's cursor and
+/// contents advance together, always); a persistent streak fail-stops before
+/// the re-queued backlog grows without bound.
+const MAX_STORE_APPLY_FAILURES: u32 = 16;
+
+/// The cursor-after-apply fold behind [`watch_applied`]: the pending batch,
+/// the applied cursor, and the store they commit to. Every change to the
+/// fold — stream updates, repair corrections, exports — goes through it, so
+/// the invariant in the module docs is enforced in one place: the cursor
+/// advances only in [`flush`](Self::flush), after `apply` returns.
+pub(crate) struct Fold<U, S, P, A, O> {
+    store: Option<S>,
+    parse: P,
+    apply: A,
+    on_applied: O,
+    // Parsed updates for `apply`: the consumer's domain view. Pre-sized to the
+    // flush bound so no batch ever re-climbs the reallocation ladder.
+    batch: Vec<U>,
+    batch_cap: usize,
+    // Flush when either batch reaches this many updates.
+    max: usize,
+    // Raw received updates for the durable store, in revision order. Only
+    // populated when a store is present; the store folds the *raw* updates
+    // (including ones `parse` rejected — they are still part of the bucket's
+    // state).
+    raw: Vec<KvUpdate>,
+    // The version of the most recently *received* update since the last
+    // flush — including updates `parse` rejected. NATS delivers in revision
+    // order, so the last received is the highest, and advancing the cursor to
+    // it after a single atomic `apply` is correct: having seen the max means
+    // we've seen everything below it, and a rejected entry is still "nothing
+    // to apply", hence covered. Reset to `none()` after every flush.
+    batch_high: WatchCursor,
+    applied: WatchCursor,
+    store_fail_streak: u32,
+    // A batch opened since the last flush (the window timer is armed).
+    open: bool,
 }
 
-/// Run the underlying watch for `scope`, resuming from `resume` when it carries
-/// a position, with cursor-expiry repair: an expiry (at resume, or mid-watch
-/// from the floor guard) runs the planned repair and then either falls back to
-/// the full-scope re-list (Relist / nothing armed) or resumes from the restored
-/// artifact's cursor (Restore) — which can itself expire later and go round
-/// again, each time only for a strictly newer artifact.
-///
-/// `unanchored`: the fold holds data but no cursor (a torn first checkpoint,
-/// or a populated store started without one). A re-list alone never removes
-/// what it doesn't deliver, so that start is repaired like an expiry at
-/// revision 0 before watching.
-async fn run_watch<S: Send + 'static>(
-    watcher: &dyn KvWatcher,
-    scope: &WatchScope,
-    resume: Option<WatchCursor>,
-    unanchored: bool,
-    repair: Option<RepairHandle<S>>,
-    tx: mpsc::Sender<KvUpdate>,
-) -> Result<(), KvError> {
-    // Resume only when the cursor carries a real position; an absent or `none()`
-    // cursor falls through to a full watch. Binding `cursor` here makes "we have a
-    // resume position" structural — there is no separate bool whose truth a later
-    // edit could let drift from the `Some`.
-    let mut resume = resume.filter(|c| !c.is_none());
-
-    // A cursor-less start that must be repaired before it watches: a fold
-    // with data and no cursor (any repair), or an empty fold on a bucket that
-    // already evicted current values with a restore armed (its re-list would
-    // seed an incomplete fold).
-    let mut repair_first = resume.is_none()
-        && match &repair {
-            // (A handle exists only for a real repair mode.)
-            Some(_) if unanchored => {
-                warn!(
-                    "the fold holds data but no cursor; repairing it like an expired cursor \
-                     before watching (a re-list alone never removes what it doesn't deliver)"
-                );
-                true
-            }
-            Some(h) => {
-                let seed = fresh_start_needs_restore(watcher, h).await?;
-                if seed {
-                    warn!(
-                        "no resume cursor, and the bucket has already evicted current values: a \
-                         re-list would seed an incomplete fold; restoring from the latest artifact"
-                    );
-                }
-                seed
-            }
-            None => {
-                // Nothing armed: the re-list stands as the fold. Say so when
-                // the bucket has already evicted current values — the copy
-                // then lacks whatever aged out, and nothing will repair it.
-                if watcher
-                    .retention()
-                    .await?
-                    .is_some_and(|r| !listing_is_truth(&r))
-                {
-                    warn!(
-                        "no resume cursor and no repair armed, on a bucket that has already \
-                         evicted current values: the re-list lacks whatever aged out. Wire a \
-                         store and ExpiryRepair::Auto to seed from an artifact"
-                    );
-                }
-                false
-            }
-        };
-
-    loop {
-        let cursor = if std::mem::take(&mut repair_first) {
-            WatchCursor::none()
-        } else {
-            let Some(cursor) = resume.take() else {
-                return watch_scope(watcher, scope, tx).await;
-            };
-            match watch_scope_from(watcher, scope, &cursor, tx.clone()).await {
-                Err(KvError::CursorExpired) => cursor,
-                other => return other,
-            }
-        };
-        match plan_repair(watcher, repair.as_ref()).await? {
-            Plan::ReListOnly => {
-                warn!(
-                    "watch cursor expired with no repair armed (needs a store and a reader or \
-                     restore source); falling back to the re-list alone — keys deleted during \
-                     the gap may persist in the fold"
-                );
-                return watch_scope(watcher, scope, tx).await;
-            }
-            Plan::Relist(reader, repairs) => {
-                warn!(
-                    "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
-                );
-                resync_stale_keys(scope, reader, repairs).await?;
-                return watch_scope(watcher, scope, tx).await;
-            }
-            Plan::Restore(reader, source, repairs) => {
-                warn!("watch cursor expired; restoring the fold from the latest artifact");
-                let restored =
-                    restore_from_artifact(watcher, scope, reader, source, repairs, &cursor)
-                        .await
-                        .map_err(|e| match e {
-                            KvError::WatchError(msg) if cursor.is_none() => {
-                                KvError::WatchError(format!(
-                                    "{msg}. This node has no cursor, so it can only seed from an \
-                             artifact. If none exists yet (first deploy onto a bucket that \
-                             already evicted values), start one node with ExpiryRepair::None \
-                             — accepting that values which already aged out are gone — and \
-                             publish an export from it"
-                                ))
-                            }
-                            other => other,
-                        })?;
-                resume = Some(restored);
-            }
+impl<U, S, P, A, O> Fold<U, S, P, A, O>
+where
+    U: Send,
+    S: SnapshotStore + Send + 'static,
+    P: FnMut(&KvUpdate) -> Option<U> + Send,
+    A: FnMut(Vec<U>) + Send,
+    O: FnMut(WatchCursor) + Send,
+{
+    fn new(
+        store: Option<S>,
+        parse: P,
+        apply: A,
+        on_applied: O,
+        max: usize,
+        applied: WatchCursor,
+    ) -> Self {
+        // `max(1)` only guards a nonsensical `max = 0` config.
+        let batch_cap = max.max(1);
+        Self {
+            store,
+            parse,
+            apply,
+            on_applied,
+            batch: Vec::with_capacity(batch_cap),
+            batch_cap,
+            max,
+            raw: Vec::new(),
+            batch_high: WatchCursor::none(),
+            applied,
+            store_fail_streak: 0,
+            open: false,
         }
     }
-}
 
-/// The full-scope (state-sync re-list) watch for `scope`.
-async fn watch_scope(
-    watcher: &dyn KvWatcher,
-    scope: &WatchScope,
-    tx: mpsc::Sender<KvUpdate>,
-) -> Result<(), KvError> {
-    match scope {
-        WatchScope::All => watcher.watch_all(tx).await,
-        WatchScope::Prefix(prefix) => watcher.watch_prefix(prefix, tx).await,
-        WatchScope::Prefixes(prefixes) => {
-            let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-            watcher.watch_prefixes(&refs, tx).await
+    /// Take one update off the watch stream into the pending batch. Returns
+    /// `true` when a batch is full and must be flushed: the parsed batch, or —
+    /// when persisting — the raw batch, so a window packed with
+    /// parse-rejected updates can't grow it without bound.
+    pub(crate) fn ingest(&mut self, u: KvUpdate) -> bool {
+        // Cursor authority: every received update bumps the pending
+        // high-water, regardless of whether `parse` keeps it — but only when
+        // it carries a real position. An unknown version (e.g. an unparseable
+        // ACK subject on the hand-built multi-prefix consumer path) must
+        // neither mint a fake cursor nor clobber the real high from earlier in
+        // the batch; skipping it under-advances at worst, and re-delivery on
+        // resume is idempotent.
+        if !u.version().is_unknown() {
+            self.batch_high = WatchCursor::from_version(u.version().clone());
+        }
+        self.correct(u);
+        self.open = true;
+        self.batch.len() >= self.max || self.raw.len() >= self.max
+    }
+
+    /// Queue a repair's state correction (a synthetic delete, a restored
+    /// entry). It runs through `parse`/`apply`/store like a stream update,
+    /// but carries no stream position, so it never moves the cursor and
+    /// doesn't open the batch window: the repair flushes it itself.
+    pub(crate) fn correct(&mut self, u: KvUpdate) {
+        let parsed = (self.parse)(&u);
+        // Only when a store is present, so the no-persistence path keeps its
+        // zero-copy cost.
+        if self.store.is_some() {
+            self.raw.push(u);
+        }
+        if let Some(parsed) = parsed {
+            self.batch.push(parsed);
         }
     }
-}
 
-/// The delta watch for `scope`, resuming after `cursor`.
-async fn watch_scope_from(
-    watcher: &dyn KvWatcher,
-    scope: &WatchScope,
-    cursor: &WatchCursor,
-    tx: mpsc::Sender<KvUpdate>,
-) -> Result<(), KvError> {
-    match scope {
-        WatchScope::All => watcher.watch_all_from(cursor, tx).await,
-        WatchScope::Prefix(prefix) => watcher.watch_prefix_from(prefix, cursor, tx).await,
-        WatchScope::Prefixes(prefixes) => {
-            let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-            watcher.watch_prefixes_from(&refs, cursor, tx).await
-        }
+    /// Set the pending cursor as if the stream had delivered `cursor`: a
+    /// restore's last step, taking the artifact's cursor. The next flush
+    /// commits it.
+    pub(crate) fn advance_to(&mut self, cursor: WatchCursor) {
+        self.batch_high = cursor;
     }
-}
 
-/// Is the bucket's key listing the truth — does "not listed" mean "deleted"?
-/// Yes when retention never evicts current values, and also when it can but
-/// has never evicted anything (the first retained revision is still 1). Read
-/// live; `None` when the backend can't say.
-fn listing_is_truth(r: &Retention) -> bool {
-    !r.evicts_current_values || resume_window_ok(0, r.first_revision)
-}
-
-/// Decide how to repair one expiry, reading the bucket's retention live when
-/// the choice depends on it.
-async fn plan_repair<'a, S>(
-    watcher: &dyn KvWatcher,
-    repair: Option<&'a RepairHandle<S>>,
-) -> Result<Plan<'a, S>, KvError> {
-    let Some(h) = repair else {
-        return Ok(Plan::ReListOnly);
-    };
-    Ok(match &h.mode {
-        ExpiryRepair::None => Plan::ReListOnly,
-        ExpiryRepair::Relist(reader) => {
-            if watcher
-                .retention()
-                .await?
-                .is_some_and(|r| !listing_is_truth(&r))
-            {
-                let msg = "watch cursor expired on a bucket whose retention evicts current \
-                           values (max_age, per-message TTL, or discard:old): its key listing \
-                           can't tell a deleted key from an aged-out one, so the key-listing \
-                           resync would delete valid keys. Refusing. Repair from artifacts with \
-                           ExpiryRepair::Restore or ExpiryRepair::Auto (or accept a re-list-only \
-                           fallback with ExpiryRepair::None)";
-                error!(msg);
-                return Err(KvError::WatchError(msg.into()));
-            }
-            Plan::Relist(reader, &h.tx)
+    /// Flush the pending batch, in order: run the domain `apply` (if
+    /// non-empty) to completion, advance the cursor, fold the raw batch +
+    /// cursor durably into the store, then fire `on_applied`. The store fold
+    /// runs on a blocking task (its `apply` may block on I/O), moving the
+    /// store in and taking it back. A TRANSIENT store error re-queues the raw
+    /// batch for cumulative commit on the next flush (the watch continues; the
+    /// store's cursor never advances past data it dropped) and a persistent
+    /// failure streak is fatal; a panicked blocking task drops the store
+    /// irrecoverably, which breaks the resume-after-restart guarantee, so it
+    /// is surfaced as fatal.
+    pub(crate) async fn flush(&mut self) -> Result<(), KvError> {
+        self.open = false;
+        // Nothing received since the last flush → nothing to do at all.
+        // (`raw` can be non-empty with no cursor advance only via a repair's
+        // corrections, or a re-queued batch.)
+        if self.batch.is_empty() && self.raw.is_empty() && self.batch_high.is_none() {
+            return Ok(());
         }
-        ExpiryRepair::Restore { reader, restore } => Plan::Restore(reader, restore, &h.tx),
-        ExpiryRepair::Auto { reader, restore } => match watcher.retention().await? {
-            Some(r) if listing_is_truth(&r) => Plan::Relist(reader, &h.tx),
-            _ => Plan::Restore(reader, restore, &h.tx),
-        },
-    })
-}
-
-/// Must an EMPTY cursor-less start seed from an artifact? Only with a restore
-/// armed, on a bucket whose re-list is no longer complete (it evicted current
-/// values). A bucket whose listing is the truth re-lists completely.
-async fn fresh_start_needs_restore<S>(
-    watcher: &dyn KvWatcher,
-    h: &RepairHandle<S>,
-) -> Result<bool, KvError> {
-    if !matches!(
-        h.mode,
-        ExpiryRepair::Restore { .. } | ExpiryRepair::Auto { .. }
-    ) {
-        return Ok(false);
-    }
-    Ok(watcher
-        .retention()
-        .await?
-        .is_some_and(|r| !listing_is_truth(&r)))
-}
-
-/// The artifact restore, watch-task half: check the newest artifact before
-/// downloading it (ahead of `local`, covers the scope, still inside
-/// retention), download it, check what actually arrived, then hand it to the
-/// main loop and wait for the cursor it restored to.
-async fn restore_from_artifact<S: Send + 'static>(
-    watcher: &dyn KvWatcher,
-    scope: &WatchScope,
-    reader: &Arc<dyn KvReader>,
-    source: &Arc<dyn RestoreSource<S>>,
-    repairs: &mpsc::Sender<RepairRequest<S>>,
-    local: &WatchCursor,
-) -> Result<WatchCursor, KvError> {
-    let prefixes = scope.prefixes();
-    let fail = |msg: String| {
-        error!(%msg, "cursor-expiry restore refused; no safe recovery");
-        KvError::WatchError(format!("cursor-expired restore: {msg}"))
-    };
-
-    let first = watcher.retention().await?.map(|r| r.first_revision);
-    let latest = source
-        .latest()
-        .await
-        .map_err(|e| fail(format!("reading the latest artifact failed: {e}")))?;
-    check_restore(&latest, local, first, &prefixes).map_err(fail)?;
-
-    let restored = source
-        .fetch()
-        .await
-        .map_err(|e| fail(format!("fetching the latest artifact failed: {e}")))?;
-    // The pointer may have advanced between the peek and the download, and
-    // retention may have moved: check what actually arrived, against now.
-    let first = watcher.retention().await?.map(|r| r.first_revision);
-    check_restore(restored.manifest(), local, first, &prefixes).map_err(fail)?;
-    let age_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|now| {
-            now.as_secs()
-                .saturating_sub(restored.manifest().created_at_unix)
-        })
-        .unwrap_or(0);
-    info!(
-        cursor = ?restored.manifest().cursor,
-        age_secs,
-        first_retained = ?first,
-        "restoring the fold from the latest artifact"
-    );
-
-    // The bucket's live keys, listed after the artifact's cursor is fixed:
-    // the restore never deletes one of these (see `restore_diff`). A failed
-    // listing fails the watch, like the key-listing repair's.
-    let mut live = std::collections::HashSet::new();
-    for prefix in &prefixes {
-        let keys = reader
-            .keys(prefix)
+        if !self.batch.is_empty() {
+            // INVARIANT: apply() runs and RETURNS before any cursor advance
+            // below. Move the batch out so a panicking apply can't leave
+            // half-consumed state behind.
+            //
+            // `replace` (not `take`) leaves a pre-sized Vec behind so each
+            // batch after the first doesn't re-climb the reallocation ladder
+            // (4→8→…→cap).
+            (self.apply)(std::mem::replace(
+                &mut self.batch,
+                Vec::with_capacity(self.batch_cap),
+            ));
+        }
+        let advanced = !self.batch_high.is_none();
+        if advanced {
+            self.applied = self.batch_high.clone();
+        }
+        // A cursor-only advance (nothing raw to fold) still commits to the
+        // store: a restore's final step moves the cursor to the artifact's
+        // with no updates left. In the steady state every advance carries raw
+        // updates, so this changes nothing there.
+        if (!self.raw.is_empty() || advanced)
+            && let Some(mut st) = self.store.take()
+        {
+            let raw = std::mem::take(&mut self.raw);
+            // Fold at the post-advance cursor. A repair-only batch (synthetic
+            // updates) leaves the cursor where it was (they are a state
+            // correction, not log entries), which is safe: an unchanged —
+            // possibly expired — cursor only ever re-runs the same repair on
+            // the next restart.
+            let cur = self.applied.clone();
+            // Hand the store AND the raw batch back on a clean return: a
+            // *failed* apply (Ok(Err)) RE-QUEUES the batch so the next flush
+            // commits it cumulatively — the store's cursor and contents always
+            // advance together. Dropping the failed batch instead lets the
+            // NEXT successful flush advance the cursor over a hole that
+            // survives every restart (reproduced by
+            // `transient_store_failure_never_leaves_a_cursor_gap`). Only a
+            // *panicked* task (Err) loses the store: fatal.
+            match tokio::task::spawn_blocking(move || {
+                let res = st.apply(&raw, &cur);
+                (st, raw, res)
+            })
             .await
-            .map_err(|e| fail(format!("listing live keys under {prefix:?} failed: {e}")))?;
-        live.extend(keys);
+            {
+                Ok((st, _raw, Ok(()))) => {
+                    self.store = Some(st);
+                    self.store_fail_streak = 0;
+                }
+                Ok((st, raw, Err(e))) => {
+                    self.store_fail_streak += 1;
+                    let streak = self.store_fail_streak;
+                    if streak >= MAX_STORE_APPLY_FAILURES {
+                        // A persistently failing store would otherwise grow
+                        // the re-queued batch without bound while the fold
+                        // silently stales. Fail-stop: the restart refolds the
+                        // tail from the store's last good cursor.
+                        warn!(error = %e, streak,
+                            "snapshot store apply failing persistently; aborting watch");
+                        return Err(KvError::WatchError(format!(
+                            "snapshot store apply failed {streak} consecutive times: {e}"
+                        )));
+                    }
+                    warn!(error = %e, streak,
+                        "snapshot store apply failed; batch re-queued for the next flush");
+                    self.store = Some(st);
+                    // Prepend: the failed range precedes anything received
+                    // since (stream order is preserved for the eventual
+                    // cumulative commit).
+                    let newer = std::mem::replace(&mut self.raw, raw);
+                    self.raw.extend(newer);
+                }
+                Err(e) => {
+                    warn!(error = %e, "snapshot store task panicked; aborting watch");
+                    return Err(KvError::WatchError(format!(
+                        "snapshot store task panicked: {e}"
+                    )));
+                }
+            }
+        }
+        if advanced {
+            (self.on_applied)(self.applied.clone());
+            self.batch_high = WatchCursor::none();
+        }
+        Ok(())
     }
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    repairs
-        .send(RepairRequest::Restore {
-            restored,
-            live,
-            reply: reply_tx,
+    /// Flush until the store holds every update received: a transient store
+    /// failure re-queues the batch, so retry; a persistent one hits the
+    /// flush's own fail-stop bound.
+    pub(crate) async fn settle(&mut self) -> Result<(), KvError> {
+        self.flush().await?;
+        while !self.raw.is_empty() {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Export the fold (see [`ExportRequest`]). The pending batch is flushed
+    /// first, so the exported cursor is exactly the applied cursor — except
+    /// when that flush's store apply transiently failed (batch re-queued):
+    /// the export then captures the store's OWN lagging cursor, which is still
+    /// self-consistent with its contents (cursor authority,
+    /// tests/model_applied.rs); the artifact never includes unfolded data, and
+    /// a bootstrap from it simply replays the short gap. The export runs on a
+    /// blocking task with the store moved in and taken back, and the
+    /// manifest records the watch's `scope`, so a restore can tell whether it
+    /// covers the restoring watcher.
+    ///
+    /// An export failure goes to the requester only — the watch keeps
+    /// running. A panicked task lost the store, which breaks the resume
+    /// guarantee: fatal, same as the flush path's.
+    pub(crate) async fn export(
+        &mut self,
+        ExportRequest { dest_dir, reply }: ExportRequest,
+        scope: &[String],
+    ) -> Result<(), KvError> {
+        self.flush().await?;
+        let Some(mut st) = self.store.take() else {
+            let _ = reply.send(Err(SnapshotError::Backend(
+                "watch_applied runs without a snapshot store; nothing to export".into(),
+            )));
+            return Ok(());
+        };
+        let scope = scope.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            let res = st
+                .export_to(&dest_dir)
+                .and_then(|_| crate::artifact::stamp_scope(&dest_dir, &scope));
+            (st, res)
         })
         .await
-        .map_err(|_| KvError::WatchError("watch loop ended during a restore".into()))?;
-    reply_rx
-        .await
-        .map_err(|_| KvError::WatchError("watch loop dropped a restore reply".into()))?
-}
-
-/// Cursor-expired stale-key resync (the key-listing diff), run BEFORE the
-/// fallback watch is established: list the scope's live keys, hand them to the
-/// main loop (which diffs them against the fold and applies synthetic
-/// deletes), and wait for the ack. That ordering — deletes applied, then
-/// fallback watch armed — is what makes a delete-then-recreate during the gap
-/// converge: the synthetic delete always lands before the re-list put.
-///
-/// Sound only on a bucket that never evicts current values; `plan_repair`
-/// refuses it otherwise.
-///
-/// A FAILED listing is **fatal** — it fails the watch rather than degrading.
-/// The resync is load-bearing for the "stale, never corrupt" convergence
-/// guarantee: a silently degraded resync leaves the fold holding keys the
-/// bucket deleted, with one warn line as the only witness (`tests/model.rs`
-/// proves this divergence reachable under degrade semantics). Failing the
-/// watch turns the violated guarantee into a visible error; the caller's
-/// restart re-resumes, hits `CursorExpired` again, and retries the resync from
-/// scratch.
-async fn resync_stale_keys<S>(
-    scope: &WatchScope,
-    reader: &Arc<dyn KvReader>,
-    repairs: &mpsc::Sender<RepairRequest<S>>,
-) -> Result<(), KvError> {
-    let mut live_keys = Vec::new();
-    for prefix in scope.prefixes() {
-        match reader.keys(&prefix).await {
-            Ok(keys) => live_keys.extend(keys),
+        {
+            Ok((st, res)) => {
+                self.store = Some(st);
+                let _ = reply.send(res);
+                Ok(())
+            }
             Err(e) => {
-                return Err(KvError::WatchError(format!(
-                    "cursor-expired resync failed listing live keys under {prefix:?}: {e}; \
-                     failing the watch rather than silently keeping stale keys"
-                )));
+                warn!(error = %e, "snapshot export task panicked; aborting watch");
+                Err(KvError::WatchError(format!(
+                    "snapshot export task panicked: {e}"
+                )))
             }
         }
     }
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if repairs
-        .send(RepairRequest::Relist {
-            live_keys,
-            ack: ack_tx,
-        })
-        .await
-        .is_ok()
-    {
-        // A dropped ack (main loop shutting down) just means the fallback watch
-        // is about to die with it; nothing to recover.
-        let _ = ack_rx.await;
+
+    /// The applied cursor: everything at or below it has been applied.
+    pub(crate) fn applied(&self) -> &WatchCursor {
+        &self.applied
     }
-    Ok(())
+
+    /// The flush bound, for a repair's own chunking.
+    pub(crate) fn batch_cap(&self) -> usize {
+        self.batch_cap
+    }
+
+    /// A batch is open: the window timer must be armed.
+    fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The store, between flushes.
+    pub(crate) fn store(&self) -> Option<&S> {
+        self.store.as_ref()
+    }
+
+    /// Move the store out (to a blocking task); [`put_store`](Self::put_store)
+    /// hands it back. A flush in between would skip the store fold.
+    pub(crate) fn take_store(&mut self) -> Option<S> {
+        self.store.take()
+    }
+
+    /// Hand back a store taken with [`take_store`](Self::take_store).
+    pub(crate) fn put_store(&mut self, store: S) {
+        self.store = Some(store);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::{KvEntry, VersionToken};
+    use crate::kv::{KvEntry, KvReader, VersionToken};
     use crate::snapshot::AppendLogSnapshot;
     use async_trait::async_trait;
     use std::sync::Mutex;
