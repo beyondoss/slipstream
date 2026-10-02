@@ -200,7 +200,7 @@ impl Default for RocksDbConfig {
     }
 }
 
-/// On-disk durable fold backed by RocksDB. See the [module docs](self).
+/// On-disk durable fold backed by RocksDB. See the module docs in `src/snapshot_rocksdb.rs`.
 pub struct RocksDbSnapshot {
     // Arc so `reader()` handles share the instance: RocksDB serves reads from
     // `&DB` concurrently with writes, and `DB` is `Send + Sync`.
@@ -597,6 +597,16 @@ impl SnapshotStore for RocksDbSnapshot {
         f: impl FnMut(KvEntry) -> Result<(), SnapshotError>,
     ) -> Result<(), SnapshotError> {
         scan_prefix(&self.db, prefix, f)
+    }
+
+    fn has_entries(&self) -> Result<bool, SnapshotError> {
+        let mut it = self
+            .db
+            .iterator_cf(cf(&self.db, DATA_CF)?, IteratorMode::Start);
+        match it.next() {
+            Some(item) => item.map(|_| true).map_err(map_rocksdb),
+            None => Ok(false),
+        }
     }
 
     fn cursor(&self) -> WatchCursor {

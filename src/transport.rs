@@ -114,12 +114,6 @@ pub enum PublishOutcome {
     },
 }
 
-/// Total order for the monotonic pointer guard. Revisionless cursors rank 0:
-/// a real cursor always supersedes an empty one, never the reverse.
-fn cursor_rank(c: &WatchCursor) -> u64 {
-    c.as_u64().unwrap_or(0)
-}
-
 /// Bound one object-store await by `limit`.
 async fn timed_by<T>(
     what: &str,
@@ -264,7 +258,7 @@ impl ObjectStoreTransport {
         ObjPath::from(format!(
             "{}/{key}.payloads/{:016x}-{hex}.tar",
             self.prefix,
-            cursor_rank(cursor)
+            cursor.rank()
         ))
     }
 
@@ -335,9 +329,9 @@ impl ObjectStoreTransport {
                     // rank-less and replaced.
                     let existing = manifest_from_slice(&bytes).ok();
                     let observed = PointerState::Present {
-                        rank: existing.as_ref().map(|m| cursor_rank(&m.cursor)),
+                        rank: existing.as_ref().map(|m| m.cursor.rank()),
                     };
-                    if !pointer_publish_allowed(&observed, cursor_rank(new_cursor)) {
+                    if !pointer_publish_allowed(&observed, new_cursor.rank()) {
                         let existing =
                             existing.expect("refusal implies a parseable, newer pointer");
                         return Ok(PublishOutcome::SupersededByNewer {
@@ -612,7 +606,7 @@ impl ArtifactTransport for ObjectStoreTransport {
             return Ok(0);
         };
         let keep = self.payload_path(key, &current.cursor, &pointer);
-        let pointer_rank = cursor_rank(&current.cursor);
+        let pointer_rank = current.cursor.rank();
         let cutoff_millis = std::time::SystemTime::now()
             .checked_sub(grace)
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

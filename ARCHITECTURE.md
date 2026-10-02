@@ -182,14 +182,20 @@ Every non-`_from` watch is a **state-sync** stream (NATS `DeliverPolicy::LastPer
 
 The cursor is the NATS stream sequence number at the last checkpoint. On restart, pass it to `watch_all_from()` to subscribe at `cursor+1` — only the delta arrives, not the full history.
 
-When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The fallback `watch_all()` re-list re-delivers the current value of every live key, but it cannot cover keys **deleted during the gap whose delete markers were also evicted** — those need synthetic `Delete` events diffed from prior state. On a bucket whose retention never evicts current values, `watch_applied` does this automatically (see below), and a raw-API caller hand-rolls the same diff with `Snapshot::stale_keys()`:
+When the cursor expires (NATS retention window evicted those records), `CursorExpired` is returned. The fallback `watch_all()` re-list re-delivers the current value of every live key, but it cannot cover keys **deleted during the gap whose delete markers were also evicted** — those need synthetic `Delete` events diffed from prior state. On a bucket whose retention never evicts current values, `watch_applied` does this automatically (see below), and a raw-API caller hand-rolls the same diff with `Snapshot::stale_keys()`, which returns `None` when the bucket's retention says the listing isn't the truth (the same planner as `ExpiryRepair::Relist`):
 
 ```rust
 match watcher.watch_all_from(&snap.cursor, tx).await {
     Ok(()) => {}
     Err(KvError::CursorExpired) => {
         let live = reader.keys("").await?;
-        for key in snap.stale_keys(live.iter().map(|s| s.as_str())) {
+        let Some(stale) = snap.stale_keys(live.iter().map(|s| s.as_str()), watcher.retention().await?)
+        else {
+            // Retention evicts current values: a missing key may have aged
+            // out. Restore from an artifact instead (ExpiryRepair::Restore).
+            return Err(KvError::CursorExpired.into());
+        };
+        for key in stale {
             cache.remove(key);
         }
         watcher.watch_all(tx).await?;
@@ -224,7 +230,7 @@ The one exception: an update carrying the **unknown** version (an unparseable AC
 
 **Flush triggers.** A batch flushes when any of these fires: the `window` elapses, `batch.len()` reaches `config.max`, a shutdown is signalled, or the channel closes with a pending batch (the remainder is flushed before returning).
 
-**Transient store failures re-queue, not drop.** If `store.apply()` returns an error, the raw batch is prepended to the next flush's accumulation and the watch continues. The streak counter increments; at 16 consecutive failures the watch fail-stops with `KvError::WatchError`. Dropping the failed batch and continuing was the shipped behavior until `transient_store_failure_never_leaves_a_cursor_gap` reproduced the bug: a transient failure followed by a successful flush advanced the cursor over a hole that survived every restart, because the restart re-folds from the advanced cursor, skipping the missing range. Cursor authority requires the store's cursor and contents to advance together, always (`applied.rs:303–394`, `tests/model_applied.rs`).
+**Transient store failures re-queue, not drop.** If `store.apply()` returns an error, the raw batch is prepended to the next flush's accumulation and the watch continues. The streak counter increments; at 16 consecutive failures the watch fail-stops with `KvError::WatchError`. Dropping the failed batch and continuing was the shipped behavior until `transient_store_failure_never_leaves_a_cursor_gap` reproduced the bug: a transient failure followed by a successful flush advanced the cursor over a hole that survived every restart, because the restart re-folds from the advanced cursor, skipping the missing range. Cursor authority requires the store's cursor and contents to advance together, always (`Fold::flush` in `applied.rs`, `tests/model_applied.rs`).
 
 **Cursor-expiry repair.** <a id="cursor-expiry-repair"></a> The cursor expires at resume (`CursorExpired` from the `*_from` watch) or mid-watch (the live floor guard ends an All-scope watch with `CursorExpired` when retention overruns it). Both take one path. Correct means **every write minus every real delete** — not "whatever NATS still lists"; the two agree only when retention never evicts current values. The repair (`ExpiryRepair`, `src/repair.rs`) is chosen accordingly:
 
@@ -292,7 +298,18 @@ Every NATS operation is wrapped in `timed()` (30 s). Without it, a CLOSE_WAIT co
 
 ### Machine-Checked Protocol Kernels (`protocol.rs`)
 
-Four pure-function guards live in `protocol.rs`. Production code and the Stateright exhaustive model checker (`tests/model.rs`) call the **same functions** — not two hand-synchronized copies. A change to any guard is re-verified against the full bounded state space on the next `cargo test --test model`. Mutation tests prove each guard is load-bearing: substituting a broken variant produces a counterexample.
+Every decision the protocol's correctness rests on is a pure function in `protocol.rs`. Production code and the Stateright models (`tests/model*.rs`) call the **same functions** — not hand-synchronized copies. A change to any of them is re-verified against the full bounded state space on the next model run. A model expresses a mutation by forging a kernel's *input* (e.g. the listing is "the truth" on an evicting bucket), never by re-implementing the decision; each mutation must produce a counterexample.
+
+| Kernel | Production | Models |
+| --- | --- | --- |
+| `pointer_publish_allowed` | `transport` pointer swap | `model.rs`, `model_fleet.rs` |
+| `payload_prunable` | `transport` prune | `model.rs` |
+| `resume_window_ok` | `nats` resume paths (`create_resume`), floor guard | every model |
+| `restore_allowed` / `restore_ahead` | `repair::check_restore`, the main loop's ahead re-check | `model.rs`, `model_live_watch.rs`, `model_repair.rs`, `model_fleet.rs` |
+| `listing_is_truth` | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention |
+| `plan_repair` | `repair::plan`, `Snapshot::stale_keys` | every model's expiry dispatch |
+| `cursorless_start_needs_repair` | `repair::run_watch` | `model_repair.rs`, `model_fleet.rs` |
+| `restore_key` | `repair::restore_diff` | `model_repair.rs` |
 
 **`pointer_publish_allowed(current: &PointerState, candidate_rank: u64) → bool`**
 
@@ -340,6 +357,18 @@ artifact_revision > local_revision && resume_window_ok(artifact_revision, first_
 ```
 
 Machine-checked as: _"bootstrap never silently diverges from every write minus every real delete"_ on an evicting bucket (`tests/model.rs`), and _"a repair never moves the fold backward"_ (`tests/model_live_watch.rs`, where removing the guard is a mutation the checker catches).
+
+**`listing_is_truth(evicts_current_values, first_revision) → bool`** and **`plan_repair(mode, listing_truth) → RepairPlan`**
+
+Whether "not listed" means "deleted": yes when retention never evicts current values, or when it can but has evicted nothing yet (first retained revision ≤ 1). The planner turns that (or `None`, a backend that can't say) and the armed `ExpiryRepair` into the repair: `Relist` where the listing isn't the truth is `RefuseRelist`; `Auto` re-lists only on `Some(true)` and restores otherwise.
+
+**`cursorless_start_needs_repair(mode, fold_has_data, listing_truth) → bool`**
+
+A start with no cursor repairs first when the fold holds data anyway (a re-list never removes what it doesn't deliver), or, with a restore armed, when the listing isn't the truth (a re-list would be incomplete).
+
+**`restore_key(local, artifact, identical, listed_live) → KeyRestore`**
+
+The per-key restore decision: take the artifact's entry unless the local one is newer (never a move backward), and delete a key the artifact lacks unless the bucket lists it live (never a phantom delete). `tests/model_repair.rs` catches both pre-fix variants as forged inputs.
 
 ### Export Round State Machine
 
@@ -636,7 +665,7 @@ Machine-checked as three theorems in `tests/model.rs`: published cursor never re
 
 ### Why extract protocol guards into `protocol.rs` and share them with the model?
 
-Production code and an exhaustive model checker running the same logic closes the drift gap between proof and implementation. Previously the model had its own inline guard copies; a change to the production guard would not update the model, leaving the proof covering the old variant. Extracting the three guards into `protocol.rs` and importing them from both call sites means every `cargo test --test model` verifies the current production code, not a snapshot. The cost is a hard dependency: `tests/model.rs` imports `pub mod protocol` directly, so the module cannot go private.
+Production code and an exhaustive model checker running the same logic closes the drift gap between proof and implementation. Previously the models had their own inline copies; a change to the production decision would not update them, leaving the proof covering the old variant. Extracting every decision into `protocol.rs` and importing it from both call sites means every model run verifies the current production code, not a snapshot. The cost is a hard dependency: the models import `pub mod protocol` directly, so the module cannot go private.
 
 ### Why write in sorted key order during compaction?
 
@@ -729,8 +758,8 @@ Production code and an exhaustive model checker running the same logic closes th
 | -------------------------- | ------------------------------------------------------------------------------------ |
 | `src/kv.rs`                | Core traits (`KvReader`, `KvWriter`, `KvWatcher`, `KvTtl`) and types (`KvEntry`, `KvUpdate`, `VersionToken`, `WatchCursor`, `KvError`) |
 | `src/stores.rs`            | `Connection`, `KvStore`, `StoreConfig`, `StorageType`, `ConnectionCapabilities`      |
-| `src/nats.rs`              | NATS JetStream implementation; bucket creation, scan consumer lifecycle, timeout wrapping, Synadia Cloud workarounds, `check_resume_window` |
-| `src/protocol.rs`          | Pure-function protocol guards: `pointer_publish_allowed`, `payload_prunable`, `resume_window_ok` — called by both production code and the Stateright model |
+| `src/nats.rs`              | NATS JetStream implementation; bucket creation, scan consumer lifecycle, timeout wrapping, Synadia Cloud workarounds, resume-window checks (`create_resume`), the live floor guard |
+| `src/protocol.rs`          | The protocol's decisions as pure functions (see "Machine-Checked Protocol Kernels"), called by both production code and the Stateright models |
 | `src/snapshot.rs`          | `SnapshotStore` trait; append-only log + `AppendLogSnapshot` (default backend): `SnapshotWriter`, `load()`, `replay_log()`, `compact_to_file()` |
 | `src/snapshot_fjall.rs`    | `FjallSnapshot`: on-disk `SnapshotStore` backed by fjall (`feature = "fjall"`)       |
 | `src/snapshot_rocksdb.rs`  | `RocksDbSnapshot`: on-disk `SnapshotStore` backed by RocksDB (`feature = "rocksdb"`) |
@@ -738,8 +767,8 @@ Production code and an exhaustive model checker running the same logic closes th
 | `src/artifact.rs`          | `ExportManifest`, `ArtifactFile`, BLAKE3 integrity; stage-then-rename discipline; backend `export_to` + `import` (append-log, fjall, RocksDB) |
 | `src/export_lease.rs`      | `ExportLease`, `LeaseGuard`, `LeaseRecord`: fleet-wide at-most-one via embedded-expiry CAS |
 | `src/transport.rs`         | `ObjectStoreTransport`, `ArtifactTransport` trait, `run_export_round`: monotonic pointer swap, multipart upload, prune, content-addressed keys (`feature = "transport"`) |
-| `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, cursor-expiry repair (drain, key-listing diff, artifact restore), `ExportRequest` handling (stamps the scope) |
-| `src/repair.rs`            | `ExpiryRepair`, `RestoreSource`, `RestoredFold`; scope coverage, restore checks, the in-scope restore diff |
+| `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, the select loop, and `Fold` — the batch, applied cursor, and store every change goes through (ingest, repair corrections, flush, `ExportRequest` handling, which stamps the scope) |
+| `src/repair.rs`            | Cursor-expiry repair, both halves: `ExpiryRepair`, `RestoreSource`, `RestoredFold`; the watch task (`run_watch`: plan, key listing, artifact checks and fetch) and the main loop's side (`fold_in`: drain, settle, key-listing diff, artifact restore into the `Fold`); scope coverage, restore checks, the in-scope restore diff |
 | `src/lib.rs`               | Re-exports all public types; no logic                                                |
 | `benches/`                 | Criterion benchmarks: snapshot write/checkpoint/load throughput, batch throughput, ACK subject parsing |
 | `tests/integration.rs`     | NATS JetStream backend integration suite: each test boots its own `nats-server` on a free port; covers bucket create, CAS, watch semantics, cursor resume, and delete reconciliation |
@@ -757,7 +786,7 @@ Production code and an exhaustive model checker running the same logic closes th
 | `tests/model_applied.rs`   | Stateright cursor-authority model: delivery → flush → transient failure → crash/restart; `DropFailedBatch` and `ResumeFromMemApplied` mutations pin both pre-fix bug classes |
 | `tests/model_resync_order.rs` | Stateright resync ack-barrier model: proves synthetic deletes strictly precede re-list puts; `NoAckBarrier` mutation reaches lost-recreate divergence |
 | `tests/model_live_watch.rs` | Stateright floor-guard model: guarded variant proves the fold always converges to the truth, repaired by the key-listing diff or (evicting bucket) the artifact restore; unguarded variant pins permanent silent divergence; mutations: relist on an evicting bucket, restore without `restore_allowed` |
-| `tests/common/mod.rs`      | Shared test helpers: ephemeral NATS server, MinIO harness, `ManifestPutCrash` transport injection |
+| `tests/common/`            | Shared test helpers: `nats.rs` (ephemeral NATS server, also the crate's own unit tests' via `#[path]`), `minio.rs` (MinIO harness), `crash.rs` (`ManifestPutCrash` transport injection, `feature = "transport"`) |
 
 ## Configuration
 

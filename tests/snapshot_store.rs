@@ -192,6 +192,29 @@ fn check_for_each_in_range<S: SnapshotStore>(open: impl Fn(&Path) -> (WatchCurso
     assert_eq!(seen, 2, "scan stops at the first callback error");
 }
 
+/// `has_entries` is "the fold holds any live entry": false empty, true once a
+/// key lands, false again once every key is deleted or purged, and the same
+/// after a reopen.
+fn check_has_entries<S: SnapshotStore>(open: impl Fn(&Path) -> (WatchCursor, S)) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let (_resume, mut s) = open(&path);
+    assert!(!s.has_entries().unwrap(), "a new fold is empty");
+    fold(&mut s, &[put("a", b"1", 1), put("b", b"2", 2)]);
+    assert!(s.has_entries().unwrap());
+    fold(&mut s, &[del("a", 3)]);
+    assert!(s.has_entries().unwrap(), "one key left");
+    fold(&mut s, &[purge("b", 4)]);
+    assert!(!s.has_entries().unwrap(), "every key deleted or purged");
+    drop(s);
+    let (_resume, mut s) = open(&path);
+    assert!(!s.has_entries().unwrap(), "still empty after a reopen");
+    fold(&mut s, &[put("c", b"3", 5)]);
+    drop(s);
+    let (_resume, s) = open(&path);
+    assert!(s.has_entries().unwrap(), "an entry survives a reopen");
+}
+
 /// Cursor-resume after a reconnect: fold a first segment, reopen (cursor reflects
 /// it), fold the post-cursor delta, reopen again (cursor advanced). Models a
 /// service restarting and resuming the watch from the persisted position.
@@ -714,6 +737,11 @@ fn append_log_for_each_in_range() {
 }
 
 #[test]
+fn append_log_has_entries() {
+    check_has_entries(open_append_log);
+}
+
+#[test]
 fn append_log_cursor_resume() {
     check_cursor_resume(open_append_log);
 }
@@ -865,6 +893,11 @@ mod fjall_backend {
     #[test]
     fn fjall_for_each_in_range() {
         check_for_each_in_range(open_no_sync);
+    }
+
+    #[test]
+    fn fjall_has_entries() {
+        check_has_entries(open_no_sync);
     }
 
     #[test]
@@ -1083,6 +1116,11 @@ mod rocksdb_backend {
     #[test]
     fn rocksdb_for_each_in_range() {
         check_for_each_in_range(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_has_entries() {
+        check_has_entries(open_no_sync);
     }
 
     #[test]

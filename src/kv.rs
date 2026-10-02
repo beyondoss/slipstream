@@ -41,6 +41,15 @@ impl WatchCursor {
     pub(crate) fn version(&self) -> &VersionToken {
         &self.0
     }
+
+    /// The cursor's position for ordering — the artifact pointer swap, the
+    /// restore guard: its u64 revision, or 0 when it has none. Those
+    /// protocols need a backend with u64 positions; a revisionless cursor
+    /// ranks lowest, so it never supersedes a real one and is never "ahead".
+    /// The ONE place cursors are ranked.
+    pub(crate) fn rank(&self) -> u64 {
+        self.as_u64().unwrap_or(0)
+    }
 }
 
 /// Error type for KV operations.

@@ -45,7 +45,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
-use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
+use crate::kv::{KvEntry, KvUpdate, Retention, VersionToken, WatchCursor};
+use crate::protocol::{RepairMode, RepairPlan, listing_is_truth, plan_repair};
 
 const MAGIC: &[u8; 4] = b"PGSS";
 // v2: Put/Delete records store the version as length-prefixed raw bytes instead
@@ -104,27 +105,39 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Keys present in this snapshot but absent from a fresh scan result.
+    /// Keys present in this snapshot but absent from a fresh scan result:
+    /// after a cursor-expired fallback to a full `watch_all()`, the keys to
+    /// delete, because the re-list can't deliver deletes whose markers were
+    /// evicted with the cursor.
     ///
-    /// After a cursor-expired fallback to full `watch_all()`, callers should
-    /// compare the snapshot against the live key set and emit synthetic
-    /// `Delete` events for stale keys to ensure convergence.
-    ///
-    /// Only on a bucket that never evicts current values (`discard: new`, no
-    /// `max_age`). Where retention evicts current values, a key absent from
-    /// the scan may simply have aged out, and deleting it loses data; repair
-    /// from an exported artifact instead
-    /// ([`ExpiryRepair`](crate::ExpiryRepair)).
-    pub fn stale_keys<'a, I>(&'a self, current_keys: I) -> Vec<&'a str>
+    /// `retention` is the bucket's ([`KvWatcher::retention`](crate::KvWatcher::retention)).
+    /// Returns `None` when it says the scan isn't the truth — retention evicts
+    /// current values and has evicted some — because a key absent from the
+    /// scan may then have merely aged out, and deleting it loses data; repair
+    /// from an exported artifact instead ([`ExpiryRepair`](crate::ExpiryRepair)).
+    /// With `retention` unknown (`None`), the caller vouches that it doesn't
+    /// evict current values. The same rule, from the same planner, as
+    /// `ExpiryRepair::Relist`.
+    pub fn stale_keys<'a, I>(
+        &'a self,
+        current_keys: I,
+        retention: Option<Retention>,
+    ) -> Option<Vec<&'a str>>
     where
         I: IntoIterator<Item = &'a str>,
     {
+        let truth = retention.map(|r| listing_is_truth(r.evicts_current_values, r.first_revision));
+        if plan_repair(RepairMode::Relist, truth) == RepairPlan::RefuseRelist {
+            return None;
+        }
         let current: HashSet<&str> = current_keys.into_iter().collect();
-        self.entries
-            .keys()
-            .filter(|k| !current.contains(k.as_str()))
-            .map(|k| k.as_str())
-            .collect()
+        Some(
+            self.entries
+                .keys()
+                .filter(|k| !current.contains(k.as_str()))
+                .map(|k| k.as_str())
+                .collect(),
+        )
     }
 }
 
@@ -409,6 +422,13 @@ pub trait SnapshotStore: Sized + Send {
         Ok(())
     }
 
+    /// Does the fold hold any entry? The default reads the whole fold through
+    /// [`range`](Self::range); a backend whose fold can be large should
+    /// override it to read at most one entry.
+    fn has_entries(&self) -> Result<bool, SnapshotError> {
+        Ok(!self.range("")?.is_empty())
+    }
+
     /// The most recently applied (and durably persisted) resume cursor —
     /// [`WatchCursor::none`] when nothing has been applied.
     fn cursor(&self) -> WatchCursor;
@@ -604,6 +624,10 @@ impl SnapshotStore for AppendLogSnapshot {
             .collect();
         out.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    fn has_entries(&self) -> Result<bool, SnapshotError> {
+        Ok(!self.entries.is_empty())
     }
 
     fn cursor(&self) -> WatchCursor {
@@ -1611,18 +1635,52 @@ mod tests {
         let snap = load(&path).unwrap().unwrap();
 
         // Simulate a fresh scan that only has "node.a" and "node.c"
-        let mut stale = snap.stale_keys(["node.a", "node.c"]);
+        let mut stale = snap.stale_keys(["node.a", "node.c"], None).unwrap();
         stale.sort();
         assert_eq!(stale, vec!["node.b"]);
 
         // All keys present → no stale
-        let stale = snap.stale_keys(["node.a", "node.b", "node.c"]);
+        let stale = snap
+            .stale_keys(["node.a", "node.b", "node.c"], None)
+            .unwrap();
         assert!(stale.is_empty());
 
         // No keys present → all stale
-        let mut stale: Vec<&str> = snap.stale_keys(std::iter::empty::<&str>());
+        let mut stale: Vec<&str> = snap.stale_keys(std::iter::empty::<&str>(), None).unwrap();
         stale.sort();
         assert_eq!(stale, vec!["node.a", "node.b", "node.c"]);
+    }
+
+    /// Where retention evicts current values and has evicted some, the scan
+    /// isn't the truth: no stale set, rather than one that deletes keys that
+    /// merely aged out.
+    #[test]
+    fn stale_keys_refuses_a_scan_that_isnt_the_truth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.snap");
+        let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        w.write_update(&put("node.a", b"v1", 1)).unwrap();
+        w.checkpoint(&cursor(1)).unwrap();
+        drop(w);
+        let snap = load(&path).unwrap().unwrap();
+        let retention = |evicts, first| {
+            Some(Retention {
+                evicts_current_values: evicts,
+                first_revision: first,
+            })
+        };
+
+        assert_eq!(snap.stale_keys([], retention(true, 5)), None, "evicted");
+        assert_eq!(
+            snap.stale_keys([], retention(true, 1)),
+            Some(vec!["node.a"]),
+            "evicting retention that has evicted nothing yet"
+        );
+        assert_eq!(
+            snap.stale_keys([], retention(false, 5)),
+            Some(vec!["node.a"]),
+            "keeps current values"
+        );
     }
 
     #[test]

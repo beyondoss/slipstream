@@ -48,7 +48,10 @@
 //! discharged by `tests/model_fleet.rs`); a full re-list is not overrun by
 //! retention before it delivers what it found (axiom 6 of `tests/model.rs`).
 
-use slipstream::protocol::{restore_allowed, resume_window_ok};
+use slipstream::protocol::{
+    KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
+    plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok,
+};
 use stateright::{Checker, Model, Property};
 
 /// Capacity of the revision array (bounds are per model: `max_rev`).
@@ -207,6 +210,8 @@ enum Mutation {
 #[derive(Clone)]
 struct RepairModel {
     evicting: bool,
+    /// The repair armed (`ExpiryRepair`'s mode).
+    mode: RepairMode,
     fresh: bool,
     mutation: Mutation,
     /// Let retention evict during a key-listing repair (see `actions`).
@@ -239,10 +244,13 @@ impl RepairModel {
         }
     }
 
-    /// `listing_is_truth` in `applied.rs`: retention never evicts current
-    /// values, or has never evicted anything yet.
-    fn listing_is_truth(s: &St) -> bool {
-        resume_window_ok(0, Self::first_revision(s))
+    /// The listing as the planner sees it: the shared kernel on the bucket's
+    /// retention. `RelistOnEvicting` forges it as the truth.
+    fn listing_truth(&self, s: &St) -> Option<bool> {
+        if self.mutation == Mutation::RelistOnEvicting {
+            return Some(true);
+        }
+        Some(listing_is_truth(self.evicting, Self::first_revision(s)))
     }
 
     fn listed(s: &St) -> Option<u8> {
@@ -371,33 +379,30 @@ impl RepairModel {
         }
     }
 
-    /// `restore_diff` on the key: the artifact at `target` holds the truth
-    /// there. Take it unless the store's value is the same or NEWER; delete
-    /// (the artifact lacks the key) unless the listing shows it live.
+    /// `restore_diff` on the key, through the shared kernel: the artifact at
+    /// `target` holds the truth there. `RestoreIgnoresVersions` forges both
+    /// sides revisionless (the pre-fix diff: take anything not identical);
+    /// `RestoreIgnoresListing` forges the key unlisted.
     fn restore_op(&self, s: &St, target: u8, listed: Option<u8>) -> Option<Upd> {
         let want = Self::truth_at(s, target);
-        match (s.store_val, want) {
-            (Some(l), Some(a)) if l >= a && self.mutation != Mutation::RestoreIgnoresVersions => {
-                None
-            }
-            (_, Some(a)) if s.store_val != Some(a) => Some(Upd {
+        let versions = self.mutation != Mutation::RestoreIgnoresVersions;
+        let state = |v: Option<u8>| match v {
+            Some(r) => KeyState::At(versions.then_some(r as u64)),
+            None => KeyState::Absent,
+        };
+        let listed_live = listed.is_some() && self.mutation != Mutation::RestoreIgnoresListing;
+        let identical = s.store_val.is_some() && s.store_val == want;
+        match restore_key(state(s.store_val), state(want), identical, listed_live) {
+            KeyRestore::Keep => None,
+            KeyRestore::TakeArtifact => Some(Upd {
                 pos: None,
-                value: Some(a),
+                value: want,
             }),
-            (Some(_), None)
-                if listed.is_none() || self.mutation == Mutation::RestoreIgnoresListing =>
-            {
-                Some(Upd {
-                    pos: None,
-                    value: None,
-                })
-            }
-            _ => None,
+            KeyRestore::Delete => Some(Upd {
+                pos: None,
+                value: None,
+            }),
         }
-    }
-
-    fn restores(&self) -> bool {
-        self.evicting && self.mutation != Mutation::RelistOnEvicting
     }
 
     /// Resume from cursor `c` (> 0): the window check.
@@ -587,14 +592,13 @@ impl Model for RepairModel {
             Act::Publish(c) => s.pointer = c,
             Act::WStart => {
                 s.w = if s.store_cur == 0 {
-                    if s.store_val.is_some() && self.mutation != Mutation::UnanchoredRelist {
-                        // Data but no cursor (a torn first checkpoint): a
-                        // re-list alone never removes what it doesn't
-                        // deliver — repair like an expiry at 0.
-                        WPhase::Expired { local: 0 }
-                    } else if self.restores() && !Self::listing_is_truth(&s) {
-                        // Empty fold, bucket already evicted current values:
-                        // seed from an artifact.
+                    // Data but no cursor (a torn first checkpoint), or an
+                    // empty fold on a bucket that already evicted current
+                    // values: repair like an expiry at 0. `UnanchoredRelist`
+                    // forges the fold empty.
+                    let has_data =
+                        s.store_val.is_some() && self.mutation != Mutation::UnanchoredRelist;
+                    if cursorless_start_needs_repair(self.mode, has_data, self.listing_truth(&s)) {
                         WPhase::Expired { local: 0 }
                     } else {
                         WPhase::Watch {
@@ -626,31 +630,41 @@ impl Model for RepairModel {
                 let WPhase::Expired { local } = s.w else {
                     return None;
                 };
-                if self.restores() && !Self::listing_is_truth(&s) {
-                    // Peek + fetch collapsed onto the CURRENT pointer (the
-                    // code re-checks what it fetched against now).
-                    let target = s.pointer;
-                    if self.restore_ok(&s, target, local) && target > 0 {
-                        s.req = Some(Req::Restore {
-                            target,
+                match plan_repair(self.mode, self.listing_truth(&s)) {
+                    RepairPlan::Restore => {
+                        // Peek + fetch collapsed onto the CURRENT pointer
+                        // (the code re-checks what it fetched against now).
+                        let target = s.pointer;
+                        if self.restore_ok(&s, target, local) && target > 0 {
+                            s.req = Some(Req::Restore {
+                                target,
+                                listed: Self::listed(&s),
+                            });
+                            s.w = WPhase::AwaitReply;
+                        } else {
+                            s.w = WPhase::Failed;
+                        }
+                    }
+                    RepairPlan::Relist => {
+                        s.req = Some(Req::Relist {
                             listed: Self::listed(&s),
                         });
-                        s.w = WPhase::AwaitReply;
-                    } else {
-                        s.w = WPhase::Failed;
+                        s.w = if self.mutation == Mutation::NoAckBarrier {
+                            WPhase::Watch {
+                                f: 0,
+                                guarded: false,
+                            }
+                        } else {
+                            WPhase::AwaitAck
+                        };
                     }
-                } else {
-                    s.req = Some(Req::Relist {
-                        listed: Self::listed(&s),
-                    });
-                    s.w = if self.mutation == Mutation::NoAckBarrier {
-                        WPhase::Watch {
+                    RepairPlan::RefuseRelist => s.w = WPhase::Failed,
+                    RepairPlan::ReListOnly => {
+                        s.w = WPhase::Watch {
                             f: 0,
                             guarded: false,
                         }
-                    } else {
-                        WPhase::AwaitAck
-                    };
+                    }
                 }
             }
             Act::WGotReply => {
@@ -716,7 +730,9 @@ impl Model for RepairModel {
                 }
                 MPhase::PreFlush(Req::Restore { target, listed }, _) => {
                     // The authoritative ahead check.
-                    if self.mutation != Mutation::NoRestoreGuard && target <= s.applied {
+                    if self.mutation != Mutation::NoRestoreGuard
+                        && !restore_ahead(target as u64, s.applied as u64)
+                    {
                         s.reply = Some(Reply::Refused);
                         s.m = MPhase::Idle;
                     } else if self.mutation == Mutation::CursorBeforeDiff {
@@ -792,7 +808,7 @@ impl Model for RepairModel {
         if self.mutation == Mutation::None {
             // The theorems are earned: the repairs run, the hazards they
             // guard against occur.
-            if self.restores() {
+            if self.evicting {
                 props.push(Property::<Self>::sometimes(
                     "a restore completes past an evicted current value",
                     |_, s| s.restored && s.evicted && RepairModel::truth(s).is_some(),
@@ -826,9 +842,16 @@ fn run(model: RepairModel, label: &str) -> impl Checker<RepairModel> {
     checker
 }
 
+/// The shipped configuration: `ExpiryRepair::Auto` on an evicting bucket,
+/// `ExpiryRepair::Relist` on one that keeps current values.
 fn shipped(evicting: bool, fresh: bool) -> RepairModel {
     RepairModel {
         evicting,
+        mode: if evicting {
+            RepairMode::Auto
+        } else {
+            RepairMode::Relist
+        },
         fresh,
         mutation: Mutation::None,
         drop_axiom_6: false,
@@ -841,6 +864,14 @@ fn shipped(evicting: bool, fresh: bool) -> RepairModel {
 #[test]
 fn keeps_current_repair_steps_are_correct() {
     run(shipped(false, false), "repair steps: keeps-current").assert_properties();
+    run(
+        RepairModel {
+            mode: RepairMode::Auto,
+            ..shipped(false, false)
+        },
+        "repair steps: keeps-current, Auto",
+    )
+    .assert_properties();
 }
 
 #[test]

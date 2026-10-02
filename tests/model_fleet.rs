@@ -33,7 +33,8 @@
 //! each poisons the fleet's artifacts.
 
 use slipstream::protocol::{
-    PointerState, pointer_publish_allowed, restore_allowed, resume_window_ok,
+    PointerState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
+    plan_repair, pointer_publish_allowed, restore_allowed, resume_window_ok,
 };
 use stateright::{Checker, Model, Property};
 
@@ -109,16 +110,26 @@ impl Fleet {
             s.head as u64
         }
     }
-    fn listing_is_truth(s: &St) -> bool {
-        resume_window_ok(0, Self::first_revision(s))
-    }
     fn listed(s: &St) -> Option<u8> {
         if s.evicted { None } else { Self::truth(s) }
     }
-    /// The repair a node would take: the artifact restore, or the
-    /// key-listing diff (shipped: `ExpiryRepair::Auto`).
+    /// The listing as the planner sees it: the shared kernel on the bucket's
+    /// retention. `RelistOnEvicting` forges it as the truth.
+    fn listing_truth(&self, s: &St) -> Option<bool> {
+        if self.mutation == Mutation::RelistOnEvicting {
+            return Some(true);
+        }
+        Some(listing_is_truth(self.evicting, Self::first_revision(s)))
+    }
+    /// Does an expired node repair by the artifact restore (else the
+    /// key-listing diff)? The shared planner, under the shipped
+    /// `ExpiryRepair::Auto`.
     fn restores(&self, s: &St) -> bool {
-        self.evicting && self.mutation != Mutation::RelistOnEvicting && !Self::listing_is_truth(s)
+        match plan_repair(RepairMode::Auto, self.listing_truth(s)) {
+            RepairPlan::Restore => true,
+            RepairPlan::Relist => false,
+            plan => unreachable!("Auto never plans {plan:?}"),
+        }
     }
     fn restore_target(s: &St, n: &Node) -> Option<(u8, Option<u8>)> {
         let (c, v) = s.pointer?;
@@ -212,7 +223,14 @@ impl Model for Fleet {
             }
             Act::Evict => s.evicted = true,
             Act::Start(i) => {
-                let relist = self.mutation == Mutation::FreshStartRelist || !self.restores(&s);
+                // The shared start kernel on an empty fold. `FreshStartRelist`
+                // forges the listing as the truth.
+                let truth = if self.mutation == Mutation::FreshStartRelist {
+                    Some(true)
+                } else {
+                    self.listing_truth(&s)
+                };
+                let relist = !cursorless_start_needs_repair(RepairMode::Auto, false, truth);
                 let (listed, head) = (Fleet::listed(&s), s.head);
                 let n = &mut s.nodes[i];
                 n.fresh = false;

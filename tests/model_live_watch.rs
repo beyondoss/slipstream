@@ -69,7 +69,9 @@
 //!   bootstrapped fold). `Publish` may lag arbitrarily — a stale pointer is
 //!   exactly what the restore guard must refuse.
 
-use slipstream::protocol::{restore_allowed, resume_window_ok};
+use slipstream::protocol::{
+    RepairMode, RepairPlan, listing_is_truth, plan_repair, restore_allowed, resume_window_ok,
+};
 use stateright::{Checker, Model, Property};
 
 /// Stream revisions run 1..=MAX_REV.
@@ -179,9 +181,29 @@ impl LiveWatch {
         Self::truth(s).filter(|_| !s.aged)
     }
 
-    fn restores(&self) -> bool {
+    /// Publishing only matters where a repair could restore (a state-space
+    /// cut, not a decision: the planner below decides).
+    fn artifacts_matter(&self) -> bool {
         self.retention == BucketRetention::EvictsCurrent
             && self.mutation != Mutation::RelistOnEvicting
+    }
+
+    /// Does a trip repair by the artifact restore (else the key-listing
+    /// diff)? The shared planner under the shipped `ExpiryRepair::Auto`, on
+    /// the listing as the kernel reads the bucket's retention (first
+    /// retained revision `floor + 1`). `RelistOnEvicting` forges the listing
+    /// as the truth.
+    fn restores(&self, s: &St) -> bool {
+        let truth = self.mutation == Mutation::RelistOnEvicting
+            || listing_is_truth(
+                self.retention == BucketRetention::EvictsCurrent,
+                s.floor as u64 + 1,
+            );
+        match plan_repair(RepairMode::Auto, Some(truth)) {
+            RepairPlan::Restore => true,
+            RepairPlan::Relist => false,
+            plan => unreachable!("Auto never plans {plan:?}"),
+        }
     }
 
     /// The restore this repair may take from the current pointer, if any.
@@ -234,7 +256,7 @@ impl Model for LiveWatch {
             acts.push(Act::Compact);
         }
         // Artifacts only matter where a restore can use them.
-        if self.restores() {
+        if self.artifacts_matter() {
             for c in s.pointer.map_or(1, |p| p + 1)..=s.head {
                 acts.push(Act::Publish(c));
             }
@@ -260,7 +282,7 @@ impl Model for LiveWatch {
         // fail-stop until the fleet publishes one.
         if self.guarded
             && !resume_window_ok(s.frontier as u64, s.floor as u64 + 1)
-            && (!self.restores() || self.restore_target(s).is_some())
+            && (!self.restores(s) || self.restore_target(s).is_some())
         {
             acts.push(Act::GuardRepair);
         }
@@ -301,7 +323,7 @@ impl Model for LiveWatch {
             Act::GuardRepair => {
                 s.tripped = true;
                 let before = s.frontier;
-                if self.restores() {
+                if self.restores(&s) {
                     // Artifact restore: the fold becomes the artifact's,
                     // consumption resumes from its cursor.
                     let p = self.restore_target(&s)?;
@@ -365,7 +387,7 @@ impl Model for LiveWatch {
                 "the floor guard trips and repairs a real divergence",
                 |_, s| s.tripped && s.fold_key == LiveWatch::truth(s),
             ));
-            if self.restores() {
+            if self.artifacts_matter() {
                 props.push(Property::<Self>::sometimes(
                     "a trip restores from an artifact past a value that aged out",
                     |_, s| s.restored && s.aged && s.fold_key == LiveWatch::truth(s),
