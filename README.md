@@ -40,15 +40,15 @@ For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold stat
 
 ```toml
 [dependencies]
-beyond-slipstream = "0.7"
+beyond-slipstream = "0.8"
 ```
 
 On-disk snapshot backends are opt-in cargo features:
 
 ```toml
-beyond-slipstream = { version = "0.7", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
-beyond-slipstream = { version = "0.7", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
-beyond-slipstream = { version = "0.7", features = ["transport"] } # export/import via object_store (S3, GCS, local)
+beyond-slipstream = { version = "0.8", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
+beyond-slipstream = { version = "0.8", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
+beyond-slipstream = { version = "0.8", features = ["transport"] } # export/import via object_store (S3, GCS, local)
 ```
 
 ## Concepts
