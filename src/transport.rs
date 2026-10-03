@@ -858,7 +858,9 @@ impl<S: Send + 'static> RestoreSource<S> for ArtifactRestore<S> {
         })
         .await
         .map_err(|e| SnapshotError::Backend(format!("restore import task panicked: {e}")))??;
-        Ok(RestoredFold::new(manifest, fold).holding(tmp))
+        Ok(RestoredFold::new(manifest, fold)
+            .scratch_in(tmp.path())
+            .holding(tmp))
     }
 }
 

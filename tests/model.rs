@@ -779,6 +779,7 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                         || listing_is_truth(
                             self.retention == BucketRetention::EvictsCurrent,
                             s.floor as u64 + 1,
+                            false,
                         );
                     s.importer = match plan_repair(mode, Some(truth)) {
                         RepairPlan::ReListOnly => {

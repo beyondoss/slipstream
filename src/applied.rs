@@ -434,6 +434,8 @@ pub(crate) struct Fold<U, S, P, A, O> {
     store_fail_streak: u32,
     // A batch opened since the last flush (the window timer is armed).
     open: bool,
+    // `applied` gained the eviction memo and the store doesn't have it yet.
+    memo_dirty: bool,
 }
 
 impl<U, S, P, A, O> Fold<U, S, P, A, O>
@@ -467,6 +469,7 @@ where
             applied,
             store_fail_streak: 0,
             open: false,
+            memo_dirty: false,
         }
     }
 
@@ -528,7 +531,11 @@ where
         // Nothing received since the last flush → nothing to do at all.
         // (`raw` can be non-empty with no cursor advance only via a repair's
         // corrections, or a re-queued batch.)
-        if self.batch.is_empty() && self.raw.is_empty() && self.batch_high.is_none() {
+        if self.batch.is_empty()
+            && self.raw.is_empty()
+            && self.batch_high.is_none()
+            && !self.memo_dirty
+        {
             return Ok(());
         }
         if !self.batch.is_empty() {
@@ -546,13 +553,16 @@ where
         }
         let advanced = !self.batch_high.is_none();
         if advanced {
-            self.applied = self.batch_high.clone();
+            // The eviction memo never clears: a stream position doesn't carry
+            // it, so it rides over from the cursor it replaces.
+            let seen = self.applied.seen_evicting();
+            self.applied = self.batch_high.clone().remembering(seen);
         }
         // A cursor-only advance (nothing raw to fold) still commits to the
         // store: a restore's final step moves the cursor to the artifact's
         // with no updates left. In the steady state every advance carries raw
         // updates, so this changes nothing there.
-        if (!self.raw.is_empty() || advanced)
+        if (!self.raw.is_empty() || advanced || self.memo_dirty)
             && let Some(mut st) = self.store.take()
         {
             let raw = std::mem::take(&mut self.raw);
@@ -579,6 +589,7 @@ where
                 Ok((st, _raw, Ok(()))) => {
                     self.store = Some(st);
                     self.store_fail_streak = 0;
+                    self.memo_dirty = false;
                 }
                 Ok((st, raw, Err(e))) => {
                     self.store_fail_streak += 1;
@@ -616,6 +627,19 @@ where
             self.batch_high = WatchCursor::none();
         }
         Ok(())
+    }
+
+    /// Remember, durably, that the bucket's retention evicts current values:
+    /// from now on every cursor this fold commits carries the memo, and so
+    /// does every artifact exported from it. Commits at once, even with
+    /// nothing else to fold.
+    pub(crate) async fn remember_evicting(&mut self) -> Result<(), KvError> {
+        if self.applied.seen_evicting() {
+            return Ok(());
+        }
+        self.applied = self.applied.clone().remembering(true);
+        self.memo_dirty = self.store.is_some();
+        self.flush().await
     }
 
     /// Flush until the store holds every update received: a transient store
@@ -2562,11 +2586,12 @@ mod tests {
             run.seen,
             vec![
                 ("node.changed".into(), false),
-                ("node.gone".into(), true),
                 ("node.late".into(), false),
+                ("node.gone".into(), true),
                 ("node.tail".into(), false),
             ],
-            "the diff (key order), then the delta from the artifact's cursor"
+            "the diff (rewrites in key order, then deletes), then the delta from the \
+             artifact's cursor"
         );
         assert_eq!(
             run.cursors,

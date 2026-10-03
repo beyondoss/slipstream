@@ -119,7 +119,11 @@ impl Fleet {
         if self.mutation == Mutation::RelistOnEvicting {
             return Some(true);
         }
-        Some(listing_is_truth(self.evicting, Self::first_revision(s)))
+        Some(listing_is_truth(
+            self.evicting,
+            Self::first_revision(s),
+            false,
+        ))
     }
     /// Does an expired node repair by the artifact restore (else the
     /// key-listing diff)? The shared planner, under the shipped

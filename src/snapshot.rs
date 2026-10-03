@@ -45,8 +45,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
-use crate::kv::{KvEntry, KvUpdate, Retention, VersionToken, WatchCursor};
-use crate::protocol::{RepairMode, RepairPlan, listing_is_truth, plan_repair};
+use crate::kv::{KvEntry, KvUpdate, MAX_CURSOR_BYTES, Retention, VersionToken, WatchCursor};
+use crate::protocol::{RepairMode, RepairPlan, listing_truth, plan_repair};
 
 const MAGIC: &[u8; 4] = b"PGSS";
 // v2: Put/Delete records store the version as length-prefixed raw bytes instead
@@ -126,7 +126,7 @@ impl Snapshot {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let truth = retention.map(|r| listing_is_truth(r.evicts_current_values, r.first_revision));
+        let truth = listing_truth(retention, self.cursor.seen_evicting());
         if plan_repair(RepairMode::Relist, truth) == RepairPlan::RefuseRelist {
             return None;
         }
@@ -953,12 +953,11 @@ fn parse_cursor(data: &[u8], stored_crc: u32) -> Result<(Record<'_>, usize), Rec
         return Err(RecordError::Truncated);
     }
     let cursor_len = data[5] as usize;
-    // A version token holds at most 10 bytes inline. A larger length means a
-    // corrupt or incompatible record — reject it rather than letting it reach
-    // `VersionToken::from_raw`, which would panic.
-    if cursor_len > 10 {
+    // No cursor encoding is longer than this. A larger length means a corrupt
+    // or incompatible record — reject it before framing on it.
+    if cursor_len > MAX_CURSOR_BYTES {
         return Err(RecordError::Invalid(format!(
-            "cursor length {cursor_len} exceeds max version token size (10)"
+            "cursor length {cursor_len} exceeds the longest cursor encoding ({MAX_CURSOR_BYTES})"
         )));
     }
     let total = 6 + cursor_len;
@@ -972,15 +971,13 @@ fn parse_cursor(data: &[u8], stored_crc: u32) -> Result<(Record<'_>, usize), Rec
         return Err(RecordError::CrcMismatch { consumed: total });
     }
 
-    // The `cursor_len > 10` check above bounds this to the inline capacity, so
-    // `from_raw` always returns `Some` here; the guard makes that explicit.
-    let version = VersionToken::from_raw(&data[6..total]).ok_or_else(|| {
+    let cursor = WatchCursor::from_bytes(&data[6..total]).ok_or_else(|| {
         RecordError::Invalid(format!(
-            "cursor length {cursor_len} exceeds max version token size (10)"
+            "cursor record ({cursor_len} bytes) is not a cursor this build can read"
         ))
     })?;
 
-    Ok((Record::Cursor(WatchCursor::from_version(version)), total))
+    Ok((Record::Cursor(cursor), total))
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1090,7 @@ fn write_delete_record(
 }
 
 fn write_cursor_record(w: &mut impl Write, cursor: &WatchCursor) -> Result<usize, SnapshotError> {
-    let cb = cursor.version().as_bytes();
+    let cb = &cursor.to_bytes()[..];
     // The record encodes the cursor length as a single byte. `VersionToken`
     // caps inline storage at 10 bytes, so this never trips today — but checking
     // here rather than casting means a future backend that widens the token
@@ -1165,7 +1162,7 @@ fn compact_to_file(
         + if cursor.is_none() {
             0
         } else {
-            4 + 1 + 1 + cursor.version().as_bytes().len()
+            4 + 1 + 1 + cursor.to_bytes().len()
         };
     let capacity = estimated.clamp(8 * 1024, 1024 * 1024);
     let mut buf = io::BufWriter::with_capacity(capacity, tempfile::NamedTempFile::new_in(dir)?);

@@ -72,9 +72,9 @@ struct Upd {
 enum Req {
     /// Key-listing diff; what the listing showed for the key.
     Relist { listed: Option<u8> },
-    /// Artifact restore to this cursor, with what the live-key listing (taken
-    /// after the fetch) showed for the key.
-    Restore { target: u8, listed: Option<u8> },
+    /// Artifact restore to this cursor. The main loop lists the live keys
+    /// itself, after the diff and before folding it (`repair::restore`).
+    Restore { target: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -205,6 +205,15 @@ enum Mutation {
     RestoreIgnoresVersions,
     /// The restore deletes keys the bucket lists live (the pre-fix diff).
     RestoreIgnoresListing,
+    /// The restore trusts its live-key listing without re-checking, after
+    /// taking it, that the log still holds everything past the artifact's
+    /// cursor: a write after the cursor that aged out first is unlisted, and
+    /// deleted.
+    NoListingRecheck,
+    /// The fold forgets that it saw retention evict current values: once the
+    /// operator turns eviction off (`config_forgot`), the planner trusts the
+    /// listing again, and the key-listing diff deletes a key that aged out.
+    NoEvictionMemo,
 }
 
 #[derive(Clone)]
@@ -216,6 +225,11 @@ struct RepairModel {
     mutation: Mutation,
     /// Let retention evict during a key-listing repair (see `actions`).
     drop_axiom_6: bool,
+    /// The bucket evicts (`evicting`), but its config no longer says so: the
+    /// operator turned `max_age` / `discard: old` off after the fold saw it
+    /// evict. The memo axiom: a fold reads retention while eviction is in
+    /// force, so it has seen any eviction that happened.
+    config_forgot: bool,
     /// The key's revisions run 1..=max_rev (revision 1 is its creation).
     max_rev: u8,
     /// Crash budget (process deaths, including store-apply crashes).
@@ -250,7 +264,9 @@ impl RepairModel {
         if self.mutation == Mutation::RelistOnEvicting {
             return Some(true);
         }
-        Some(listing_is_truth(self.evicting, Self::first_revision(s)))
+        let reported = self.evicting && !self.config_forgot;
+        let seen = self.evicting && s.evicted && self.mutation != Mutation::NoEvictionMemo;
+        Some(listing_is_truth(reported, Self::first_revision(s), seen))
     }
 
     fn listed(s: &St) -> Option<u8> {
@@ -636,10 +652,7 @@ impl Model for RepairModel {
                         // (the code re-checks what it fetched against now).
                         let target = s.pointer;
                         if self.restore_ok(&s, target, local) && target > 0 {
-                            s.req = Some(Req::Restore {
-                                target,
-                                listed: Self::listed(&s),
-                            });
+                            s.req = Some(Req::Restore { target });
                             s.w = WPhase::AwaitReply;
                         } else {
                             s.w = WPhase::Failed;
@@ -728,18 +741,28 @@ impl Model for RepairModel {
                     s.relisted = true;
                     s.m = MPhase::RelistFlush(false);
                 }
-                MPhase::PreFlush(Req::Restore { target, listed }, _) => {
+                MPhase::PreFlush(Req::Restore { target }, _) => {
                     // The authoritative ahead check.
                     if self.mutation != Mutation::NoRestoreGuard
                         && !restore_ahead(target as u64, s.applied as u64)
                     {
                         s.reply = Some(Reply::Refused);
                         s.m = MPhase::Idle;
+                    } else if !matches!(
+                        self.mutation,
+                        Mutation::NoListingRecheck | Mutation::NoRestoreGuard
+                    ) && !resume_window_ok(target as u64, Self::first_revision(&s))
+                    {
+                        // The listing (taken here) can only be trusted for
+                        // writes after the artifact's cursor while the log
+                        // still holds all of them.
+                        s.reply = Some(Reply::Refused);
+                        s.m = MPhase::Idle;
                     } else if self.mutation == Mutation::CursorBeforeDiff {
                         s.batch_high = Some(target);
                         s.m = MPhase::RestoreCommit(target, false);
                     } else {
-                        if let Some(u) = self.restore_op(&s, target, listed) {
+                        if let Some(u) = self.restore_op(&s, target, Self::listed(&s)) {
                             s.batch.push(u);
                             s.raw.push(u);
                         }
@@ -855,6 +878,7 @@ fn shipped(evicting: bool, fresh: bool) -> RepairModel {
         fresh,
         mutation: Mutation::None,
         drop_axiom_6: false,
+        config_forgot: false,
         max_rev: 4,
         max_crashes: 1,
         max_transient: 2,
@@ -879,6 +903,40 @@ fn evicting_repair_steps_are_correct() {
     run(shipped(true, false), "repair steps: evicting").assert_properties();
 }
 
+/// Eviction turned off after it dropped a key: the planner sees a config
+/// that keeps current values, but the fold remembers what it saw, so `Auto`
+/// still restores rather than diffing the listing.
+#[test]
+fn eviction_turned_off_repair_steps_are_correct() {
+    run(
+        RepairModel {
+            config_forgot: true,
+            ..shipped(true, false)
+        },
+        "repair steps: eviction turned off",
+    )
+    .assert_properties();
+}
+
+/// Without the memo, the same run deletes the key that aged out.
+#[test]
+fn eviction_memo_is_load_bearing() {
+    let checker = run(
+        RepairModel {
+            config_forgot: true,
+            mutation: Mutation::NoEvictionMemo,
+            ..shipped(true, false)
+        },
+        "repair steps: eviction turned off, no memo",
+    );
+    assert!(
+        checker
+            .discovery("a repair never deletes the key's current value")
+            .is_some(),
+        "the checker found no deleted aged-out key without the memo"
+    );
+}
+
 #[test]
 fn fresh_start_repair_steps_are_correct() {
     run(shipped(false, true), "repair steps: keeps-current, fresh").assert_properties();
@@ -901,6 +959,7 @@ fn every_repair_step_is_load_bearing() {
         (Mutation::UnanchoredRelist, false, true),
         (Mutation::RestoreIgnoresVersions, true, false),
         (Mutation::RestoreIgnoresListing, true, false),
+        (Mutation::NoListingRecheck, true, false),
     ];
     let names = [
         "while the store's cursor is resumable, the store plus the tail is the truth",
@@ -924,6 +983,8 @@ fn every_repair_step_is_load_bearing() {
                 Mutation::UnanchoredRelist => "unanchored fold re-listed blind",
                 Mutation::RestoreIgnoresVersions => "restore ignores versions",
                 Mutation::RestoreIgnoresListing => "restore ignores the live listing",
+                Mutation::NoListingRecheck => "restore trusts a listing taken after eviction",
+                Mutation::NoEvictionMemo => "no eviction memo",
             },
             if evicting {
                 "evicting"
