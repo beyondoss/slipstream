@@ -717,11 +717,6 @@ where
         self.open
     }
 
-    /// The store, between flushes.
-    pub(crate) fn store(&self) -> Option<&S> {
-        self.store.as_ref()
-    }
-
     /// Move the store out (to a blocking task); [`put_store`](Self::put_store)
     /// hands it back. A flush in between would skip the store fold.
     pub(crate) fn take_store(&mut self) -> Option<S> {
