@@ -298,9 +298,16 @@ fn classify_raw_create_response(payload: &[u8]) -> RawCreateOutcome {
         return RawCreateOutcome::AlreadyExists;
     }
 
-    // 400 "maximum number of streams reached" may also mean bucket exists
-    // (Synadia Cloud returns this when at stream limit but bucket exists)
-    if code == 400 && description.contains("maximum number of streams") {
+    // At the stream limit, the bucket may still exist (Synadia Cloud answers
+    // this way for a bucket it already has). 10027 is the server's
+    // JSMaximumStreamsLimitErr; the text is the fallback for replies without
+    // it. A false positive is harmless: StreamLimit re-checks the bucket.
+    if err_code == 10027
+        || (code == 400
+            && description
+                .to_ascii_lowercase()
+                .contains("maximum number of streams"))
+    {
         return RawCreateOutcome::StreamLimit;
     }
 
@@ -1852,6 +1859,19 @@ mod tests {
             classify_raw_create_response(payload),
             RawCreateOutcome::StreamLimit
         );
+    }
+
+    #[test]
+    fn raw_create_stream_limit_by_code_or_reworded_text() {
+        for payload in [
+            &br#"{"error":{"code":400,"err_code":10027,"description":"stream limit hit"}}"#[..],
+            br#"{"error":{"code":400,"description":"Maximum Number Of Streams reached"}}"#,
+        ] {
+            assert_eq!(
+                classify_raw_create_response(payload),
+                RawCreateOutcome::StreamLimit
+            );
+        }
     }
 
     #[test]

@@ -526,8 +526,8 @@ impl AppendLogSnapshot {
     /// manifest — checksums, backend identity, format generation — and the
     /// staged copy is loaded and its cursor compared against the manifest's
     /// before anything lands at `dest_path`; a bad artifact never becomes a
-    /// fold. A crash mid-import leaves nothing at `dest_path`; a crash after
-    /// the final rename leaves a valid fold (a retried import then refuses the
+    /// fold. A crash mid-import leaves nothing at `dest_path`; a crash or a
+    /// failed open after the final rename leaves a valid fold (a retried import then refuses the
     /// existing destination — just [`open`](Self::open) it).
     pub fn import(
         artifact_dir: &Path,
@@ -857,10 +857,8 @@ fn parse_put(data: &[u8], stored_crc: u32) -> Result<(Record<'_>, usize), Record
         data[vl_off + 3],
     ]) as usize;
     // Lengths are read before CRC. A bit-flipped value_len of 2e9 looks like
-    // EOF and used to silent-drop every later record. Cap far above any
-    // legitimate config value; a torn last record of a real-sized value is
-    // still Truncated below.
-    const MAX_VALUE_LEN: usize = 16 * 1024 * 1024;
+    // EOF and used to silent-drop every later record. A torn last record of a
+    // real-sized value is still Truncated below.
     if value_len > MAX_VALUE_LEN {
         return Err(RecordError::CrcMismatch {
             consumed: data.len().min(vl_off + 4),
@@ -984,6 +982,11 @@ fn parse_cursor(data: &[u8], stored_crc: u32) -> Result<(Record<'_>, usize), Rec
 // Internal: record writing (incremental CRC, no allocations)
 // ---------------------------------------------------------------------------
 
+/// Largest value a put record may carry. NATS caps a message payload at
+/// 64 MiB, so every value a watch can deliver fits. The same bound gates the
+/// writer and the reader.
+const MAX_VALUE_LEN: usize = 64 * 1024 * 1024;
+
 fn write_put_record(
     w: &mut impl Write,
     key: &str,
@@ -1004,13 +1007,15 @@ fn write_put_record(
             u16::MAX
         ))
     })?;
-    let value_len = u32::try_from(value.len()).map_err(|_| {
-        SnapshotError::InvalidFormat(format!(
-            "value too long: {} bytes (max {})",
-            value.len(),
-            u32::MAX
-        ))
-    })?;
+    // The reader treats a longer value as corruption, so writing one would
+    // leave a record no later `load` can get past.
+    if value.len() > MAX_VALUE_LEN {
+        return Err(SnapshotError::InvalidFormat(format!(
+            "value too long: {} bytes (max {MAX_VALUE_LEN})",
+            value.len()
+        )));
+    }
+    let value_len = value.len() as u32;
     // The version is stored as length-prefixed raw bytes so any backend's token
     // (NATS u64, FDB 10-byte versionstamp) round-trips intact. `VersionToken`
     // caps inline storage at 10 bytes, so this `u8` length never truncates today;
@@ -1242,6 +1247,30 @@ mod tests {
 
         assert_eq!(snap.entries["node.us-east-1"].value, b"val1");
         assert_eq!(snap.entries["node.eu-west-1"].value, b"val2");
+    }
+
+    /// The writer used to accept any u32 length while the reader called
+    /// anything over 16 MiB corruption: one large value bricked the fold.
+    #[test]
+    fn largest_value_round_trips_and_larger_is_refused_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.snap");
+
+        let (_, mut snap) = AppendLogSnapshot::load(&path).unwrap();
+        let big = vec![7u8; MAX_VALUE_LEN];
+        snap.apply(&[put("big", &big, 1)], &cursor(1)).unwrap();
+        let err = snap
+            .apply(&[put("huge", &vec![0u8; MAX_VALUE_LEN + 1], 2)], &cursor(2))
+            .unwrap_err();
+        assert!(matches!(err, SnapshotError::InvalidFormat(_)), "{err}");
+        snap.apply(&[put("after", b"x", 3)], &cursor(3)).unwrap();
+        drop(snap);
+
+        let (c, snap) = AppendLogSnapshot::load(&path).unwrap();
+        assert_eq!(c.as_u64(), Some(3));
+        assert_eq!(snap.get("big").unwrap().unwrap().value.len(), MAX_VALUE_LEN);
+        assert!(snap.get("huge").unwrap().is_none());
+        assert_eq!(snap.get("after").unwrap().unwrap().value, b"x");
     }
 
     #[test]
