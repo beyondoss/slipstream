@@ -70,8 +70,9 @@ struct Upd {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum Req {
-    /// Key-listing diff; what the listing showed for the key.
-    Relist { listed: Option<u8> },
+    /// Key-listing diff. The main loop lists the live keys itself, after the
+    /// pre-repair flush and before the diff (`repair::relist`).
+    Relist,
     /// Artifact restore to this cursor. The main loop lists the live keys
     /// itself, after the diff and before folding it (`repair::restore`).
     Restore { target: u8 },
@@ -495,11 +496,11 @@ impl Model for RepairModel {
         let relist_in_flight = !self.drop_axiom_6
             && (matches!(s.w, WPhase::Watch { f, guarded: false } if f < s.head)
                 || matches!(s.w, WPhase::AwaitAck)
-                || matches!(s.req, Some(Req::Relist { .. }))
+                || matches!(s.req, Some(Req::Relist))
                 || matches!(
                     s.m,
-                    MPhase::Drain(Req::Relist { .. })
-                        | MPhase::PreFlush(Req::Relist { .. }, _)
+                    MPhase::Drain(Req::Relist)
+                        | MPhase::PreFlush(Req::Relist, _)
                         | MPhase::RelistFlush(_)
                 ));
         let evictable = if self.evicting {
@@ -659,9 +660,7 @@ impl Model for RepairModel {
                         }
                     }
                     RepairPlan::Relist => {
-                        s.req = Some(Req::Relist {
-                            listed: Self::listed(&s),
-                        });
+                        s.req = Some(Req::Relist);
                         s.w = if self.mutation == Mutation::NoAckBarrier {
                             WPhase::Watch {
                                 f: 0,
@@ -728,9 +727,9 @@ impl Model for RepairModel {
                 }
             }
             Act::MNext => match s.m {
-                MPhase::PreFlush(Req::Relist { listed }, _) => {
-                    // Diff the STORE against the listing.
-                    if s.store_val.is_some() && listed.is_none() {
+                MPhase::PreFlush(Req::Relist, _) => {
+                    // List, then diff the STORE against the listing.
+                    if s.store_val.is_some() && Self::listed(&s).is_none() {
                         let u = Upd {
                             pos: None,
                             value: None,
@@ -918,6 +917,21 @@ fn eviction_turned_off_repair_steps_are_correct() {
     .assert_properties();
 }
 
+/// The key-listing resync stays correct without the ack barrier now that the
+/// main loop takes the listing after its drain (axiom 6 suffices); the
+/// barrier is defense in depth.
+#[test]
+fn relist_holds_without_the_ack_barrier() {
+    run(
+        RepairModel {
+            mutation: Mutation::NoAckBarrier,
+            ..shipped(false, false)
+        },
+        "repair steps: keeps-current, no ack barrier",
+    )
+    .assert_properties();
+}
+
 /// Without the memo, the same run deletes the key that aged out.
 #[test]
 fn eviction_memo_is_load_bearing() {
@@ -953,7 +967,12 @@ fn every_repair_step_is_load_bearing() {
         (Mutation::NoPreFlushRetry, false, false),
         (Mutation::NoPreFlushRetry, true, false),
         (Mutation::CursorBeforeDiff, true, false),
-        (Mutation::NoAckBarrier, false, false),
+        // Not `NoAckBarrier`: the main loop lists the live keys itself, after
+        // draining the backlog, so a re-list put that races the diff is
+        // followed by its key's delete marker on the same watch; axiom 6
+        // alone keeps the resync correct. The barrier stays as defense in
+        // depth (and is still load-bearing in `tests/model_resync_order.rs`,
+        // which models a listing taken before the handoff).
         (Mutation::NoRestoreGuard, true, false),
         (Mutation::RelistOnEvicting, true, false),
         (Mutation::UnanchoredRelist, false, true),

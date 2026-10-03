@@ -137,6 +137,14 @@ pub trait RestoreSource<S: Send>: Send + Sync {
     /// temporary fold. It may be newer than what [`latest`](Self::latest)
     /// returned; the caller re-checks it.
     async fn fetch(&self) -> Result<RestoredFold<S>, SnapshotError>;
+
+    /// A directory on the fold's filesystem for a repair's scratch files.
+    /// [`ExpiryRepair::Auto`]'s key-listing diff sorts the bucket's listing
+    /// there; without one (and always under [`ExpiryRepair::Relist`]) it uses
+    /// the system temp dir (`TMPDIR`), which may be RAM-backed.
+    fn scratch_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A verified artifact opened as a temporary, read-only fold, plus anything
@@ -367,21 +375,137 @@ pub(crate) struct SpillReader {
 }
 
 impl SpillReader {
+    /// The next key, in the order they were pushed.
+    pub(crate) fn next_key(&mut self) -> std::io::Result<Option<String>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let mut n = [0u8; 4];
+        self.r.read_exact(&mut n)?;
+        let mut key = vec![0u8; u32::from_le_bytes(n) as usize];
+        self.r.read_exact(&mut key)?;
+        self.left -= 1;
+        String::from_utf8(key)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
     /// Up to `max` keys, in the order they were pushed; empty when done.
     pub(crate) fn take(&mut self, max: usize) -> std::io::Result<Vec<String>> {
         let mut keys = Vec::new();
-        while self.left > 0 && keys.len() < max {
-            let mut n = [0u8; 4];
-            self.r.read_exact(&mut n)?;
-            let mut key = vec![0u8; u32::from_le_bytes(n) as usize];
-            self.r.read_exact(&mut key)?;
-            keys.push(
-                String::from_utf8(key)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-            );
-            self.left -= 1;
+        while keys.len() < max {
+            match self.next_key()? {
+                Some(key) => keys.push(key),
+                None => break,
+            }
         }
         Ok(keys)
+    }
+}
+
+/// How many bytes of keys a [`KeySorter`] holds before spilling a sorted run.
+const SORT_RUN_BYTES: usize = 64 << 20;
+
+/// An external sort of key names: keys accumulate up to a run's worth, each
+/// full run is sorted and spilled ([`KeySpill`]), and [`sorted`](Self::sorted)
+/// merges the runs. Memory is one run, however many keys pass through; a
+/// listing that fits in one run never touches disk.
+pub(crate) struct KeySorter {
+    dir: Option<PathBuf>,
+    run_bytes: usize,
+    buf: Vec<String>,
+    held: usize,
+    runs: Vec<SpillReader>,
+}
+
+impl KeySorter {
+    pub(crate) fn new(dir: Option<PathBuf>) -> Self {
+        Self::with_run_bytes(dir, SORT_RUN_BYTES)
+    }
+
+    pub(crate) fn with_run_bytes(dir: Option<PathBuf>, run_bytes: usize) -> Self {
+        Self {
+            dir,
+            run_bytes,
+            buf: Vec::new(),
+            held: 0,
+            runs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, key: String) -> std::io::Result<()> {
+        self.held += key.len() + std::mem::size_of::<String>();
+        self.buf.push(key);
+        if self.held >= self.run_bytes {
+            self.spill_run()?;
+        }
+        Ok(())
+    }
+
+    fn spill_run(&mut self) -> std::io::Result<()> {
+        self.buf.sort_unstable();
+        self.buf.dedup();
+        let mut spill = KeySpill::new(self.dir.as_deref())?;
+        for key in self.buf.drain(..) {
+            spill.push(&key)?;
+        }
+        self.runs.push(spill.into_reader()?);
+        self.held = 0;
+        Ok(())
+    }
+
+    /// Every key pushed, ascending, each once.
+    pub(crate) fn sorted(mut self) -> std::io::Result<SortedKeys> {
+        if self.runs.is_empty() {
+            self.buf.sort_unstable();
+            self.buf.dedup();
+            return Ok(SortedKeys::Held(self.buf.into_iter()));
+        }
+        if !self.buf.is_empty() {
+            self.spill_run()?;
+        }
+        let mut heads = std::collections::BinaryHeap::new();
+        for (i, run) in self.runs.iter_mut().enumerate() {
+            if let Some(key) = run.next_key()? {
+                heads.push(std::cmp::Reverse((key, i)));
+            }
+        }
+        Ok(SortedKeys::Merged {
+            runs: self.runs,
+            heads,
+            last: None,
+        })
+    }
+}
+
+/// [`KeySorter`]'s output: ascending, without duplicates.
+pub(crate) enum SortedKeys {
+    Held(std::vec::IntoIter<String>),
+    Merged {
+        runs: Vec<SpillReader>,
+        heads: std::collections::BinaryHeap<std::cmp::Reverse<(String, usize)>>,
+        last: Option<String>,
+    },
+}
+
+impl SortedKeys {
+    pub(crate) fn next_key(&mut self) -> std::io::Result<Option<String>> {
+        match self {
+            SortedKeys::Held(keys) => Ok(keys.next()),
+            SortedKeys::Merged { runs, heads, last } => loop {
+                let Some(std::cmp::Reverse((key, i))) = heads.pop() else {
+                    return Ok(None);
+                };
+                if let Some(next) = runs[i].next_key()? {
+                    heads.push(std::cmp::Reverse((next, i)));
+                }
+                // Runs are deduplicated within, not across.
+                if last.as_deref() != Some(key.as_str()) {
+                    *last = Some(key.clone());
+                    return Ok(Some(key));
+                }
+            },
+        }
     }
 }
 
@@ -425,11 +549,13 @@ pub(crate) enum RepairRequest<S> {
     /// The bucket's retention was seen evicting current values: the fold
     /// commits the memo on its cursor. No reply; the watch keeps running.
     Evicting,
-    /// The key-listing diff: the bucket's live keys for the watch scope. The
-    /// main loop applies synthetic deletes for in-scope keys missing from it,
-    /// then acks so the watch task can start the fallback re-list.
+    /// The key-listing diff: the reader that lists the bucket's live keys,
+    /// and where to sort that listing. The main loop applies synthetic deletes
+    /// for in-scope keys missing from it, then acks so the watch task can
+    /// start the fallback re-list.
     Relist {
-        live_keys: Vec<String>,
+        reader: Arc<dyn KvReader>,
+        scratch: Option<PathBuf>,
         ack: oneshot::Sender<()>,
     },
     /// The artifact restore: a verified artifact fold, the reader that lists
@@ -457,7 +583,11 @@ enum Plan<'a, S> {
     /// Fall back to the re-list alone (nothing armed).
     ReListOnly,
     /// The key-listing diff, then the re-list.
-    Relist(&'a Arc<dyn KvReader>, &'a mpsc::Sender<RepairRequest<S>>),
+    Relist(
+        &'a Arc<dyn KvReader>,
+        Option<PathBuf>,
+        &'a mpsc::Sender<RepairRequest<S>>,
+    ),
     /// The artifact restore, then a resume from the artifact's cursor.
     Restore(
         &'a Arc<dyn KvReader>,
@@ -690,11 +820,11 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                     .watching(watcher, watch_scope(watcher, scope, tx))
                     .await;
             }
-            Plan::Relist(reader, repairs) => {
+            Plan::Relist(reader, scratch, repairs) => {
                 warn!(
                     "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
                 );
-                resync_stale_keys(scope, reader, repairs).await?;
+                resync_stale_keys(reader, scratch, repairs).await?;
                 return memo
                     .watching(watcher, watch_scope(watcher, scope, tx))
                     .await;
@@ -760,7 +890,7 @@ async fn watch_scope_from(
 
 /// Decide how to repair one expiry ([`plan_repair`]), reading the bucket's
 /// retention live when the choice depends on it.
-async fn plan<'a, S>(
+async fn plan<'a, S: Send>(
     watcher: &dyn KvWatcher,
     repair: Option<&'a RepairHandle<S>>,
     memo: &mut EvictionMemo<'_, S>,
@@ -786,8 +916,9 @@ async fn plan<'a, S>(
             error!(msg);
             return Err(KvError::WatchError(msg.into()));
         }
-        (RepairPlan::Relist, ExpiryRepair::Relist(reader) | ExpiryRepair::Auto { reader, .. }) => {
-            Plan::Relist(reader, &h.tx)
+        (RepairPlan::Relist, ExpiryRepair::Relist(reader)) => Plan::Relist(reader, None, &h.tx),
+        (RepairPlan::Relist, ExpiryRepair::Auto { reader, restore }) => {
+            Plan::Relist(reader, restore.scratch_dir(), &h.tx)
         }
         (
             RepairPlan::Restore,
@@ -860,8 +991,8 @@ async fn restore_from_artifact<S: Send + 'static>(
 }
 
 /// Cursor-expired stale-key resync (the key-listing diff), run BEFORE the
-/// fallback watch is established: list the scope's live keys, hand them to the
-/// main loop (which diffs them against the fold and applies synthetic
+/// fallback watch is established: hand the main loop the reader (it lists the
+/// scope's live keys, diffs them against the fold, and applies synthetic
 /// deletes), and wait for the ack. That ordering — deletes applied, then
 /// fallback watch armed — is what makes a delete-then-recreate during the gap
 /// converge: the synthetic delete always lands before the re-list put.
@@ -878,33 +1009,22 @@ async fn restore_from_artifact<S: Send + 'static>(
 /// restart re-resumes, hits `CursorExpired` again, and retries the resync from
 /// scratch.
 async fn resync_stale_keys<S>(
-    scope: &WatchScope,
     reader: &Arc<dyn KvReader>,
+    scratch: Option<PathBuf>,
     repairs: &mpsc::Sender<RepairRequest<S>>,
 ) -> Result<(), KvError> {
-    let mut live_keys = Vec::new();
-    for prefix in scope.prefixes() {
-        match reader.keys(&prefix).await {
-            Ok(keys) => live_keys.extend(keys),
-            Err(e) => {
-                return Err(KvError::WatchError(format!(
-                    "cursor-expired resync failed listing live keys under {prefix:?}: {e}; \
-                     failing the watch rather than silently keeping stale keys"
-                )));
-            }
-        }
-    }
     let (ack_tx, ack_rx) = oneshot::channel();
     if repairs
         .send(RepairRequest::Relist {
-            live_keys,
+            reader: Arc::clone(reader),
+            scratch,
             ack: ack_tx,
         })
         .await
         .is_ok()
     {
-        // A dropped ack (main loop shutting down) just means the fallback watch
-        // is about to die with it; nothing to recover.
+        // A dropped ack (main loop shut down, or the resync failed and ended
+        // it) means the fallback watch is about to die with it.
         let _ = ack_rx.await;
     }
     Ok(())
@@ -956,8 +1076,12 @@ where
     fold.settle().await?;
     match req {
         RepairRequest::Evicting => unreachable!("handled above"),
-        RepairRequest::Relist { live_keys, ack } => {
-            relist(fold, &live_keys, prefixes).await?;
+        RepairRequest::Relist {
+            reader,
+            scratch,
+            ack,
+        } => {
+            relist(fold, &*reader, scratch, prefixes).await?;
             // Ack AFTER the deletes are applied: the watch task is holding
             // the fallback watch until it hears back, which is what orders
             // deletes before the re-list (tests/model_resync_order.rs proves
@@ -1009,9 +1133,15 @@ where
 /// the fold holds and the bucket no longer lists — they vanished during the
 /// gap (their delete markers evicted with the cursor), and the re-list can't
 /// deliver a delete.
+///
+/// Memory stays bounded at any fold size: the listing is sorted externally
+/// ([`KeySorter`], runs spilled to `scratch`) and merge-joined against the
+/// fold's own key-ordered scan, so neither the listing nor the fold is ever
+/// held. Only the stale keys are — the keys deleted during the gap.
 async fn relist<U, S, P, A, O>(
     fold: &mut Fold<U, S, P, A, O>,
-    live_keys: &[String],
+    reader: &dyn KvReader,
+    scratch: Option<PathBuf>,
     prefixes: &[String],
 ) -> Result<(), KvError>
 where
@@ -1021,50 +1151,95 @@ where
     A: FnMut(Vec<U>) + Send,
     O: FnMut(WatchCursor) + Send,
 {
-    let live: HashSet<&str> = live_keys.iter().map(String::as_str).collect();
-    let mut stale: Vec<String> = Vec::new();
-    if let Some(st) = fold.store() {
-        for prefix in prefixes {
-            // Stream the fold's keys rather than `range()`, which buffers every
-            // in-scope entry — values included — into one Vec. On an on-disk
-            // backend holding a fold larger than RAM (the case those backends
-            // exist for), an All-scope resync would materialize the entire
-            // fold on the repair path. Only the keys matter.
-            if let Err(e) = st.for_each_in_range(prefix, |entry| {
-                if !live.contains(entry.key.as_str()) {
-                    stale.push(entry.key);
-                }
-                Ok(())
-            }) {
-                // FATAL, not a degrade: an incomplete diff silently leaves
-                // deleted keys in the fold forever (tests/model.rs proves the
-                // divergence reachable under degrade semantics). Fail the
-                // watch; the restart re-runs the resume → expiry → resync from
-                // scratch.
-                warn!(error = %e, prefix = %prefix,
-                    "resync fold scan failed; aborting watch rather than diverging");
-                return Err(KvError::WatchError(format!(
-                    "cursor-expired resync failed listing fold prefix {prefix:?}: {e}"
-                )));
-            }
+    // Disjoint and in order, so the fold's per-prefix scans run in one
+    // ascending sequence the sorted listing can be walked alongside.
+    let mut prefixes = disjoint(prefixes);
+    prefixes.sort_unstable();
+
+    // The listing streams into a sorter on a blocking thread. The send blocks
+    // only if sorting falls behind the network.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(8192);
+    let sorter = tokio::task::spawn_blocking(move || {
+        let mut sorter = KeySorter::new(scratch);
+        for key in rx {
+            sorter.push(key)?;
         }
+        sorter.sorted()
+    });
+    for prefix in &prefixes {
+        reader
+            .for_each_key(prefix, &mut |key| {
+                let _ = tx.send(key);
+            })
+            .await
+            .map_err(|e| {
+                repair_fatal(format!(
+                    "cursor-expired resync failed listing live keys under {prefix:?}: {e}; \
+                     failing the watch rather than silently keeping stale keys"
+                ))
+            })?;
     }
-    // Overlapping prefixes can list a key twice.
-    stale.sort_unstable();
-    stale.dedup();
+    drop(tx);
+    let mut live = sorter
+        .await
+        .map_err(|e| repair_fatal(format!("cursor-expired resync: sort task panicked: {e}")))?
+        .map_err(|e| repair_fatal(format!("cursor-expired resync: sorting the listing: {e}")))?;
+
+    let Some(st) = fold.take_store() else {
+        unreachable!("repairs are armed only with a store")
+    };
+    let (st, stale) = tokio::task::spawn_blocking(move || {
+        let mut stale: Vec<String> = Vec::new();
+        let res = (|| {
+            let mut next = live.next_key()?;
+            for prefix in &prefixes {
+                // Stream the fold's keys rather than `range()`, which buffers
+                // every in-scope entry — values included.
+                st.for_each_in_range(prefix, |entry| {
+                    while next.as_ref().is_some_and(|k| *k < entry.key) {
+                        next = live.next_key()?;
+                    }
+                    if next.as_deref() != Some(entry.key.as_str()) {
+                        stale.push(entry.key);
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok::<_, SnapshotError>(())
+        })();
+        (st, res.map(|()| stale))
+    })
+    .await
+    .map_err(|e| repair_fatal(format!("cursor-expired resync: diff task panicked: {e}")))?;
+    fold.put_store(st);
+    // FATAL, not a degrade: an incomplete diff silently leaves deleted keys in
+    // the fold forever (tests/model.rs proves the divergence reachable under
+    // degrade semantics). Fail the watch; the restart re-runs the resume →
+    // expiry → resync from scratch.
+    let stale = stale.map_err(|e| {
+        repair_fatal(format!(
+            "cursor-expired resync failed diffing the fold against the listing: {e}"
+        ))
+    })?;
     if !stale.is_empty() {
         warn!(
             stale = stale.len(),
             "cursor-expired resync: deleting keys that vanished during the gap"
         );
     }
-    for key in stale {
-        // Synthetic: carries no revision (unknown version) and so never
-        // advances the cursor.
-        fold.correct(KvUpdate::Delete {
-            key,
-            version: VersionToken::unknown(),
-        });
+    // Synthetic deletes: no revision (unknown version), so they never advance
+    // the cursor. Flushed in batch-sized chunks, all before the ack.
+    let max = fold.batch_cap();
+    let mut stale = stale.into_iter();
+    loop {
+        let chunk: Vec<String> = stale.by_ref().take(max).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        for key in chunk {
+            fold.correct(restore_delete(key));
+        }
+        fold.flush().await?;
     }
     fold.flush().await
 }
@@ -1412,6 +1587,33 @@ mod tests {
         );
         assert_eq!(disjoint(&s(&["a.", ""])), s(&[""]));
         assert_eq!(disjoint(&s(&["a.", "a."])), s(&["a."]));
+    }
+
+    /// The external sort against an in-memory sort, across run sizes that
+    /// force one run, a few, and one per key, with duplicates within and
+    /// across runs.
+    #[test]
+    fn key_sorter_matches_sort_dedup_at_every_run_size() {
+        let mut keys: Vec<String> = (0..300u32)
+            .map(|i| format!("k.{}", (i * 7919) % 211))
+            .collect();
+        keys.push(String::new());
+        keys.push("k.".into());
+        let mut want = keys.clone();
+        want.sort();
+        want.dedup();
+        for run_bytes in [usize::MAX, 4096, 512, 1] {
+            let mut sorter = KeySorter::with_run_bytes(None, run_bytes);
+            for k in &keys {
+                sorter.push(k.clone()).unwrap();
+            }
+            let mut sorted = sorter.sorted().unwrap();
+            let mut got = Vec::new();
+            while let Some(k) = sorted.next_key().unwrap() {
+                got.push(k);
+            }
+            assert_eq!(got, want, "run_bytes {run_bytes}");
+        }
     }
 
     #[test]

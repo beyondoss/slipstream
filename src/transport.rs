@@ -862,6 +862,10 @@ impl<S: Send + 'static> RestoreSource<S> for ArtifactRestore<S> {
             .scratch_in(tmp.path())
             .holding(tmp))
     }
+
+    fn scratch_dir(&self) -> Option<PathBuf> {
+        Some(self.scratch_dir.clone())
+    }
 }
 
 impl crate::AppendLogSnapshot {

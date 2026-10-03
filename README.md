@@ -378,7 +378,7 @@ Turning eviction off later doesn't make the key list trustworthy again: keys tha
 
 On a bucket that evicts only by `max_age`, a node restarted within half of `max_age` resumes even when every message after its cursor was overwritten while it was down: none of those can have aged out, so there is nothing to restore.
 
-A restore holds only the keys it will delete in memory; the keys it rewrites are spilled to the scratch directory, so it works at any fold size.
+A restore holds only the keys it will delete in memory; the keys it rewrites are spilled to the scratch directory, so it works at any fold size. The key-listing repair likewise sorts the bucket's listing on disk and walks it alongside the fold, holding only the keys it deletes. Under `Auto` it uses the restore source's scratch directory; under `Relist` it uses `TMPDIR`, so point that at disk, not tmpfs, for large buckets.
 
 `Some(reader)` from older code still compiles and means `Relist`. `None` (or no `store`) falls back to the re-list alone and warns that deleted keys may persist.
 
