@@ -118,6 +118,10 @@ pub fn payload_prunable(
 /// resync. Machine-checked as `bootstrap never silently diverges` in
 /// `tests/model.rs` (where the model's retention floor is
 /// `first_sequence - 1`).
+///
+/// This answers only whether the window is intact; it holds at
+/// `revision == u64::MAX`. The sequence to start at must come from
+/// [`resume_start_sequence`], which refuses to wrap there.
 pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
     first_sequence <= revision.saturating_add(1)
 }

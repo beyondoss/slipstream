@@ -478,7 +478,7 @@ Cursor:  cur_len:u8 ++ cursor_bytes
 
 Version bytes are stored as length-prefixed raw bytes, not a fixed `u64`. A 10-byte FDB versionstamp round-trips intact; a `u64`-only field would flatten it to 0 and break every subsequent CAS on a restored entry.
 
-CRC covers from the type byte through the end of the record. A truncated final record (crash mid-write) is silently discarded. A CRC mismatch in the middle of the file returns `SnapshotError::Corrupted`.
+CRC covers from the type byte through the end of the record. A truncated final record (crash mid-write) is silently discarded. A CRC mismatch in the middle of the file returns `SnapshotError::Corrupted`. Lengths are read before the CRC can be checked, so a corrupted length that points past EOF reads as a truncated tail and drops the records after it: the fold lands at an earlier cursor, the same shape as a tail lost to power loss. A value is at most 64 MiB (NATS's payload ceiling), enforced by the writer and the reader alike; a larger length is treated as corruption.
 
 ### State Machine
 
@@ -742,11 +742,13 @@ Production code and an exhaustive model checker running the same logic closes th
 | `Timeout` on any NATS op             | CLOSE_WAIT half-dead TCP parks the `await` without this guard              | Call `shutdown()` + `connect()`                   |
 | `RevisionMismatch` on CAS            | Concurrent writer won the race                                              | Re-read with `entry()`, resolve, retry            |
 | `AlreadyExists` on `create()`        | Key already present; caller's create was not exclusive                      | Read live value, decide whether to proceed        |
+| Value over 64 MiB written to the append log | `apply` returns `InvalidFormat` before writing anything; under `watch_applied` the batch re-queues until the watch fail-stops | Unreachable from a NATS watch (its payload ceiling is the same); a direct `apply` caller must keep values under 64 MiB or use an LSM backend |
 | Snapshot truncated tail              | `load()` discards partial final record; earlier records intact              | Resume from recovered cursor; tail re-folded      |
 | Snapshot mid-file CRC mismatch       | `SnapshotError::Corrupted`                                                  | Import the latest artifact (a NATS re-list loses everything evicted; complete only on a bucket that never evicted a current value) |
 | Snapshot wrong format version        | `SnapshotError::InvalidFormat`                                              | Same: import the latest artifact                  |
 | `compact()` I/O error                | Writer poisoned; subsequent writes return `Io`                              | Reopen (the old file is intact until the atomic rename); if unreadable, import the latest artifact |
 | Synadia Cloud stream limit           | Raw API path treats as non-fatal; verifies bucket with `get_key_value`      | Non-fatal if bucket exists                        |
+| Multipart upload fails mid-stream    | The upload is aborted, so S3/GCS drop its parts; if the abort itself fails, a warning names the key | Next round re-uploads; a bucket lifecycle rule for incomplete uploads is the backstop (a crashed process can't abort) |
 | Crash between payload upload and pointer swap | Old pointer remains fully consistent; payload orphaned | Next export round publishes new pointer; stale payload pruned after grace |
 | Slow exporter after newer round published | `pointer_publish_allowed` returns false → `SupersededByNewer`           | Lease abandoned, local artifact deleted; payload orphaned until prune |
 | Tampered / torn artifact             | `ArtifactInvalid` at import (hash + cursor gate); nothing written to destination | Fetch another artifact                        |

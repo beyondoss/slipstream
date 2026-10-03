@@ -478,28 +478,47 @@ impl ArtifactTransport for ObjectStoreTransport {
         .await?
         .map_err(map_obj)?;
         let mut wm = WriteMultipart::new_with_chunk_size(upload, CHUNK);
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            use tokio::io::AsyncReadExt;
-            let n = file.read(&mut buf).await.map_err(SnapshotError::Io)?;
-            if n == 0 {
-                break;
+        let streamed = async {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                use tokio::io::AsyncReadExt;
+                let n = file.read(&mut buf).await.map_err(SnapshotError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                timed("part upload", wm.wait_for_capacity(MAX_CONCURRENT_PARTS))
+                    .await?
+                    .map_err(map_obj)?;
+                wm.write(&buf[..n]);
             }
-            timed("part upload", wm.wait_for_capacity(MAX_CONCURRENT_PARTS))
-                .await?
-                .map_err(map_obj)?;
-            wm.write(&buf[..n]);
+            // Drains every in-flight part (up to MAX_CONCURRENT_PARTS × CHUNK
+            // bytes), so it gets a proportionally larger stall bound than a
+            // single-request await.
+            timed_by(
+                "multipart drain",
+                OP_TIMEOUT * MAX_CONCURRENT_PARTS as u32,
+                wm.wait_for_capacity(0),
+            )
+            .await?
+            .map_err(map_obj)
         }
-        // finish() drains every in-flight part (up to MAX_CONCURRENT_PARTS ×
-        // CHUNK bytes) plus the completion request, so it gets a proportionally
-        // larger stall bound than a single-request await.
-        timed_by(
-            "multipart finish",
-            OP_TIMEOUT * MAX_CONCURRENT_PARTS as u32,
-            wm.finish(),
-        )
-        .await?
-        .map_err(map_obj)?;
+        .await;
+        if let Err(e) = streamed {
+            // S3 and GCS keep uploaded parts of an unfinished upload (billed,
+            // invisible to listings) until it is aborted; dropping does not.
+            if let Err(abort) = timed("multipart abort", wm.abort())
+                .await
+                .and_then(|r| r.map_err(map_obj))
+            {
+                warn!(key, error = %abort, "multipart abort failed; parts linger until a bucket lifecycle rule removes them");
+            }
+            return Err(e);
+        }
+        // Every part is in; finish() only flushes the (empty) buffer and sends
+        // the completion request, aborting the upload itself if that fails.
+        timed("multipart finish", wm.finish())
+            .await?
+            .map_err(map_obj)?;
 
         // Pointer LAST, by monotonic conditional swap: its presence marks the
         // payload complete, and it can never regress past a newer round.

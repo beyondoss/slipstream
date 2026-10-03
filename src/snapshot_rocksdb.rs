@@ -423,7 +423,7 @@ impl RocksDbSnapshot {
             let (staged_cursor, verify) = Self::open(
                 &stage.payload(),
                 RocksDbConfig {
-                    sync: config.sync,
+                    sync: true,
                     cache_size_bytes: 0,
                 },
             )?;
