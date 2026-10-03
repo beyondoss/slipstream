@@ -374,6 +374,12 @@ A restore only accepts an artifact that is ahead of the local fold, covers the w
 
 A node with no cursor on a bucket that has already evicted current values seeds from the artifact too, since a re-list alone would miss whatever aged out.
 
+Turning eviction off later doesn't make the key list trustworthy again: keys that aged out while it was on stay missing from it. A node that ever saw its bucket evict remembers that in its saved cursor (and in every artifact it exports), so `Auto` keeps restoring and `Relist` keeps refusing.
+
+On a bucket that evicts only by `max_age`, a node restarted within half of `max_age` resumes even when every message after its cursor was overwritten while it was down: none of those can have aged out, so there is nothing to restore.
+
+A restore holds only the keys it will delete in memory; the keys it rewrites are spilled to the scratch directory, so it works at any fold size.
+
 `Some(reader)` from older code still compiles and means `Relist`. `None` (or no `store`) falls back to the re-list alone and warns that deleted keys may persist.
 
 ## NATS mapping

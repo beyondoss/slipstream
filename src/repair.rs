@@ -26,7 +26,11 @@
 
 use std::any::Any;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
@@ -34,9 +38,9 @@ use tracing::{error, info, warn};
 
 use crate::applied::{Fold, WatchScope};
 use crate::artifact::ExportManifest;
-use crate::kv::{KvEntry, KvError, KvReader, KvUpdate, KvWatcher, VersionToken, WatchCursor};
+use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
-    KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
+    KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
     plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok,
 };
 use crate::snapshot::{SnapshotError, SnapshotStore};
@@ -86,7 +90,9 @@ pub enum ExpiryRepair<S> {
     },
     /// Decide by the bucket's live retention, read at the moment of expiry:
     /// [`Relist`](Self::Relist) when it never evicts current values,
-    /// [`Restore`](Self::Restore) when it does or can't say.
+    /// [`Restore`](Self::Restore) when it does or can't say — and always
+    /// Restore once the fold has seen it evict, even after eviction is
+    /// turned off (a key that aged out stays missing from the listing).
     Auto {
         /// Lists live keys (for either repair).
         reader: Arc<dyn KvReader>,
@@ -138,6 +144,7 @@ pub trait RestoreSource<S: Send>: Send + Sync {
 /// first, then the guard.
 pub struct RestoredFold<S> {
     manifest: ExportManifest,
+    scratch: Option<PathBuf>,
     // Declaration order is drop order, and it is load-bearing: the fold (an
     // open LSM, possibly) must close before its guard deletes its directory.
     fold: S,
@@ -149,9 +156,19 @@ impl<S> RestoredFold<S> {
     pub fn new(manifest: ExportManifest, fold: S) -> Self {
         Self {
             manifest,
+            scratch: None,
             fold,
             guard: None,
         }
+    }
+
+    /// Where the restore may spill its working set (the keys it will
+    /// rewrite) instead of holding it in memory. Put it on the fold's
+    /// filesystem, not a RAM-backed temp dir; without it the restore spills
+    /// to the system temp dir.
+    pub fn scratch_in(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch = Some(dir.into());
+        self
     }
 
     /// Keep `guard` (e.g. the `TempDir` holding the fold's files) alive until
@@ -231,39 +248,42 @@ pub(crate) fn check_restore(
     Ok(())
 }
 
-/// One key of a restore: take the artifact's entry, or delete the key.
-pub(crate) enum RestoreOp {
-    Put(String),
-    Delete(String),
-}
-
-impl RestoreOp {
-    fn key(&self) -> &str {
-        match self {
-            RestoreOp::Put(k) | RestoreOp::Delete(k) => k,
+/// `prefixes` with every prefix that another one covers dropped, so no key
+/// matches two of them: a scan per prefix then visits each key once.
+pub(crate) fn disjoint(prefixes: &[String]) -> Vec<String> {
+    let mut sorted: Vec<&String> = prefixes.iter().collect();
+    sorted.sort_by_key(|p| p.len());
+    let mut kept: Vec<String> = Vec::new();
+    for p in sorted {
+        if !kept.iter().any(|k| p.starts_with(k.as_str())) {
+            kept.push(p.clone());
         }
     }
+    kept
 }
 
-/// The in-scope ops that bring the `local` fold to the `artifact` fold's
-/// state at its cursor `C`, without ever moving a key backward or deleting a
-/// live one. Keys only, in key order — values are read back in bounded
-/// chunks ([`materialize`]), so a restore never holds the whole changed set's
-/// values at once (the same discipline as the key-listing diff).
+/// One pass over a restore's in-scope keys, in key order, deciding each with
+/// [`restore_key`] (which the repair model, `tests/model_repair.rs`, runs too).
+/// Keys the artifact's entry should replace go to `take`, one at a time, so the
+/// caller can spill them rather than hold them. Local keys the artifact lacks
+/// are returned: the restore deletes them unless the bucket lists them live,
+/// and only these need checking against the listing. Out-of-scope keys are
+/// untouched on both sides.
 ///
-/// Each in-scope key is decided by [`restore_key`], which the repair model
-/// (`tests/model_repair.rs`) runs too. Out-of-scope keys are untouched on
-/// both sides.
+/// Memory is the returned set, which holds the keys deleted between the local
+/// fold's cursor and the artifact's: never the fold, the artifact, or the
+/// bucket's listing.
 pub(crate) fn restore_diff<S: SnapshotStore>(
     local: &S,
     artifact: &S,
     prefixes: &[String],
-    live: &HashSet<String>,
-) -> Result<Vec<RestoreOp>, SnapshotError> {
-    let mut ops = Vec::new();
-    for prefix in prefixes {
-        // Every key the artifact holds.
-        artifact.for_each_in_range(prefix, |entry| {
+    mut take: impl FnMut(String) -> Result<(), SnapshotError>,
+) -> Result<HashSet<String>, SnapshotError> {
+    let mut candidates = HashSet::new();
+    for prefix in disjoint(prefixes) {
+        // Every key the artifact holds. Whether the bucket lists it doesn't
+        // matter when the artifact has it.
+        artifact.for_each_in_range(&prefix, |entry| {
             let at = KeyState::At(entry.version.as_u64());
             let (state, identical) = match local.get(&entry.key)? {
                 Some(l) => (
@@ -272,54 +292,123 @@ pub(crate) fn restore_diff<S: SnapshotStore>(
                 ),
                 None => (KeyState::Absent, false),
             };
-            let listed = live.contains(&entry.key);
-            if restore_key(state, at, identical, listed) == KeyRestore::TakeArtifact {
-                ops.push(RestoreOp::Put(entry.key));
+            if restore_key(state, at, identical, false) == KeyRestore::TakeArtifact {
+                take(entry.key)?;
             }
             Ok(())
         })?;
         // Local keys the artifact lacks. The kernel is asked first, as if the
-        // artifact lacked the key, so the artifact is read only for keys that
-        // would be deleted.
-        local.for_each_in_range(prefix, |entry| {
+        // artifact lacked the key and the bucket didn't list it, so the
+        // artifact is read only for keys that could be deleted.
+        local.for_each_in_range(&prefix, |entry| {
             let state = KeyState::At(entry.version.as_u64());
-            let listed = live.contains(&entry.key);
-            if restore_key(state, KeyState::Absent, false, listed) == KeyRestore::Delete
+            if restore_key(state, KeyState::Absent, false, false) == KeyRestore::Delete
                 && artifact.get(&entry.key)?.is_none()
             {
-                ops.push(RestoreOp::Delete(entry.key));
+                candidates.insert(entry.key);
             }
             Ok(())
         })?;
     }
-    // Overlapping prefixes visit a key more than once; a key is a Put or a
-    // Delete, never both (Put iff the artifact has it).
-    ops.sort_unstable_by(|a, b| a.key().cmp(b.key()));
-    ops.dedup_by(|a, b| a.key() == b.key());
-    Ok(ops)
+    Ok(candidates)
 }
 
-/// Read one chunk of a restore's values back from the artifact fold. Deletes
-/// carry the unknown version: like the key-listing diff's synthetic deletes,
-/// they are a state correction, not a log entry, and never move a cursor.
+/// Keys written to a scratch file and read back in chunks: a restore's
+/// rewrite set can be the whole fold (a fresh node seeding from an artifact),
+/// so it never sits in memory. Each key is `len: u32 LE ++ bytes`.
+pub(crate) struct KeySpill {
+    w: BufWriter<File>,
+    len: u64,
+}
+
+impl KeySpill {
+    /// A spill in `dir`, or the system temp dir. The file is unlinked from the
+    /// start, so nothing is left behind.
+    pub(crate) fn new(dir: Option<&Path>) -> std::io::Result<Self> {
+        let file = match dir {
+            Some(dir) => tempfile::tempfile_in(dir)?,
+            None => tempfile::tempfile()?,
+        };
+        Ok(Self {
+            w: BufWriter::new(file),
+            len: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, key: &str) -> std::io::Result<()> {
+        let n = u32::try_from(key.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "key longer than 4 GiB")
+        })?;
+        self.w.write_all(&n.to_le_bytes())?;
+        self.w.write_all(key.as_bytes())?;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Rewind for reading.
+    pub(crate) fn into_reader(self) -> std::io::Result<SpillReader> {
+        let mut file = self.w.into_inner().map_err(|e| e.into_error())?;
+        file.rewind()?;
+        Ok(SpillReader {
+            r: BufReader::new(file),
+            left: self.len,
+        })
+    }
+}
+
+/// The read side of a [`KeySpill`].
+pub(crate) struct SpillReader {
+    r: BufReader<File>,
+    left: u64,
+}
+
+impl SpillReader {
+    /// Up to `max` keys, in the order they were pushed; empty when done.
+    pub(crate) fn take(&mut self, max: usize) -> std::io::Result<Vec<String>> {
+        let mut keys = Vec::new();
+        while self.left > 0 && keys.len() < max {
+            let mut n = [0u8; 4];
+            self.r.read_exact(&mut n)?;
+            let mut key = vec![0u8; u32::from_le_bytes(n) as usize];
+            self.r.read_exact(&mut key)?;
+            keys.push(
+                String::from_utf8(key)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            );
+            self.left -= 1;
+        }
+        Ok(keys)
+    }
+}
+
+/// Read one chunk of a restore's rewritten entries back from the artifact
+/// fold.
 pub(crate) fn materialize<S: SnapshotStore>(
     artifact: &S,
-    ops: Vec<RestoreOp>,
+    keys: Vec<String>,
 ) -> Result<Vec<KvUpdate>, SnapshotError> {
-    ops.into_iter()
-        .map(|op| match op {
-            RestoreOp::Put(key) => match artifact.get(&key)? {
-                Some(entry @ KvEntry { .. }) => Ok(KvUpdate::Put(entry)),
-                None => Err(SnapshotError::Backend(format!(
-                    "restored artifact fold lost key {key:?} mid-restore"
-                ))),
-            },
-            RestoreOp::Delete(key) => Ok(KvUpdate::Delete {
-                key,
-                version: VersionToken::unknown(),
-            }),
+    keys.into_iter()
+        .map(|key| match artifact.get(&key)? {
+            Some(entry) => Ok(KvUpdate::Put(entry)),
+            None => Err(SnapshotError::Backend(format!(
+                "restored artifact fold lost key {key:?} mid-restore"
+            ))),
         })
         .collect()
+}
+
+/// A restore's delete: like the key-listing diff's synthetic deletes, a state
+/// correction rather than a log entry, so it carries the unknown version and
+/// never moves a cursor.
+fn restore_delete(key: String) -> KvUpdate {
+    KvUpdate::Delete {
+        key,
+        version: VersionToken::unknown(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +422,9 @@ pub(crate) fn materialize<S: SnapshotStore>(
 
 /// A cursor-expired repair handoff from the watch task to the main loop.
 pub(crate) enum RepairRequest<S> {
+    /// The bucket's retention was seen evicting current values: the fold
+    /// commits the memo on its cursor. No reply; the watch keeps running.
+    Evicting,
     /// The key-listing diff: the bucket's live keys for the watch scope. The
     /// main loop applies synthetic deletes for in-scope keys missing from it,
     /// then acks so the watch task can start the fallback re-list.
@@ -340,13 +432,15 @@ pub(crate) enum RepairRequest<S> {
         live_keys: Vec<String>,
         ack: oneshot::Sender<()>,
     },
-    /// The artifact restore: a verified artifact fold, and the bucket's live
-    /// keys for the scope (listed after the fetch). The main loop folds the
-    /// in-scope difference, advances to the artifact's cursor, and replies
-    /// with it so the watch task resumes from there.
+    /// The artifact restore: a verified artifact fold, the reader that lists
+    /// the bucket's live keys, and the watcher whose retention vouches for
+    /// that listing. The main loop folds the in-scope difference, advances to
+    /// the artifact's cursor, and replies with it so the watch task resumes
+    /// from there.
     Restore {
         restored: RestoredFold<S>,
-        live: HashSet<String>,
+        reader: Arc<dyn KvReader>,
+        watcher: Arc<dyn KvWatcher>,
         reply: oneshot::Sender<Result<WatchCursor, KvError>>,
     },
 }
@@ -408,13 +502,97 @@ pub(crate) fn arm<S>(
     }
 }
 
-/// [`listing_is_truth`] for the watcher's live retention; `None` when the
-/// backend can't say.
-async fn listing_truth(watcher: &dyn KvWatcher) -> Result<Option<bool>, KvError> {
-    Ok(watcher
-        .retention()
-        .await?
-        .map(|r| listing_is_truth(r.evicts_current_values, r.first_revision)))
+/// How often a live watch re-reads the bucket's retention, until it first
+/// sees current-value eviction (only while a key-listing repair could still
+/// be planned: `Relist` or `Auto`).
+const RETENTION_POLL: Duration = Duration::from_secs(60);
+
+/// The watch task's copy of the eviction memo ([`WatchCursor`]'s): has this
+/// fold ever seen the bucket's retention evict current values? The fold
+/// keeps it durably; this copy decides the task's repairs. Retention can be
+/// edited, and a key that aged out while eviction was in force stays missing
+/// from the bucket's listing after it is turned off, so the listing is
+/// trusted only by a fold that never saw eviction ([`listing_truth`]).
+struct EvictionMemo<'a, S> {
+    seen: bool,
+    repair: Option<&'a RepairHandle<S>>,
+}
+
+impl<S> EvictionMemo<'_, S> {
+    /// Read the bucket's retention. The first time it shows current values
+    /// may have been evicted (eviction on, and the log already past its first
+    /// revision), remember it here and have the fold commit it. Eviction that
+    /// is configured but hasn't dropped anything yet isn't remembered: the
+    /// listing is still complete, and a fresh node on a fresh bucket must not
+    /// be sent to an artifact that doesn't exist yet.
+    async fn observe(&mut self, watcher: &dyn KvWatcher) -> Result<Option<Retention>, KvError> {
+        let retention = watcher.retention().await?;
+        if !self.seen && listing_truth(retention, false) == Some(false) {
+            self.seen = true;
+            if let Some(h) = self.repair {
+                info!(
+                    "the bucket's retention has evicted current values; this fold will not \
+                     trust the bucket's key listing again, even if eviction is turned off"
+                );
+                h.tx.send(RepairRequest::Evicting).await.map_err(|_| {
+                    KvError::WatchError("watch loop ended while recording eviction".into())
+                })?;
+            }
+        }
+        Ok(retention)
+    }
+
+    /// [`listing_truth`] for the retention read now and the memo.
+    async fn listing_truth(&mut self, watcher: &dyn KvWatcher) -> Result<Option<bool>, KvError> {
+        let retention = self.observe(watcher).await?;
+        Ok(listing_truth(retention, self.seen))
+    }
+
+    /// Could a key-listing repair still be planned, so retention is worth
+    /// watching?
+    fn polls(&self) -> bool {
+        !self.seen
+            && matches!(
+                self.repair.map(|h| h.mode.mode()),
+                Some(RepairMode::Relist | RepairMode::Auto)
+            )
+    }
+
+    /// Read retention without failing the watch on an error: the read only
+    /// feeds the memo, and the next one retries.
+    async fn poll(&mut self, watcher: &dyn KvWatcher) {
+        if let Err(e) = self.observe(watcher).await {
+            warn!(error = %e, "reading the bucket's retention failed; retrying later");
+        }
+    }
+
+    /// Run a live watch, re-reading retention every [`RETENTION_POLL`]
+    /// while [`polls`](Self::polls): eviction turned on and off again while
+    /// the watch runs must still be seen.
+    async fn watching(
+        &mut self,
+        watcher: &dyn KvWatcher,
+        watch: impl std::future::Future<Output = Result<(), KvError>>,
+    ) -> Result<(), KvError> {
+        if !self.polls() {
+            return watch.await;
+        }
+        tokio::pin!(watch);
+        let mut tick = tokio::time::interval(RETENTION_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                res = &mut watch => return res,
+                _ = tick.tick() => {
+                    self.poll(watcher).await;
+                    if !self.polls() {
+                        return watch.await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The watch task: run the underlying watch for `scope`, resuming from
@@ -437,7 +615,12 @@ pub(crate) async fn run_watch<S: Send + 'static>(
     repair: Option<RepairHandle<S>>,
     tx: mpsc::Sender<KvUpdate>,
 ) -> Result<(), KvError> {
+    let shared = Arc::clone(&watcher);
     let (watcher, scope) = (watcher.as_ref(), &scope);
+    let mut memo = EvictionMemo {
+        seen: resume.as_ref().is_some_and(WatchCursor::seen_evicting),
+        repair: repair.as_ref(),
+    };
     // Resume only when the cursor carries a real position; an absent or `none()`
     // cursor falls through to a full watch. Binding `cursor` here makes "we have a
     // resume position" structural — there is no separate bool whose truth a later
@@ -453,7 +636,7 @@ pub(crate) async fn run_watch<S: Send + 'static>(
         let truth = match mode {
             RepairMode::Relist => None,
             RepairMode::Restore | RepairMode::Auto if unanchored => None,
-            _ => listing_truth(watcher).await?,
+            _ => memo.listing_truth(watcher).await?,
         };
         repair_first = cursorless_start_needs_repair(mode, unanchored, truth);
         if repair_first && unanchored {
@@ -477,38 +660,49 @@ pub(crate) async fn run_watch<S: Send + 'static>(
         }
     }
 
+    if memo.polls() {
+        memo.poll(watcher).await;
+    }
+
     loop {
         let cursor = if std::mem::take(&mut repair_first) {
             WatchCursor::none()
         } else {
             let Some(cursor) = resume.take() else {
-                return watch_scope(watcher, scope, tx).await;
+                return memo
+                    .watching(watcher, watch_scope(watcher, scope, tx))
+                    .await;
             };
-            match watch_scope_from(watcher, scope, &cursor, tx.clone()).await {
+            let watch = watch_scope_from(watcher, scope, &cursor, tx.clone());
+            match memo.watching(watcher, watch).await {
                 Err(KvError::CursorExpired) => cursor,
                 other => return other,
             }
         };
-        match plan(watcher, repair.as_ref()).await? {
+        match plan(watcher, repair.as_ref(), &mut memo).await? {
             Plan::ReListOnly => {
                 warn!(
                     "watch cursor expired with no repair armed (needs a store and a reader or \
                      restore source); falling back to the re-list alone — keys deleted during \
                      the gap may persist in the fold"
                 );
-                return watch_scope(watcher, scope, tx).await;
+                return memo
+                    .watching(watcher, watch_scope(watcher, scope, tx))
+                    .await;
             }
             Plan::Relist(reader, repairs) => {
                 warn!(
                     "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
                 );
                 resync_stale_keys(scope, reader, repairs).await?;
-                return watch_scope(watcher, scope, tx).await;
+                return memo
+                    .watching(watcher, watch_scope(watcher, scope, tx))
+                    .await;
             }
             Plan::Restore(reader, source, repairs) => {
                 warn!("watch cursor expired; restoring the fold from the latest artifact");
                 let restored =
-                    restore_from_artifact(watcher, scope, reader, source, repairs, &cursor)
+                    restore_from_artifact(&shared, scope, reader, source, repairs, &cursor)
                         .await
                         .map_err(|e| match e {
                             KvError::WatchError(msg) if cursor.is_none() => {
@@ -522,6 +716,9 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                             }
                             other => other,
                         })?;
+                // An artifact from a fold that saw eviction carries the memo
+                // (the fold took it with the artifact's cursor).
+                memo.seen |= restored.seen_evicting();
                 resume = Some(restored);
             }
         }
@@ -566,22 +763,24 @@ async fn watch_scope_from(
 async fn plan<'a, S>(
     watcher: &dyn KvWatcher,
     repair: Option<&'a RepairHandle<S>>,
+    memo: &mut EvictionMemo<'_, S>,
 ) -> Result<Plan<'a, S>, KvError> {
     let Some(h) = repair else {
         return Ok(Plan::ReListOnly);
     };
     let mode = h.mode.mode();
     let truth = match mode {
-        RepairMode::Relist | RepairMode::Auto => listing_truth(watcher).await?,
+        RepairMode::Relist | RepairMode::Auto => memo.listing_truth(watcher).await?,
         RepairMode::None | RepairMode::Restore => None,
     };
     Ok(match (plan_repair(mode, truth), &h.mode) {
         (RepairPlan::ReListOnly, _) => Plan::ReListOnly,
         (RepairPlan::RefuseRelist, _) => {
             let msg = "watch cursor expired on a bucket whose retention evicts current \
-                       values (max_age, per-message TTL, or discard:old): its key listing \
-                       can't tell a deleted key from an aged-out one, so the key-listing \
-                       resync would delete valid keys. Refusing. Repair from artifacts with \
+                       values (max_age, per-message TTL, or discard:old), or did while this \
+                       fold tracked it: its key listing can't tell a deleted key from an \
+                       aged-out one, so the key-listing resync would delete valid keys. \
+                       Refusing. Repair from artifacts with \
                        ExpiryRepair::Restore or ExpiryRepair::Auto (or accept a re-list-only \
                        fallback with ExpiryRepair::None)";
             error!(msg);
@@ -603,7 +802,7 @@ async fn plan<'a, S>(
 /// retention), download it, check what actually arrived, then hand it to the
 /// main loop and wait for the cursor it restored to.
 async fn restore_from_artifact<S: Send + 'static>(
-    watcher: &dyn KvWatcher,
+    watcher: &Arc<dyn KvWatcher>,
     scope: &WatchScope,
     reader: &Arc<dyn KvReader>,
     source: &Arc<dyn RestoreSource<S>>,
@@ -645,23 +844,12 @@ async fn restore_from_artifact<S: Send + 'static>(
         "restoring the fold from the latest artifact"
     );
 
-    // The bucket's live keys, listed after the artifact's cursor is fixed:
-    // the restore never deletes one of these (see `restore_diff`). A failed
-    // listing fails the watch, like the key-listing repair's.
-    let mut live = HashSet::new();
-    for prefix in &prefixes {
-        let keys = reader
-            .keys(prefix)
-            .await
-            .map_err(|e| fail(format!("listing live keys under {prefix:?} failed: {e}")))?;
-        live.extend(keys);
-    }
-
     let (reply_tx, reply_rx) = oneshot::channel();
     repairs
         .send(RepairRequest::Restore {
             restored,
-            live,
+            reader: Arc::clone(reader),
+            watcher: Arc::clone(watcher),
             reply: reply_tx,
         })
         .await
@@ -746,6 +934,10 @@ where
     A: FnMut(Vec<U>) + Send,
     O: FnMut(WatchCursor) + Send,
 {
+    let req = match req {
+        RepairRequest::Evicting => return fold.remember_evicting().await,
+        req => req,
+    };
     // Fold everything the watch task delivered before it asked for this
     // repair. A floor-guard trip ends a live watch mid-stream with updates
     // still buffered in the channel: the repair must see them (it diffs the
@@ -763,6 +955,7 @@ where
     // removed, and the put would then commit and resurrect the key.
     fold.settle().await?;
     match req {
+        RepairRequest::Evicting => unreachable!("handled above"),
         RepairRequest::Relist { live_keys, ack } => {
             relist(fold, &live_keys, prefixes).await?;
             // Ack AFTER the deletes are applied: the watch task is holding
@@ -778,7 +971,8 @@ where
         }
         RepairRequest::Restore {
             restored,
-            live,
+            reader,
+            watcher,
             reply,
         } => {
             let target = restored.manifest().cursor.clone();
@@ -797,8 +991,15 @@ where
                 let _ = reply.send(Err(KvError::WatchError(msg)));
                 return Ok(());
             }
-            restore(fold, restored, live, prefixes).await?;
-            let _ = reply.send(Ok(target));
+            match restore(fold, restored, &*reader, &*watcher, prefixes).await? {
+                Ok(()) => {
+                    let _ = reply.send(Ok(target));
+                }
+                Err(msg) => {
+                    error!(%msg, "cursor-expiry repair refused");
+                    let _ = reply.send(Err(KvError::WatchError(msg)));
+                }
+            }
             Ok(())
         }
     }
@@ -870,12 +1071,18 @@ where
 
 /// The artifact restore, main-loop half: replace the in-scope fold with the
 /// artifact's ([`restore_diff`]), then take its cursor.
+///
+/// Memory stays bounded at any fold size. The keys to rewrite are spilled to
+/// scratch and read back a chunk at a time; only the keys the restore would
+/// delete are held, and the bucket's listing is streamed past them rather
+/// than collected. With no delete candidates the listing is skipped.
 async fn restore<U, S, P, A, O>(
     fold: &mut Fold<U, S, P, A, O>,
     mut restored: RestoredFold<S>,
-    live: HashSet<String>,
+    reader: &dyn KvReader,
+    watcher: &dyn KvWatcher,
     prefixes: &[String],
-) -> Result<(), KvError>
+) -> Result<Result<(), String>, KvError>
 where
     U: Send,
     S: SnapshotStore + Send + 'static,
@@ -887,50 +1094,112 @@ where
     let Some(st) = fold.take_store() else {
         unreachable!("repairs are armed only with a store")
     };
-    let (prefixes, max) = (prefixes.to_vec(), fold.batch_cap());
+    let prefixes = disjoint(prefixes);
+    let max = fold.batch_cap();
+    let scope = prefixes.clone();
     let (st, r, diff) = tokio::task::spawn_blocking(move || {
-        let diff = restore_diff(&st, restored.fold(), &prefixes, &live);
+        let diff = (|| {
+            let mut spill = KeySpill::new(restored.scratch.as_deref())?;
+            let candidates = restore_diff(&st, restored.fold(), &scope, |key| {
+                spill.push(&key).map_err(SnapshotError::from)
+            })?;
+            Ok::<_, SnapshotError>((spill, candidates))
+        })();
         (st, restored, diff)
     })
     .await
     .map_err(|e| repair_fatal(format!("cursor-expired restore: diff task panicked: {e}")))?;
     fold.put_store(st);
     restored = r;
-    let diff = diff.map_err(|e| {
+    let (spill, mut deletes) = diff.map_err(|e| {
         repair_fatal(format!(
             "cursor-expired restore: diffing the fold against the artifact failed: {e}"
         ))
     })?;
+
+    // A delete candidate the bucket lists live is kept: its current value is a
+    // write after the artifact's cursor, which the resume delivers
+    // (`restore_key`'s `listed_live`). A failed listing fails the watch, like
+    // the key-listing repair's.
+    if !deletes.is_empty() {
+        for prefix in &prefixes {
+            reader
+                .for_each_key(prefix, &mut |key| {
+                    deletes.remove(&key);
+                })
+                .await
+                .map_err(|e| {
+                    repair_fatal(format!(
+                        "cursor-expired restore: listing live keys under {prefix:?} failed: {e}"
+                    ))
+                })?;
+        }
+        // The listing vouches for every write after the artifact's cursor only
+        // while the log still holds all of them: one that aged out before the
+        // listing is unlisted, and would be deleted. Retention only moves
+        // forward, so a check after the listing covers it
+        // (`tests/model_repair.rs`, `NoListingRecheck`). Nothing is folded yet.
+        if let Some(first) = watcher.retention().await?.map(|r| r.first_revision)
+            && !resume_window_ok(target.rank(), first)
+        {
+            let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
+            return Ok(Err(format!(
+                "cursor-expired restore: the log evicted writes after the artifact's cursor \
+                 ({:?}, first retained revision {first}) while the restore was listing live \
+                 keys, so the listing can't vouch for them; nothing was changed. Exports must \
+                 run well inside the bucket's max_age / discard turnover",
+                target
+            )));
+        }
+    }
     info!(
         from = ?fold.applied(),
         to = ?target,
-        changed = diff.len(),
+        rewritten = spill.len(),
+        deleted = deletes.len(),
         "cursor-expired restore: replacing the in-scope fold with the artifact's"
     );
+
     // Fold the difference through parse/apply/store in `max`-sized chunks,
     // values read back per chunk. These carry no stream position: every chunk
     // commits under the old cursor, so a crash part-way re-runs the
     // (idempotent) restore on restart.
-    let mut ops = diff.into_iter();
+    let mut spill = spill
+        .into_reader()
+        .map_err(|e| repair_fatal(format!("cursor-expired restore: reading scratch: {e}")))?;
     loop {
-        let chunk: Vec<_> = ops.by_ref().take(max).collect();
-        if chunk.is_empty() {
-            break;
-        }
-        let (r, updates) = tokio::task::spawn_blocking(move || {
-            let updates = materialize(restored.fold(), chunk);
-            (restored, updates)
+        let (r, sp, updates) = tokio::task::spawn_blocking(move || {
+            let updates = spill
+                .take(max)
+                .map_err(SnapshotError::from)
+                .and_then(|keys| materialize(restored.fold(), keys));
+            (restored, spill, updates)
         })
         .await
         .map_err(|e| repair_fatal(format!("cursor-expired restore: read task panicked: {e}")))?;
         restored = r;
+        spill = sp;
         let updates = updates.map_err(|e| {
             repair_fatal(format!(
                 "cursor-expired restore: reading the artifact failed: {e}"
             ))
         })?;
+        if updates.is_empty() {
+            break;
+        }
         for u in updates {
             fold.correct(u);
+        }
+        fold.flush().await?;
+    }
+    let mut deletes = deletes.into_iter();
+    loop {
+        let chunk: Vec<_> = deletes.by_ref().take(max).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        for key in chunk {
+            fold.correct(restore_delete(key));
         }
         fold.flush().await?;
     }
@@ -941,12 +1210,13 @@ where
     // Closing an LSM can block; drop the temporary fold and its scratch dir
     // off the async thread.
     let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
-    Ok(())
+    Ok(Ok(()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::KvEntry;
     use crate::snapshot::AppendLogSnapshot;
 
     fn put(key: &str, value: &[u8], rev: u64) -> KvUpdate {
@@ -1028,9 +1298,41 @@ mod tests {
         assert!(err.contains("outside the log's retention window"), "{err}");
     }
 
+    /// The restore's updates in production order — rewritten entries from
+    /// the spill, then deletes for candidates the listing lacks — through the
+    /// real `restore_diff`, `KeySpill`, and `materialize`.
+    fn restore_ops(
+        local: &AppendLogSnapshot,
+        artifact: &AppendLogSnapshot,
+        prefixes: &[String],
+        live: &HashSet<String>,
+    ) -> Vec<KvUpdate> {
+        let mut spill = KeySpill::new(None).unwrap();
+        let candidates = restore_diff(local, artifact, prefixes, |k| {
+            spill.push(&k).map_err(SnapshotError::from)
+        })
+        .unwrap();
+        let mut reader = spill.into_reader().unwrap();
+        let mut updates = Vec::new();
+        loop {
+            let chunk = reader.take(2).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            updates.extend(materialize(artifact, chunk).unwrap());
+        }
+        let mut deletes: Vec<String> = candidates
+            .into_iter()
+            .filter(|k| !live.contains(k))
+            .collect();
+        deletes.sort();
+        updates.extend(deletes.into_iter().map(restore_delete));
+        updates
+    }
+
     /// The diff turns the local in-scope fold into the artifact's: changed and
-    /// new keys are Puts, keys the artifact lacks are Deletes, identical
-    /// entries and out-of-scope keys are left alone.
+    /// new keys are rewritten, keys the artifact lacks are delete candidates,
+    /// identical entries and out-of-scope keys are left alone.
     #[test]
     fn diff_is_wholesale_replacement_within_scope() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1056,27 +1358,16 @@ mod tests {
             ],
             9,
         );
-        let ops = restore_diff(
-            &local,
-            &artifact,
-            &["node.".to_string()],
-            &Default::default(),
-        )
+        let mut rewritten = Vec::new();
+        let candidates = restore_diff(&local, &artifact, &["node.".to_string()], |k| {
+            rewritten.push(k);
+            Ok(())
+        })
         .unwrap();
-        let got: Vec<(String, bool)> = ops
-            .iter()
-            .map(|o| (o.key().to_string(), matches!(o, RestoreOp::Put(_))))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("node.changed".into(), true),
-                ("node.gone".into(), false),
-                ("node.new".into(), true),
-            ]
-        );
+        assert_eq!(rewritten, vec!["node.changed", "node.new"]);
+        assert_eq!(candidates, HashSet::from(["node.gone".to_string()]));
 
-        let updates = materialize(&artifact, ops).unwrap();
+        let updates = restore_ops(&local, &artifact, &["node.".to_string()], &HashSet::new());
         match &updates[0] {
             KvUpdate::Put(e) => {
                 assert_eq!(e.value, b"new");
@@ -1089,24 +1380,62 @@ mod tests {
             other => panic!("expected put, got {other:?}"),
         }
         assert!(
-            matches!(&updates[1], KvUpdate::Delete { version, .. } if version.is_unknown()),
+            matches!(&updates[2], KvUpdate::Delete { version, .. } if version.is_unknown()),
             "restore deletes never carry a revision"
         );
     }
 
     #[test]
-    fn diff_dedups_overlapping_prefixes() {
+    fn diff_visits_each_key_once_under_overlapping_prefixes() {
         let dir = tempfile::TempDir::new().unwrap();
         let local = fold(&dir, "local", &[put("node.a", b"1", 1)], 1);
         let artifact = fold(&dir, "artifact", &[put("node.b", b"2", 2)], 2);
-        let ops = restore_diff(
+        let updates = restore_ops(
             &local,
             &artifact,
             &["node.".into(), "node".into()],
-            &Default::default(),
-        )
-        .unwrap();
-        assert_eq!(ops.len(), 2, "each key once despite two covering prefixes");
+            &HashSet::new(),
+        );
+        assert_eq!(
+            updates.len(),
+            2,
+            "each key once despite two covering prefixes"
+        );
+    }
+
+    #[test]
+    fn disjoint_drops_covered_prefixes() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            disjoint(&s(&["node.", "node", "edge."])),
+            s(&["node", "edge."])
+        );
+        assert_eq!(disjoint(&s(&["a.", ""])), s(&[""]));
+        assert_eq!(disjoint(&s(&["a.", "a."])), s(&["a."]));
+    }
+
+    #[test]
+    fn spill_round_trips_in_order_and_chunks() {
+        let mut spill = KeySpill::new(None).unwrap();
+        let keys: Vec<String> = (0..10).map(|i| format!("k.{i}")).collect();
+        for k in &keys {
+            spill.push(k).unwrap();
+        }
+        spill.push("").unwrap();
+        assert_eq!(spill.len(), 11);
+        let mut r = spill.into_reader().unwrap();
+        let mut got = Vec::new();
+        loop {
+            let chunk = r.take(3).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(chunk.len() <= 3);
+            got.extend(chunk);
+        }
+        let mut want = keys;
+        want.push(String::new());
+        assert_eq!(got, want);
     }
 
     // --- Exhaustive small-domain checks of the real functions ---------------
@@ -1244,7 +1573,7 @@ mod tests {
     /// THE RESTORE, exhaustively over every pair of 3-key folds (each key
     /// absent or at one of two revisions: 729 pairs), four scopes including
     /// overlapping prefixes, and every live-key listing (8), using the real
-    /// `restore_diff` and `materialize` and a real store. Per in-scope key,
+    /// `restore_diff`, `KeySpill` and `materialize` and a real store. Per in-scope key,
     /// the restored fold holds:
     ///
     /// - the artifact's entry, unless the local one is NEWER (or the same) —
@@ -1278,7 +1607,7 @@ mod tests {
                 for scope in scopes {
                     let prefixes: Vec<String> = scope.iter().map(|p| p.to_string()).collect();
                     for (li, live) in lives.iter().enumerate() {
-                        let full = restore_diff(
+                        let full = restore_ops(
                             &fold_of(
                                 &dir,
                                 &format!("probe-{li}-{}", scope.join("|")),
@@ -1288,19 +1617,16 @@ mod tests {
                             &artifact,
                             &prefixes,
                             live,
-                        )
-                        .unwrap();
+                        );
                         // Crash after `cut` ops: apply them, then re-diff.
                         for cut in 0..=full.len() {
                             let name = format!("local-{li}-{cut}-{}", scope.join("|"));
                             let mut local = fold_of(&dir, &name, &local_states, 3);
-                            let first = restore_diff(&local, &artifact, &prefixes, live).unwrap();
-                            let partial: Vec<RestoreOp> = first.into_iter().take(cut).collect();
-                            let updates = materialize(&artifact, partial).unwrap();
-                            local.apply(&updates, &WatchCursor::from_u64(3)).unwrap();
-                            let rest = restore_diff(&local, &artifact, &prefixes, live).unwrap();
-                            let updates = materialize(&artifact, rest).unwrap();
-                            local.apply(&updates, &WatchCursor::from_u64(9)).unwrap();
+                            let first = restore_ops(&local, &artifact, &prefixes, live);
+                            let partial: Vec<KvUpdate> = first.into_iter().take(cut).collect();
+                            local.apply(&partial, &WatchCursor::from_u64(3)).unwrap();
+                            let rest = restore_ops(&local, &artifact, &prefixes, live);
+                            local.apply(&rest, &WatchCursor::from_u64(9)).unwrap();
 
                             for (i, key) in KEYS.iter().enumerate() {
                                 let (l, a) = (local_states[i], artifact_states[i]);
@@ -1326,9 +1652,7 @@ mod tests {
                                 );
                             }
                             assert!(
-                                restore_diff(&local, &artifact, &prefixes, live)
-                                    .unwrap()
-                                    .is_empty(),
+                                restore_ops(&local, &artifact, &prefixes, live).is_empty(),
                                 "a converged fold must diff empty"
                             );
                             cases += 1;

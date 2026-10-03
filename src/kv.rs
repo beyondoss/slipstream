@@ -7,39 +7,144 @@ use tokio::sync::mpsc::Sender;
 /// Backends store whatever they need to resume (NATS: u64 revision).
 /// Callers should treat this as opaque and only pass it back to
 /// `watch_all_from` / `watch_prefix_from`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WatchCursor(VersionToken);
+///
+/// A cursor that [`watch_applied`](crate::watch_applied) produced may also
+/// remember that the bucket's retention was once seen evicting current
+/// values. That memo outlives the retention setting: a key that aged out
+/// while it was in force is missing from the bucket's listing forever after,
+/// so the cursor-expiry repair must never again treat the listing as the
+/// truth. A store persisting a cursor should write
+/// [`to_bytes`](Self::to_bytes) and read [`from_bytes`](Self::from_bytes);
+/// [`as_u64`](Self::as_u64) keeps only the position.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WatchCursor {
+    version: VersionToken,
+    seen_evicting: bool,
+}
+
+impl fmt::Debug for WatchCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.seen_evicting {
+            write!(f, "WatchCursor({:?}, seen evicting)", self.version)
+        } else {
+            write!(f, "WatchCursor({:?})", self.version)
+        }
+    }
+}
+
+/// The longest encoding [`WatchCursor::to_bytes`] produces.
+pub(crate) const MAX_CURSOR_BYTES: usize = CURSOR_MEMO_LEN + 8;
+
+/// A cursor with its memo: the version padded to the token's 10-byte
+/// capacity, its length, a flags byte, and — when the flags say so — the
+/// server time its message was written (u64 LE Unix milliseconds). Longer
+/// than any bare version, so the encodings never collide, and a cursor
+/// without the memo keeps the pre-memo encoding byte for byte (older builds
+/// read it; they refuse this one as too long rather than misread it).
+const CURSOR_MEMO_LEN: usize = 12;
+const CURSOR_SEEN_EVICTING: u8 = 0b01;
+const CURSOR_WRITTEN_AT: u8 = 0b10;
 
 impl WatchCursor {
     /// No cursor — forces a full watch on next connect.
     pub fn none() -> Self {
-        Self(VersionToken::unknown())
+        Self::default()
     }
 
     /// Returns true if this cursor has no position (will trigger full watch).
     pub fn is_none(&self) -> bool {
-        self.0.is_unknown()
+        self.version.is_unknown()
     }
 
     /// Create a cursor from a version token.
     pub fn from_version(token: VersionToken) -> Self {
-        Self(token)
+        Self {
+            version: token,
+            seen_evicting: false,
+        }
     }
 
     /// Create a cursor from a u64 revision (convenience for NATS).
     pub fn from_u64(rev: u64) -> Self {
-        Self(VersionToken::from_u64(rev))
+        Self::from_version(VersionToken::from_u64(rev))
+    }
+
+    /// The cursor as a store should persist it, memo included. The time its
+    /// message was written is kept only alongside the memo: it matters only
+    /// on a bucket that evicts (`NatsKvWatcher`'s resume check).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let v = self.version.as_bytes();
+        if !self.seen_evicting {
+            return v.to_vec();
+        }
+        let mut out = vec![0u8; CURSOR_MEMO_LEN];
+        out[..v.len()].copy_from_slice(v);
+        out[10] = v.len() as u8;
+        out[11] = CURSOR_SEEN_EVICTING;
+        if let Some(ms) = self.version.written_ms() {
+            out[11] |= CURSOR_WRITTEN_AT;
+            out.extend_from_slice(&ms.to_le_bytes());
+        }
+        out
+    }
+
+    /// Read back [`to_bytes`](Self::to_bytes). `None` for bytes no build
+    /// wrote: a length or flags this build doesn't know.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() <= 10 {
+            return VersionToken::from_raw(bytes).map(Self::from_version);
+        }
+        let (head, tail) = bytes.split_at_checked(CURSOR_MEMO_LEN)?;
+        let (len, flags) = (head[10] as usize, head[11]);
+        if len > 10 || flags & !(CURSOR_SEEN_EVICTING | CURSOR_WRITTEN_AT) != 0 {
+            return None;
+        }
+        let mut version = VersionToken::from_raw(&head[..len])?;
+        match (flags & CURSOR_WRITTEN_AT != 0, tail.len()) {
+            (false, 0) => {}
+            (true, 8) => {
+                let ms = u64::from_le_bytes(tail.try_into().ok()?);
+                if ms == 0 {
+                    return None;
+                }
+                version = version.written_at(ms);
+            }
+            _ => return None,
+        }
+        Some(Self {
+            version,
+            seen_evicting: flags & CURSOR_SEEN_EVICTING != 0,
+        })
+    }
+
+    /// The server time this cursor's message was written, when known (Unix
+    /// milliseconds).
+    pub(crate) fn written_ms(&self) -> Option<u64> {
+        self.version.written_ms()
+    }
+
+    /// The bucket's retention was seen evicting current values while this
+    /// cursor's fold — or one it was restored from — tracked it.
+    pub(crate) fn seen_evicting(&self) -> bool {
+        self.seen_evicting
+    }
+
+    /// This cursor, remembering that retention evicts current values (or
+    /// unchanged when `seen` is false: the memo never clears).
+    pub(crate) fn remembering(mut self, seen: bool) -> Self {
+        self.seen_evicting |= seen;
+        self
     }
 
     /// Try to extract as u64 revision.
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
-        self.0.as_u64()
+        self.version.as_u64()
     }
 
     /// Access the underlying version token.
     pub(crate) fn version(&self) -> &VersionToken {
-        &self.0
+        &self.version
     }
 
     /// The cursor's position for ordering — the artifact pointer swap, the
@@ -123,10 +228,31 @@ pub struct Retention {
 ///
 /// Stored inline (no heap allocation) — fits up to 10 bytes, which covers
 /// every current backend.
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+///
+/// A token read off a watch may also carry the server time its message was
+/// written (NATS: the message timestamp). That time is not part of the
+/// version: equality and hashing ignore it, and it isn't in
+/// [`as_bytes`](Self::as_bytes).
+#[derive(Clone, Default)]
 pub struct VersionToken {
     len: u8,
     buf: [u8; 10],
+    // Unix milliseconds of the message's server timestamp; 0 = unknown.
+    written_ms: u64,
+}
+
+impl PartialEq for VersionToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for VersionToken {}
+
+impl std::hash::Hash for VersionToken {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
 }
 
 impl fmt::Debug for VersionToken {
@@ -157,7 +283,24 @@ impl VersionToken {
     pub fn from_u64(rev: u64) -> Self {
         let mut buf = [0u8; 10];
         buf[..8].copy_from_slice(&rev.to_be_bytes());
-        Self { len: 8, buf }
+        Self {
+            len: 8,
+            buf,
+            written_ms: 0,
+        }
+    }
+
+    /// This version, carrying the server time its message was written
+    /// (Unix milliseconds).
+    pub(crate) fn written_at(mut self, unix_ms: u64) -> Self {
+        self.written_ms = unix_ms;
+        self
+    }
+
+    /// The server time this version's message was written, when the backend
+    /// reported it (Unix milliseconds).
+    pub(crate) fn written_ms(&self) -> Option<u64> {
+        (self.written_ms != 0).then_some(self.written_ms)
     }
 
     /// Create from FDB versionstamp (10 bytes).
@@ -170,7 +313,11 @@ impl VersionToken {
     /// second constructor.
     #[cfg(test)]
     pub(crate) fn from_fdb_versionstamp(vs: &[u8; 10]) -> Self {
-        Self { len: 10, buf: *vs }
+        Self {
+            len: 10,
+            buf: *vs,
+            written_ms: 0,
+        }
     }
 
     /// Try to extract as u64 (for NATS compatibility).
@@ -208,7 +355,11 @@ impl VersionToken {
         let len = bytes.len() as u8;
         let mut buf = [0u8; 10];
         buf[..len as usize].copy_from_slice(bytes);
-        Some(Self { len, buf })
+        Some(Self {
+            len,
+            buf,
+            written_ms: 0,
+        })
     }
 }
 
@@ -271,6 +422,23 @@ pub trait KvReader: Send + Sync {
 
     /// Get all keys matching a prefix. Returns keys only, not values.
     async fn keys(&self, prefix: &str) -> Result<Vec<String>, KvError>;
+
+    /// Hand every key [`keys`](Self::keys) would list to `f`, one at a time,
+    /// without collecting them: the cursor-expiry restore checks a large
+    /// bucket's listing this way rather than holding every key name at once.
+    ///
+    /// The provided implementation collects [`keys`](Self::keys) and iterates
+    /// it. A backend that can stream should override it.
+    async fn for_each_key(
+        &self,
+        prefix: &str,
+        f: &mut (dyn FnMut(String) + Send),
+    ) -> Result<(), KvError> {
+        for key in self.keys(prefix).await? {
+            f(key);
+        }
+        Ok(())
+    }
 
     /// Get multiple entries by prefix. Useful for bulk loading.
     async fn scan(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
@@ -450,6 +618,49 @@ pub trait KvPurge: KvWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cursor without the eviction memo encodes exactly as before the memo
+    /// existed (older builds keep reading it); with the memo it round-trips
+    /// and is longer than any bare version; unknown encodings are refused.
+    #[test]
+    fn cursor_bytes_round_trip_and_stay_compatible() {
+        let c = WatchCursor::from_u64(42);
+        assert_eq!(c.to_bytes(), VersionToken::from_u64(42).as_bytes());
+        assert_eq!(WatchCursor::from_bytes(&c.to_bytes()), Some(c.clone()));
+        assert!(WatchCursor::from_bytes(&[]).is_some_and(|c| c.is_none()));
+
+        let m = c.clone().remembering(true);
+        assert!(m.seen_evicting() && m.as_u64() == Some(42));
+        assert!(m.to_bytes().len() > 10);
+        assert_eq!(WatchCursor::from_bytes(&m.to_bytes()), Some(m.clone()));
+        assert!(
+            m.clone().remembering(false).seen_evicting(),
+            "the memo never clears"
+        );
+
+        let fdb = WatchCursor::from_version(VersionToken::from_fdb_versionstamp(&[7; 10]))
+            .remembering(true);
+        assert_eq!(WatchCursor::from_bytes(&fdb.to_bytes()), Some(fdb));
+
+        let t = WatchCursor::from_version(VersionToken::from_u64(42).written_at(1_700_000_000_123));
+        assert_eq!(t.to_bytes(), c.to_bytes(), "no memo: the time isn't kept");
+        let t = t.remembering(true);
+        let back = WatchCursor::from_bytes(&t.to_bytes()).unwrap();
+        assert_eq!(back.written_ms(), Some(1_700_000_000_123));
+        assert!(back.seen_evicting() && back.as_u64() == Some(42));
+        assert_eq!(back, t);
+
+        let mut bad = m.to_bytes();
+        bad[11] |= 0b100;
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "unknown flag");
+        let mut bad = m.to_bytes();
+        bad[11] |= CURSOR_WRITTEN_AT;
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "time flagged, missing");
+        let mut bad = m.to_bytes();
+        bad[10] = 11;
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "version too long");
+        assert_eq!(WatchCursor::from_bytes(&[0; 11]), None, "no such length");
+    }
 
     #[test]
     fn from_raw_roundtrips_within_capacity() {

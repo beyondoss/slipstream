@@ -64,7 +64,7 @@ use fjall::config::{BlockSizePolicy, PinningPolicy};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
-use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
+use crate::kv::{KvEntry, KvUpdate, WatchCursor};
 use crate::snapshot::{SnapshotError, SnapshotStore};
 use crate::snapshot_record::{decode_entry, encode_value_into};
 
@@ -189,14 +189,12 @@ impl FjallSnapshot {
             .map_err(map_fjall)?;
 
         let cursor = match meta.get(CURSOR_KEY).map_err(map_fjall)? {
-            Some(raw) => VersionToken::from_raw(&raw)
-                .map(WatchCursor::from_version)
-                .ok_or_else(|| {
-                    SnapshotError::InvalidFormat(format!(
-                        "stored cursor is {} bytes, exceeds version token capacity",
-                        raw.len()
-                    ))
-                })?,
+            Some(raw) => WatchCursor::from_bytes(&raw).ok_or_else(|| {
+                SnapshotError::InvalidFormat(format!(
+                    "stored cursor ({} bytes) is not a cursor this build can read",
+                    raw.len()
+                ))
+            })?,
             None => WatchCursor::none(),
         };
 
@@ -469,7 +467,7 @@ impl SnapshotStore for FjallSnapshot {
             }
         }
         // Cursor in the SAME batch as the data it names.
-        wb.insert(&self.meta, CURSOR_KEY, cursor.version().as_bytes());
+        wb.insert(&self.meta, CURSOR_KEY, cursor.to_bytes());
         wb.commit().map_err(map_fjall)?;
 
         self.cursor = cursor.clone();

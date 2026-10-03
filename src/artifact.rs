@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::kv::{VersionToken, WatchCursor};
+use crate::kv::WatchCursor;
 use crate::snapshot::SnapshotError;
 
 /// Version of the artifact layout itself (`MANIFEST.json` schema + `data/`
@@ -174,18 +174,17 @@ pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 fn cursor_to_hex(cursor: &WatchCursor) -> String {
-    hex_encode(cursor.version().as_bytes())
+    hex_encode(&cursor.to_bytes())
 }
 
 fn cursor_from_hex(s: &str) -> Result<WatchCursor, SnapshotError> {
     let bytes = hex_decode(s).ok_or_else(|| invalid(format!("malformed cursor_hex: {s:?}")))?;
-    let token = VersionToken::from_raw(&bytes).ok_or_else(|| {
+    WatchCursor::from_bytes(&bytes).ok_or_else(|| {
         invalid(format!(
-            "cursor_hex decodes to {} bytes, exceeds version token capacity",
+            "cursor_hex decodes to {} bytes, not a cursor this build can read",
             bytes.len()
         ))
-    })?;
-    Ok(WatchCursor::from_version(token))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +813,7 @@ mod tests {
     fn manifest_round_trips_fdb_width_cursor() {
         // 10-byte tokens have no u64 form; the hex path must carry them intact.
         let raw = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let cursor = WatchCursor::from_version(VersionToken::from_raw(&raw).unwrap());
+        let cursor = WatchCursor::from_version(crate::kv::VersionToken::from_raw(&raw).unwrap());
         let dir = TempDir::new().unwrap();
         write_manifest(dir.path(), &manifest_with(vec![], cursor.clone())).unwrap();
         let got = read_manifest(dir.path()).unwrap();

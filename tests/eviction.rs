@@ -446,7 +446,9 @@ async fn relist_on_evicting_bucket_is_refused() {
     assert!(err.to_string().contains("evicts current values"), "{err}");
 
     let (after, fold) = h.open("watcher.snap");
-    assert_eq!(after, cursor, "cursor untouched");
+    // The refusal read retention and saved the eviction memo; the position
+    // is untouched.
+    assert_eq!(after.as_u64(), cursor.as_u64(), "cursor untouched");
     assert_eq!(
         fold.get("route.keep").unwrap().map(|e| e.value),
         Some(b"v1".to_vec()),
@@ -477,7 +479,7 @@ async fn stale_artifact_fails_the_watch() {
         .expect_err("a stale artifact must fail the watch");
     assert!(err.to_string().contains("retention window"), "{err}");
     let (after, fold) = h.open("watcher.snap");
-    assert_eq!(after, cursor);
+    assert_eq!(after.as_u64(), cursor.as_u64(), "position untouched");
     assert!(fold.get("route.keep").unwrap().is_some());
 }
 
@@ -595,7 +597,8 @@ async fn live_floor_guard_trip_restores_in_process() {
 
     let (wc, wfold) = h.open("watcher.snap");
     let (xc, xfold) = h.open("exporter.snap");
-    assert_eq!(wc, xc);
+    // Same position; only the watcher has read retention since it evicted.
+    assert_eq!(wc.as_u64(), xc.as_u64());
     assert_eq!(
         wfold.get("route.keep").unwrap().map(|e| e.value),
         Some(b"v1".to_vec()),
@@ -616,18 +619,39 @@ async fn live_floor_guard_trip_restores_in_process() {
     );
 }
 
-/// PINNED BEHAVIOR (availability, not safety): the resume check is
-/// conservative — it sees only the stream's first retained revision, so when
-/// every message after a node's cursor has been SUPERSEDED (every key
-/// rewritten since), the cursor looks expired though nothing was evicted.
-/// On an evicting bucket that routes to a restore, and with no artifact
-/// ahead of the node, the watch fail-stops until the next export round —
-/// safe, but unavailable. A heartbeat-style bucket (few keys, all rewritten
-/// often) hits this on a short restart. Telling supersession from eviction
-/// needs information the stream doesn't expose (e.g. the cursor's message
-/// timestamp against `max_age`); this test flips if that lands.
+/// A node on a heartbeat bucket that has read retention after the log moved
+/// past its first revision, so its cursor keeps the eviction memo and the
+/// time its message was written. (A node starting with no cursor on such a
+/// log would seed from an artifact instead.)
+async fn seed_heartbeat_node(h: &Harness) -> Node {
+    let w = h.bucket.writer().unwrap();
+    w.put("hb.a", b"0").await.unwrap();
+    let rev = w.put("hb.b", b"1").await.unwrap().as_u64().unwrap();
+    let (_c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, None, h.auto());
+    node.wait_applied(rev).await;
+    let rev = w.put("hb.a", b"1").await.unwrap().as_u64().unwrap();
+    node.wait_applied(rev).await;
+    let c = node.stop().await.unwrap();
+    // The restart reads retention first thing: `max_age`, log past revision 1.
+    let (_c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, Some(c), h.auto());
+    let rev = w.put("hb.b", b"1").await.unwrap().as_u64().unwrap();
+    node.wait_applied(rev).await;
+    node
+}
+
+/// A supersession-only gap on a `max_age` bucket resumes instead of
+/// fail-stopping. The resume check sees only the stream's first retained
+/// revision, so when every message after a node's cursor was SUPERSEDED
+/// while it was down (every key rewritten since — a heartbeat bucket on a
+/// short restart), the cursor looks expired though nothing aged out. With no
+/// artifact ahead of the node, a restore can't run. But the cursor keeps the
+/// time its message was written: it is far younger than `max_age`, so no
+/// later message can have aged out, and the watch resumes from the first
+/// retained revision.
 #[tokio::test(flavor = "multi_thread")]
-async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
+async fn supersession_only_restart_resumes_on_a_max_age_bucket() {
     let h = Harness::new(StoreConfig {
         name: "routes".into(),
         max_age: Some(Duration::from_secs(3600)),
@@ -635,11 +659,7 @@ async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
     })
     .await;
     let w = h.bucket.writer().unwrap();
-    w.put("hb.a", b"1").await.unwrap();
-    let rev = w.put("hb.b", b"1").await.unwrap().as_u64().unwrap();
-    let (_c, fold) = h.open("node.snap");
-    let node = Node::spawn(&h.bucket, fold, None, h.auto());
-    node.wait_applied(rev).await;
+    let node = seed_heartbeat_node(&h).await;
     let artifact = node.publish(&*h.transport, h.dir.path()).await;
     let rev = w.put("hb.a", b"2").await.unwrap().as_u64().unwrap();
     node.wait_applied(rev).await;
@@ -650,7 +670,7 @@ async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
     // right after its cursor. Nothing ages out (max_age is an hour).
     w.put("hb.a", b"3").await.unwrap();
     w.put("hb.b", b"3").await.unwrap();
-    w.put("hb.a", b"4").await.unwrap();
+    let head = w.put("hb.a", b"4").await.unwrap().as_u64().unwrap();
     assert!(
         h.first_sequence().await > cursor + 1,
         "supersession alone passed the cursor"
@@ -658,7 +678,47 @@ async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
 
     let (c, fold) = h.open("node.snap");
     let node = Node::spawn(&h.bucket, fold, Some(c), h.auto());
-    let err = tokio::time::timeout(Duration::from_secs(10), node.task)
+    node.wait_applied(head).await;
+    node.stop().await.expect("resumed, no fail-stop");
+    let (c, fold) = h.open("node.snap");
+    assert_eq!(c.as_u64(), Some(head));
+    assert_eq!(
+        fold.get("hb.a").unwrap().map(|e| e.value),
+        Some(b"4".to_vec())
+    );
+    assert_eq!(
+        fold.get("hb.b").unwrap().map(|e| e.value),
+        Some(b"3".to_vec())
+    );
+}
+
+/// The same gap where `discard: old` can also evict: the time proves nothing
+/// about a limit, so the resume still reports the cursor expired and, with no
+/// artifact ahead of the node, fail-stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersession_gap_still_expires_when_eviction_is_not_only_by_age() {
+    let h = Harness::new(StoreConfig {
+        name: "routes".into(),
+        max_age: Some(Duration::from_secs(3600)),
+        max_bytes: Some(1 << 20),
+        discard: DiscardPolicy::Old,
+        ..Default::default()
+    })
+    .await;
+    let w = h.bucket.writer().unwrap();
+    let node = seed_heartbeat_node(&h).await;
+    node.publish(&*h.transport, h.dir.path()).await;
+    let rev = w.put("hb.a", b"2").await.unwrap().as_u64().unwrap();
+    node.wait_applied(rev).await;
+    let cursor = node.stop().await.unwrap().as_u64().unwrap();
+    w.put("hb.a", b"3").await.unwrap();
+    w.put("hb.b", b"3").await.unwrap();
+    w.put("hb.a", b"4").await.unwrap();
+    assert!(h.first_sequence().await > cursor + 1);
+
+    let (c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, Some(c), h.auto());
+    let err = timeout(Duration::from_secs(10), node.task)
         .await
         .expect("fails fast")
         .unwrap()
@@ -666,5 +726,93 @@ async fn supersession_only_restart_fail_stops_without_a_newer_artifact() {
     assert!(
         err.to_string().contains("not ahead of the local fold"),
         "{err}"
+    );
+}
+
+/// Eviction turned off after it dropped a key: the bucket's config now says
+/// it keeps current values, so a planner reading only the config trusts the
+/// key listing and the key-listing diff deletes `route.keep`, which aged out
+/// while eviction was on. The fold remembers that it saw eviction (the memo
+/// on its cursor), so `Auto` routes the expiry to a restore instead: with no
+/// artifact ahead it fails, and `route.keep` stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn eviction_turned_off_never_trusts_the_listing_again() {
+    let h = Harness::new(Eviction::DiscardOld.config()).await;
+    let w = h.bucket.writer().unwrap();
+    w.put("route.keep", b"v1").await.unwrap();
+    let (_c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, None, h.auto());
+    let rev = Eviction::DiscardOld.evict(&h.bucket).await;
+    node.wait_applied(rev).await;
+    let cursor = node.stop().await.expect("ran clean");
+    assert!(
+        h.bucket.reader().get("route.keep").await.unwrap().is_none(),
+        "route.keep must have aged out"
+    );
+
+    // A restart while eviction is still on reads retention, sees that it has
+    // evicted, and commits the memo before the watch delivers anything.
+    let (c, fold) = h.open("node.snap");
+    assert_eq!(c, cursor);
+    let node = Node::spawn(&h.bucket, fold, Some(c), h.auto());
+    let rev = w.put("route.marker", b"m").await.unwrap().as_u64().unwrap();
+    node.wait_applied(rev).await;
+    let cursor = node.stop().await.expect("ran clean");
+    let (c, _) = h.open("node.snap");
+    assert!(
+        format!("{c:?}").contains("seen evicting"),
+        "the fold remembers the eviction: {c:?}"
+    );
+    let cursor = cursor.as_u64().unwrap();
+
+    // The operator turns eviction off.
+    let js = async_nats::jetstream::new(async_nats::connect(&h._nats.url).await.unwrap());
+    let mut stream = js.get_stream("KV_routes").await.unwrap();
+    let mut config = stream.info().await.unwrap().config.clone();
+    config.max_bytes = -1;
+    js.update_stream(config).await.unwrap();
+    let retention = h
+        .bucket
+        .watcher()
+        .unwrap()
+        .retention()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !retention.evicts_current_values,
+        "the config no longer evicts"
+    );
+
+    // While the node is down, every key is rewritten: supersession alone
+    // expires its cursor.
+    // Twice, so even the first rewrite (the message right after the cursor)
+    // is superseded.
+    let reader = h.bucket.reader();
+    let keys = reader.keys("").await.unwrap();
+    for round in [b"again".as_slice(), b"again2"] {
+        for key in &keys {
+            w.put(key, round).await.unwrap();
+        }
+    }
+    assert!(
+        h.first_sequence().await > cursor + 1,
+        "supersession passed the cursor"
+    );
+
+    let (c, fold) = h.open("node.snap");
+    let node = Node::spawn(&h.bucket, fold, Some(c.clone()), h.auto());
+    let err = timeout(Duration::from_secs(15), node.task)
+        .await
+        .expect("fails fast")
+        .unwrap()
+        .expect_err("no artifact to restore from: the listing must not be trusted");
+    assert!(err.to_string().contains("artifact"), "{err}");
+    let (after, fold) = h.open("node.snap");
+    assert_eq!(after.as_u64(), c.as_u64(), "cursor untouched");
+    assert_eq!(
+        fold.get("route.keep").unwrap().map(|e| e.value),
+        Some(b"v1".to_vec()),
+        "the key that aged out while eviction was on is still there"
     );
 }

@@ -83,7 +83,7 @@ use rocksdb::{
 };
 
 use crate::artifact::{ExportManifest, ExportStage, verify_and_stage_import};
-use crate::kv::{KvEntry, KvUpdate, VersionToken, WatchCursor};
+use crate::kv::{KvEntry, KvUpdate, WatchCursor};
 use crate::snapshot::{SnapshotError, SnapshotStore};
 use crate::snapshot_record::{decode_entry, encode_value_into};
 
@@ -334,14 +334,12 @@ impl RocksDbSnapshot {
             .get_cf(cf(&db, META_CF)?, CURSOR_KEY)
             .map_err(map_rocksdb)?
         {
-            Some(raw) => VersionToken::from_raw(&raw)
-                .map(WatchCursor::from_version)
-                .ok_or_else(|| {
-                    SnapshotError::InvalidFormat(format!(
-                        "stored cursor is {} bytes, exceeds version token capacity",
-                        raw.len()
-                    ))
-                })?,
+            Some(raw) => WatchCursor::from_bytes(&raw).ok_or_else(|| {
+                SnapshotError::InvalidFormat(format!(
+                    "stored cursor ({} bytes) is not a cursor this build can read",
+                    raw.len()
+                ))
+            })?,
             None => WatchCursor::none(),
         };
 
@@ -561,7 +559,7 @@ impl SnapshotStore for RocksDbSnapshot {
             }
         }
         // Cursor in the SAME batch as the data it names.
-        wb.put_cf(meta, CURSOR_KEY, cursor.version().as_bytes());
+        wb.put_cf(meta, CURSOR_KEY, cursor.to_bytes());
 
         // The WAL is always on; `set_sync` only toggles the per-commit fsync.
         // NO_SYNC (sync: false) reaches the OS — survives a process crash via WAL

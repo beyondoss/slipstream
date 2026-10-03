@@ -755,8 +755,17 @@ impl KvReader for NatsKvReader {
 
     async fn keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
         debug!(prefix = %prefix, "listing keys with prefix");
-
         let mut keys = Vec::new();
+        self.for_each_key(prefix, &mut |key| keys.push(key)).await?;
+        debug!(prefix = %prefix, keys = keys.len(), "keys listing complete");
+        Ok(keys)
+    }
+
+    async fn for_each_key(
+        &self,
+        prefix: &str,
+        f: &mut (dyn FnMut(String) + Send),
+    ) -> Result<(), KvError> {
         self.consume_last_per_subject(prefix, true, |msg, key| {
             // Skip both real KV deletes and CAS tombstones (empty-value Puts
             // written by delete_with_version). get()/scan() hide the latter, so
@@ -764,13 +773,10 @@ impl KvReader for NatsKvReader {
             // With headers_only the payload is stripped, but NATS adds a
             // `Nats-Msg-Size` header we use to detect the empty value.
             if !is_kv_delete(&msg) && !is_empty_value(&msg) {
-                keys.push(key);
+                f(key);
             }
         })
-        .await?;
-
-        debug!(prefix = %prefix, keys = keys.len(), "keys listing complete");
-        Ok(keys)
+        .await
     }
 
     async fn scan(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
@@ -815,11 +821,19 @@ impl KvReader for NatsKvReader {
 /// version on every scanned entry. We instead parse from the front, accounting
 /// for the optional `<domain>.<account>` prefix that modern servers prepend.
 fn stream_sequence_from_ack(reply: &str) -> Option<u64> {
-    // The stream-seq field sits at index 5 (legacy) or 7 (modern), so we only
-    // ever read the first 8 tokens. Keep those in a stack array and count the
+    ack_fields(reply).map(|(seq, _)| seq)
+}
+
+/// The stream sequence and the message's server timestamp (Unix nanoseconds)
+/// from a JetStream ACK subject ([`stream_sequence_from_ack`] has the shapes;
+/// the timestamp is two tokens after the sequence).
+fn ack_fields(reply: &str) -> Option<(u64, Option<u64>)> {
+    // The stream-seq field sits at index 5 (legacy) or 7 (modern) and the
+    // timestamp two after it, so we only ever read the first 10 tokens. Keep
+    // those in a stack array and count the
     // remainder with the iterator — no heap `Vec`, which on a large `scan()`
     // would be one allocation per delivered message.
-    let mut head = [""; 8];
+    let mut head = [""; 10];
     let mut count = 0usize;
     for (i, token) in reply.split('.').enumerate() {
         if i < head.len() {
@@ -833,7 +847,13 @@ fn stream_sequence_from_ack(reply: &str) -> Option<u64> {
     // Legacy form has exactly 9 tokens with no domain/account; anything longer
     // carries the two-token `<domain>.<account>` prefix, shifting fields right.
     let stream_seq_idx = if count == 9 { 5 } else { 7 };
-    head[stream_seq_idx].parse::<u64>().ok()
+    let seq = head[stream_seq_idx].parse::<u64>().ok()?;
+    Some((seq, head[stream_seq_idx + 2].parse::<u64>().ok()))
+}
+
+/// Unix milliseconds of a server timestamp; 0 (unknown) before the epoch.
+fn unix_ms(t: time::OffsetDateTime) -> u64 {
+    u64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
 /// Check if a NATS message represents a KV delete/purge operation.
@@ -988,7 +1008,7 @@ impl NatsKvReader {
 /// instead of allocating a fresh copy per watch event.
 fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry) -> KvUpdate {
     use async_nats::jetstream::kv::Operation;
-    let version = VersionToken::from_u64(entry.revision);
+    let version = VersionToken::from_u64(entry.revision).written_at(unix_ms(entry.created));
     match entry.operation {
         // An empty value is a `delete_with_version` tombstone: a delete, with
         // the tombstone's own revision — the rule `get`/`scan`/`keys` apply.
@@ -1247,8 +1267,8 @@ fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<Kv
     let version = msg
         .reply
         .as_deref()
-        .and_then(stream_sequence_from_ack)
-        .map(VersionToken::from_u64)
+        .and_then(ack_fields)
+        .map(|(seq, ts)| VersionToken::from_u64(seq).written_at(ts.map_or(0, |ns| ns / 1_000_000)))
         .unwrap_or_else(VersionToken::unknown);
     let operation = msg
         .headers
@@ -1324,6 +1344,68 @@ impl NatsKvWatcher {
         Ok(stream)
     }
 
+    /// Where to resume after `cursor` (at `revision`): `revision` itself,
+    /// unless the log's first retained revision is past it AND that gap can
+    /// hold no evicted message ([`gap_holds_no_eviction`]) — then the first
+    /// retained revision's predecessor. Every message in such a gap was
+    /// superseded by a later write the resume delivers, so resuming past it
+    /// is gap-free for a last-write-wins fold, where reporting the cursor as
+    /// expired would send an evicting bucket's fold to an artifact restore it
+    /// may not be able to run yet (none newer than the node). Needs the time
+    /// the cursor's message was written, which a cursor keeps only on a
+    /// bucket that evicts, and the server's clock (`ts` in the raw
+    /// stream-info reply, NATS 2.10+); without either, `revision`.
+    ///
+    /// [`gap_holds_no_eviction`]: crate::protocol::gap_holds_no_eviction
+    async fn resume_point(&self, cursor: &WatchCursor, revision: u64) -> Result<u64, KvError> {
+        let Some(written_ms) = cursor.written_ms() else {
+            return Ok(revision);
+        };
+        let subject = format!("STREAM.INFO.KV_{}", self.bucket);
+        let raw: serde_json::Value = timed(self.js.request(subject, &()))
+            .await?
+            .map_err(|e| KvError::OperationFailed(format!("stream info for resume: {e}")))?;
+        let info: async_nats::jetstream::stream::Info = match serde_json::from_value(raw.clone()) {
+            Ok(info) => info,
+            // An API error reply (or a shape we can't read): no shortcut; the
+            // window check reports what it finds.
+            Err(_) => return Ok(revision),
+        };
+        let first = info.state.first_sequence;
+        if crate::protocol::resume_window_ok(revision, first) {
+            return Ok(revision);
+        }
+        let Some(now_ms) = raw
+            .get("ts")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ts| {
+                time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .map(unix_ms)
+        else {
+            return Ok(revision);
+        };
+        let max_age_ms = u64::try_from(info.config.max_age.as_millis()).unwrap_or(u64::MAX);
+        let age_ms = now_ms.saturating_sub(written_ms);
+        if !crate::protocol::gap_holds_no_eviction(
+            evicts_only_by_age(&info.config),
+            max_age_ms,
+            age_ms,
+        ) {
+            return Ok(revision);
+        }
+        let resume = first.saturating_sub(1);
+        info!(
+            revision,
+            first_sequence = first,
+            cursor_age_ms = age_ms,
+            max_age_ms,
+            "every message between the cursor and the first retained one was superseded \
+             (none is old enough to have aged out); resuming from the first retained"
+        );
+        Ok(resume.max(revision))
+    }
+
     /// Create a resume consumer (or watch) for `revision`, the ONE way every
     /// `*_from` path does it: the window checked before creation
     /// ([`check_resume_window`](Self::check_resume_window); `create` gets the
@@ -1372,9 +1454,18 @@ impl NatsKvWatcher {
 /// counts. When this returns false, a key missing from the bucket was deleted;
 /// when it returns true, it may simply have aged out.
 fn evicts_current_values(config: &async_nats::jetstream::stream::Config) -> bool {
+    !config.max_age.is_zero() || evicts_other_than_by_age(config)
+}
+
+/// Current values go only by age: `max_age`, and neither per-message TTLs nor
+/// a `discard: old` limit.
+fn evicts_only_by_age(config: &async_nats::jetstream::stream::Config) -> bool {
+    !config.max_age.is_zero() && !evicts_other_than_by_age(config)
+}
+
+fn evicts_other_than_by_age(config: &async_nats::jetstream::stream::Config) -> bool {
     use async_nats::jetstream::stream::DiscardPolicy as NatsDiscard;
-    !config.max_age.is_zero()
-        || config.allow_message_ttl
+    config.allow_message_ttl
         || (config.discard == NatsDiscard::Old && (config.max_bytes > 0 || config.max_messages > 0))
 }
 
@@ -1439,6 +1530,7 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_all(tx).await,
         };
+        let revision = self.resume_point(cursor, revision).await?;
         let start = resume_start(revision)?;
         let watcher = self
             .create_resume(revision, &"all", |_| self.kv.watch_all_from_revision(start))
@@ -1463,6 +1555,7 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_prefix(prefix, tx).await,
         };
+        let revision = self.resume_point(cursor, revision).await?;
         let nats_key = format!("{prefix}>");
         let start = resume_start(revision)?;
         let watcher = self
@@ -1492,6 +1585,7 @@ impl KvWatcher for NatsKvWatcher {
             Some(rev) if rev > 0 => rev,
             _ => return self.watch_prefixes(prefixes, tx).await,
         };
+        let revision = self.resume_point(cursor, revision).await?;
 
         // async-nats has `watch_many` (multi-filter) and `watch_from_revision`
         // (seek) but no combination of the two, so build the multi-filter

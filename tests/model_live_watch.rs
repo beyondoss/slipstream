@@ -198,6 +198,7 @@ impl LiveWatch {
             || listing_is_truth(
                 self.retention == BucketRetention::EvictsCurrent,
                 s.floor as u64 + 1,
+                false,
             );
         match plan_repair(RepairMode::Auto, Some(truth)) {
             RepairPlan::Restore => true,

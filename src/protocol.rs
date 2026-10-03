@@ -10,10 +10,11 @@
 //! | [`resume_window_ok`]       | `nats` resume paths (`check_resume_window`), the live floor guard | every model |
 //! | [`restore_allowed`]        | `repair::check_restore`             | `model.rs` `Act::RestoreRead`, live `GuardRepair`, repair-steps `WPlan`, fleet `Repair` |
 //! | [`restore_ahead`]          | `repair::check_restore`, the main loop's re-check (`repair::fold_in`) | repair-steps restore reply |
-//! | [`listing_is_truth`]       | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention |
+//! | [`listing_is_truth`] / [`listing_truth`] | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention; repair-steps `ConfigForgot` |
 //! | [`plan_repair`]            | `repair::plan`, `Snapshot::stale_keys` | expiry dispatch in every model |
 //! | [`cursorless_start_needs_repair`] | `repair::run_watch`          | repair-steps `WStart`, fleet `Start` |
 //! | [`restore_key`]            | `repair::restore_diff`              | repair-steps restore op |
+//! | [`gap_holds_no_eviction`]  | `nats` resume (`NatsKvWatcher::resume_point`) | — (unit-tested; `tests/eviction.rs` live) |
 //!
 //! Because the model transitions call these very functions, a change to any
 //! of them is re-verified against the full bounded state space on the next
@@ -26,6 +27,8 @@
 //! Kernels operate on plain `u64` ranks (a [`WatchCursor`](crate::WatchCursor)'s
 //! revision, with revisionless cursors ranked 0 by the callers) so they stay
 //! free of I/O types and usable from the checker's `u8`-bounded state space.
+
+use crate::kv::Retention;
 
 /// What the publisher observed at the pointer key before deciding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,10 +154,33 @@ pub fn restore_ahead(artifact_revision: u64, local_revision: u64) -> bool {
 
 /// Is the bucket's key listing the truth — does "not listed" mean
 /// "deleted"? Yes when retention never evicts current values, and also when
-/// it can but has evicted nothing yet (first retained revision ≤ 1).
+/// it can but has evicted nothing yet (first retained revision ≤ 1) — unless
+/// the fold has ever seen this answer be no (`seen_evicting`). Retention can be edited: a key that aged out while
+/// `max_age` or `discard: old` was in force stays missing from the listing
+/// after the setting is removed (or the bucket recreated), so the current
+/// config alone can't vouch for the listing.
 /// Erring toward `false` is safe: it only routes a repair to an artifact.
-pub fn listing_is_truth(evicts_current_values: bool, first_revision: u64) -> bool {
-    !evicts_current_values || resume_window_ok(0, first_revision)
+pub fn listing_is_truth(
+    evicts_current_values: bool,
+    first_revision: u64,
+    seen_evicting: bool,
+) -> bool {
+    !seen_evicting && (!evicts_current_values || resume_window_ok(0, first_revision))
+}
+
+/// [`listing_is_truth`] for retention as a watcher reports it: `None` when
+/// the backend can't say and the fold never saw it evict — then the caller's
+/// chosen repair decides ([`plan_repair`]).
+pub fn listing_truth(retention: Option<Retention>, seen_evicting: bool) -> Option<bool> {
+    match retention {
+        Some(r) => Some(listing_is_truth(
+            r.evicts_current_values,
+            r.first_revision,
+            seen_evicting,
+        )),
+        None if seen_evicting => Some(false),
+        None => None,
+    }
 }
 
 /// The repair a watch armed for an expired cursor, without its payloads
@@ -270,6 +296,20 @@ pub fn restore_key(
     }
 }
 
+/// Can a resume gap that looks expired (the log's first retained revision is
+/// past the cursor's successor) hold no evicted message? Only when age is the
+/// log's sole way to evict a current value (`age_only`: `max_age`, no
+/// per-message TTLs, no `discard: old` limit) and the cursor's own message
+/// is at most half of `max_age` old: every later message is younger still, so
+/// none has aged out, and each one missing was superseded by a later write
+/// the resume delivers. Half rather than all of `max_age` is headroom for
+/// clock steps and leader changes between the server that stamped the
+/// message and the one reporting the time. `cursor_age_ms` is 0 when the
+/// stamp is ahead of the clock.
+pub fn gap_holds_no_eviction(age_only: bool, max_age_ms: u64, cursor_age_ms: u64) -> bool {
+    age_only && max_age_ms > 0 && cursor_age_ms.saturating_mul(2) <= max_age_ms
+}
+
 /// Sequence the watch should start at after applying `revision`.
 ///
 /// `None` at `u64::MAX`: wrapping to 0 would silently replay the bucket
@@ -319,6 +359,19 @@ mod tests {
     }
 
     #[test]
+    fn gap_holds_no_eviction_boundaries() {
+        assert!(gap_holds_no_eviction(true, 60_000, 0));
+        assert!(gap_holds_no_eviction(true, 60_000, 30_000));
+        assert!(!gap_holds_no_eviction(true, 60_000, 30_001));
+        assert!(!gap_holds_no_eviction(false, 60_000, 0), "other eviction");
+        assert!(!gap_holds_no_eviction(true, 0, 0), "no max_age");
+        assert!(
+            !gap_holds_no_eviction(true, 60_000, u64::MAX),
+            "no overflow"
+        );
+    }
+
+    #[test]
     fn repair_planner_is_total() {
         use RepairMode::*;
         for truth in [Option::None, Some(true), Some(false)] {
@@ -339,12 +392,30 @@ mod tests {
             RepairPlan::Restore,
             "unknown: restore"
         );
-        assert!(listing_is_truth(false, 99));
+        assert!(listing_is_truth(false, 99, false));
         assert!(
-            listing_is_truth(true, 1),
+            listing_is_truth(true, 1, false),
             "evicting, but nothing evicted yet"
         );
-        assert!(!listing_is_truth(true, 2));
+        assert!(!listing_is_truth(true, 2, false));
+        assert!(
+            !listing_is_truth(false, 99, true),
+            "eviction removed from the config, but the fold saw it in force"
+        );
+        let r = |evicts| {
+            Some(Retention {
+                evicts_current_values: evicts,
+                first_revision: 9,
+            })
+        };
+        assert_eq!(listing_truth(r(false), false), Some(true));
+        assert_eq!(listing_truth(r(false), true), Some(false));
+        assert_eq!(listing_truth(Option::None, false), Option::None);
+        assert_eq!(
+            listing_truth(Option::None, true),
+            Some(false),
+            "the memo speaks even when the backend can't"
+        );
         assert!(
             cursorless_start_needs_repair(Relist, true, Some(true)),
             "data, no cursor"
