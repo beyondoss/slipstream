@@ -161,6 +161,11 @@ impl Default for BatchConfig {
 /// Returns the final applied cursor when the watch ends (shutdown signalled, or
 /// the underlying stream closed).
 ///
+/// On every exit, `Ok` or `Err`, the store is closed on its own thread, never
+/// on the runtime, and the return waits up to 30 s for that close — so a
+/// caller may reopen the same path, and a store whose close hangs cannot
+/// freeze the runtime or swallow the watch's result.
+///
 /// `store` is any [`SnapshotStore`] backend the consumer chose (the in-RAM
 /// [`AppendLogSnapshot`](crate::AppendLogSnapshot) default, an on-disk backend, or
 /// its own impl) — or `None` to run without persistence. On each flush, *after*
@@ -283,116 +288,168 @@ where
     let applied = resume.clone().unwrap_or_else(WatchCursor::none);
     let mut fold = Fold::new(store, parse, apply, on_applied, config.max, applied);
 
-    // Spawn the watch task. It owns the cursor-expiry handling so the main loop
-    // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
-    let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
-    let handle = tokio::spawn(repair::run_watch(
-        watcher, scope, resume, unanchored, repair, tx,
-    ));
-    // A fatal error ends the watch, and the watch task with it.
-    let stop = |e: KvError| {
-        handle.abort();
-        e
-    };
+    // The loop only borrows `fold`, so every exit path — `?`, `return`, a
+    // clean shutdown — comes back here with the store still owned, to be
+    // closed off the runtime (see `close_off_runtime`).
+    let result: Result<WatchCursor, KvError> = async {
+        // Spawn the watch task. It owns the cursor-expiry handling so the main loop
+        // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
+        let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
+        let handle = tokio::spawn(repair::run_watch(
+            watcher, scope, resume, unanchored, repair, tx,
+        ));
+        // A fatal error ends the watch, and the watch task with it.
+        let stop = |e: KvError| {
+            handle.abort();
+            e
+        };
 
-    // A single timer future, reset in place each time a batch opens. The old
-    // `tokio::time::sleep(timeout)` lived inside the select arm, so it was
-    // re-created on every loop iteration — one Arc-backed timer-wheel entry
-    // allocated, registered, and immediately dropped per received update.
-    // Pinning one future and `reset`-ing it reuses that single allocation; the
-    // `if fold.is_open()` guard keeps it from firing while idle, so its
-    // initial already-elapsed deadline is never observed.
-    let sleep = tokio::time::sleep(Duration::ZERO);
-    tokio::pin!(sleep);
+        // A single timer future, reset in place each time a batch opens. The old
+        // `tokio::time::sleep(timeout)` lived inside the select arm, so it was
+        // re-created on every loop iteration — one Arc-backed timer-wheel entry
+        // allocated, registered, and immediately dropped per received update.
+        // Pinning one future and `reset`-ing it reuses that single allocation; the
+        // `if fold.is_open()` guard keeps it from firing while idle, so its
+        // initial already-elapsed deadline is never observed.
+        let sleep = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(sleep);
 
-    loop {
-        tokio::select! {
-            biased;
+        loop {
+            tokio::select! {
+                biased;
 
-            // Shutdown wins: flush whatever is batched (so the cursor reflects
-            // it), abandon any updates still in flight on the channel — they
-            // weren't applied, the cursor doesn't claim them, and they'll be
-            // re-delivered on the next resume — and return the applied cursor.
-            res = shutdown.changed() => {
-                if res.is_err() || *shutdown.borrow() {
-                    fold.flush().await.map_err(stop)?;
-                    handle.abort();
-                    // Observe the task's terminal state. An abort surfaces as a
-                    // cancelled JoinError, which we ignore; a genuine panic that
-                    // raced ahead of the abort is logged rather than silently lost.
-                    if let Err(join) = handle.await
-                        && !join.is_cancelled()
-                    {
-                        warn!(error = %join, "watch task panicked at shutdown");
-                    }
-                    return Ok(fold.applied().clone());
-                }
-            }
-
-            // Batch window elapsed.
-            () = &mut sleep, if fold.is_open() => {
-                fold.flush().await.map_err(stop)?;
-            }
-
-            // Cursor-expiry repair. Placed before `rx.recv()` (biased), but
-            // ordering against the update stream comes from the backlog drain
-            // in `repair::fold_in` and the ack/reply protocol: the watch task
-            // is parked until this arm finishes, so nothing from its next
-            // watch can interleave.
-            req = async { repairs.as_mut().expect("arm guarded by is_some").recv().await },
-                if repairs.is_some() => {
-                match req {
-                    Some(req) => {
-                        repair::fold_in(&mut fold, req, &mut rx, &prefixes)
-                            .await
-                            .map_err(stop)?;
-                    }
-                    None => repairs = None,
-                }
-            }
-
-            // Export request. Placed after shutdown/window (they stay prompt)
-            // and before `rx.recv()` so a firehose of updates cannot starve an
-            // export indefinitely.
-            req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
-                if exports.is_some() => {
-                match req {
-                    Some(req) => fold.export(req, &prefixes).await.map_err(stop)?,
-                    // Sender dropped: disarm the arm for the rest of the run.
-                    None => exports = None,
-                }
-            }
-
-            update = rx.recv() => {
-                match update {
-                    Some(u) => {
-                        // Arm the window on the first received update of a
-                        // batch — even a parse-rejected one, so the cursor
-                        // advances within `window` even through a run of
-                        // irrelevant keys.
-                        if !fold.is_open() {
-                            sleep.as_mut().reset(tokio::time::Instant::now() + config.window);
-                        }
-                        if fold.ingest(u) {
-                            fold.flush().await.map_err(stop)?;
-                        }
-                    }
-                    None => {
-                        // Stream closed. Flush the remainder, then surface the
-                        // watch task's terminal result: a clean end returns the
-                        // applied cursor, an error propagates.
+                // Shutdown wins: flush whatever is batched (so the cursor reflects
+                // it), abandon any updates still in flight on the channel — they
+                // weren't applied, the cursor doesn't claim them, and they'll be
+                // re-delivered on the next resume — and return the applied cursor.
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
                         fold.flush().await.map_err(stop)?;
-                        return match handle.await {
-                            Ok(Ok(())) => Ok(fold.applied().clone()),
-                            Ok(Err(e)) => Err(e),
-                            Err(join) => Err(KvError::WatchError(format!(
-                                "watch task panicked: {join}"
-                            ))),
-                        };
+                        handle.abort();
+                        // Observe the task's terminal state. An abort surfaces as a
+                        // cancelled JoinError, which we ignore; a genuine panic that
+                        // raced ahead of the abort is logged rather than silently lost.
+                        if let Err(join) = handle.await
+                            && !join.is_cancelled()
+                        {
+                            warn!(error = %join, "watch task panicked at shutdown");
+                        }
+                        return Ok(fold.applied().clone());
+                    }
+                }
+
+                // Batch window elapsed.
+                () = &mut sleep, if fold.is_open() => {
+                    fold.flush().await.map_err(stop)?;
+                }
+
+                // Cursor-expiry repair. Placed before `rx.recv()` (biased), but
+                // ordering against the update stream comes from the backlog drain
+                // in `repair::fold_in` and the ack/reply protocol: the watch task
+                // is parked until this arm finishes, so nothing from its next
+                // watch can interleave.
+                req = async { repairs.as_mut().expect("arm guarded by is_some").recv().await },
+                    if repairs.is_some() => {
+                    match req {
+                        Some(req) => {
+                            repair::fold_in(&mut fold, req, &mut rx, &prefixes)
+                                .await
+                                .map_err(stop)?;
+                        }
+                        None => repairs = None,
+                    }
+                }
+
+                // Export request. Placed after shutdown/window (they stay prompt)
+                // and before `rx.recv()` so a firehose of updates cannot starve an
+                // export indefinitely.
+                req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
+                    if exports.is_some() => {
+                    match req {
+                        Some(req) => fold.export(req, &prefixes).await.map_err(stop)?,
+                        // Sender dropped: disarm the arm for the rest of the run.
+                        None => exports = None,
+                    }
+                }
+
+                update = rx.recv() => {
+                    match update {
+                        Some(u) => {
+                            // Arm the window on the first received update of a
+                            // batch — even a parse-rejected one, so the cursor
+                            // advances within `window` even through a run of
+                            // irrelevant keys.
+                            if !fold.is_open() {
+                                sleep.as_mut().reset(tokio::time::Instant::now() + config.window);
+                            }
+                            if fold.ingest(u) {
+                                fold.flush().await.map_err(stop)?;
+                            }
+                        }
+                        None => {
+                            // Stream closed. Flush the remainder, then surface the
+                            // watch task's terminal result: a clean end returns the
+                            // applied cursor, an error propagates.
+                            fold.flush().await.map_err(stop)?;
+                            return match handle.await {
+                                Ok(Ok(())) => Ok(fold.applied().clone()),
+                                Ok(Err(e)) => Err(e),
+                                Err(join) => Err(KvError::WatchError(format!(
+                                    "watch task panicked: {join}"
+                                ))),
+                            };
+                        }
                     }
                 }
             }
         }
+    }
+    .await;
+    if let Some(store) = fold.take_store() {
+        close_off_runtime(store).await;
+    }
+    result
+}
+
+/// How long [`watch_applied`] waits for its store to close before returning
+/// without it.
+const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Drop `store` on a detached thread, waiting up to [`STORE_CLOSE_TIMEOUT`].
+///
+/// A store's destructor can block: fjall's `Database::drop` joins its worker
+/// pool, and in fjall 3.1.x can deadlock doing so — a blocking `send(Close)`
+/// into its full worker channel after the last worker has already exited.
+/// Dropped on the runtime, that parks a tokio worker forever; on a
+/// single-worker runtime (a service under `CPUQuota=100%`) it freezes the
+/// whole process, and the caller never sees the error this watch returned.
+///
+/// A std thread, not `spawn_blocking`: runtime shutdown waits on blocking
+/// tasks, so a hung close there would only move the hang to process exit. A
+/// normal close finishes well inside the timeout, so a caller that reopens
+/// the same path after we return still finds it unlocked; past the timeout we
+/// return anyway and leave the closing thread behind.
+async fn close_off_runtime<S: Send + 'static>(store: S) {
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("fold-close".into())
+        .spawn(move || {
+            drop(store);
+            let _ = done_tx.send(());
+        });
+    if let Err(e) = spawned {
+        // `spawn` dropped the closure, and the store with it, on this thread.
+        warn!(error = %e, "could not spawn the store-close thread; closed inline");
+        return;
+    }
+    if tokio::time::timeout(STORE_CLOSE_TIMEOUT, done_rx)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = STORE_CLOSE_TIMEOUT.as_secs(),
+            "snapshot store did not close in time; returning without it"
+        );
     }
 }
 
@@ -2243,6 +2300,135 @@ mod tests {
             Some(b"2".to_vec())
         );
     }
+    /// A SnapshotStore that runs `on_drop` when dropped — to observe where
+    /// and when `watch_applied` closes its store.
+    struct DropProbeStore {
+        inner: AppendLogSnapshot,
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl Drop for DropProbeStore {
+        fn drop(&mut self) {
+            if let Some(f) = self.on_drop.take() {
+                f();
+            }
+        }
+    }
+
+    impl crate::snapshot::SnapshotStore for DropProbeStore {
+        fn load(
+            _path: &std::path::Path,
+        ) -> Result<(WatchCursor, Self), crate::snapshot::SnapshotError> {
+            unreachable!("test store is constructed directly")
+        }
+        fn apply(
+            &mut self,
+            batch: &[KvUpdate],
+            cursor: &WatchCursor,
+        ) -> Result<(), crate::snapshot::SnapshotError> {
+            self.inner.apply(batch, cursor)
+        }
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.get(key)
+        }
+        fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.range(prefix)
+        }
+        fn cursor(&self) -> WatchCursor {
+            self.inner.cursor()
+        }
+        fn export_to(
+            &mut self,
+            dest_dir: &std::path::Path,
+        ) -> Result<crate::artifact::ExportManifest, crate::snapshot::SnapshotError> {
+            self.inner.export_to(dest_dir)
+        }
+    }
+
+    fn drop_probe_store(
+        dir: &tempfile::TempDir,
+        on_drop: impl FnOnce() + Send + 'static,
+    ) -> DropProbeStore {
+        let (_c, inner) = AppendLogSnapshot::open(&dir.path().join("fold.snap"), u64::MAX).unwrap();
+        DropProbeStore {
+            inner,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    /// A store whose close never finishes (fjall 3.1.x `Database::drop` can
+    /// deadlock) must not take the runtime with it. This runs on a
+    /// current-thread runtime — the single-worker shape of a service under
+    /// `CPUQuota=100%` — where a store dropped on the runtime parks the only
+    /// worker: pre-fix, `watch_applied` never returned its error and this
+    /// test hung.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_hangs_on_close_cannot_freeze_the_runtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = drop_probe_store(&dir, move || {
+            let _ = release_rx.recv();
+        });
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let res = watch_applied(
+            Arc::new(ErrorWatcher),
+            WatchScope::All,
+            None,
+            None,
+            Some(store),
+            None,
+            BatchConfig::default(),
+            parse_put,
+            |_batch: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await;
+
+        assert!(
+            matches!(&res, Err(KvError::WatchError(m)) if m.contains("injected watch failure")),
+            "the watch's own error reaches the caller, got {res:?}"
+        );
+        // Let the abandoned close thread finish.
+        release_tx.send(()).unwrap();
+    }
+
+    /// A store that closes normally is closed BEFORE `watch_applied` returns,
+    /// so a caller can reopen the same path (fjall holds a lock file until
+    /// its `Database` drops). Real time, not paused: a paused clock
+    /// auto-advances while the runtime idles on the close thread, firing the
+    /// close timeout at once.
+    #[tokio::test]
+    async fn the_store_is_closed_before_watch_applied_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = Arc::clone(&closed);
+        let store = drop_probe_store(&dir, move || c.store(true, Ordering::SeqCst));
+        let watcher = Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true));
+        let (sd_tx, sd_rx) = watch::channel(false);
+
+        let task = tokio::spawn(watch_applied(
+            watcher,
+            WatchScope::All,
+            None,
+            None,
+            Some(store),
+            None,
+            BatchConfig::default(),
+            parse_put,
+            |_batch: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sd_tx.send(true).unwrap();
+        let cursor = task.await.unwrap().unwrap();
+
+        assert_eq!(cursor.as_u64(), Some(1));
+        assert!(closed.load(Ordering::SeqCst), "store closed before return");
+    }
+
     /// A reader whose live-key listing always fails — the resync's I/O
     /// failure mode.
     struct FailingReader;
