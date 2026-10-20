@@ -243,13 +243,85 @@ pub async fn watch_applied<U, S, P, A, O, R>(
     // artifact's manifest records this watch's scope, which a restore checks.
     // `None` (or dropping the paired sender) leaves the loop's behavior
     // unchanged.
+    exports: Option<mpsc::Receiver<ExportRequest>>,
+    config: BatchConfig,
+    parse: P,
+    apply: A,
+    on_applied: O,
+    shutdown: watch::Receiver<bool>,
+) -> Result<WatchCursor, KvError>
+where
+    U: Send,
+    // `Send + 'static`: each flush moves `store` onto a blocking task to run its
+    // (potentially blocking) `apply`, then takes it back — the same offload the
+    // append log's compaction always used.
+    S: SnapshotStore + Send + 'static,
+    P: FnMut(&KvUpdate) -> Option<U> + Send,
+    A: FnMut(Vec<U>) + Send,
+    O: FnMut(WatchCursor) + Send,
+    R: Into<ExpiryRepair<S>>,
+{
+    let end = watch_applied_owned(
+        watcher, scope, resume, repair, store, exports, config, parse, apply, on_applied, shutdown,
+    )
+    .await;
+    if let Some(store) = end.store {
+        close_off_runtime(store).await;
+    }
+    end.result
+}
+
+/// How a [`watch_applied_owned`] run ended.
+pub struct WatchEnd<S> {
+    /// The run's result: the applied cursor on a clean end or a shutdown, the
+    /// error otherwise.
+    pub result: Result<WatchCursor, KvError>,
+    /// The applied cursor at the end, error or not: everything up to it was
+    /// applied and, with a store, committed with it. The `resume` for the next
+    /// run.
+    pub applied: WatchCursor,
+    /// The store, intact. `None` when none was given, or it was lost (a
+    /// flush task panicked).
+    pub store: Option<S>,
+}
+
+/// [`watch_applied`], handing the store back instead of closing it.
+///
+/// On every exit, a watch error included, the [`WatchEnd`] carries the store
+/// intact and the applied cursor it committed with (data and cursor commit
+/// together). A caller that keeps readers open on the store can therefore
+/// resume in-process: call again with the same store and `resume` set to
+/// [`WatchEnd::applied`]. Nothing the store holds is re-applied out of order and
+/// nothing is skipped. A store that comes back `None` was lost (a flush task
+/// panicked); only a fresh open recovers from that. Closing a returned store
+/// is the caller's job: drop it off the runtime (fjall's `Database::drop` can
+/// block; see [`watch_applied`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn watch_applied_owned<U, S, P, A, O, R>(
+    watcher: Arc<dyn KvWatcher>,
+    scope: WatchScope,
+    resume: Option<WatchCursor>,
+    // How an expired cursor is repaired (see the function docs). Only
+    // consulted on expiry (and, for a restore, at a cursor-less start on a
+    // bucket that has already evicted current values) — the hot path never
+    // touches it.
+    repair: R,
+    store: Option<S>,
+    // `Some(rx)` arms an export-request arm in the select loop: each
+    // [`ExportRequest`] is handled between flushes (pending batch flushed
+    // first), so the exported artifact's cursor is the applied cursor (or,
+    // across a transiently failed store flush, the store's own lagging but
+    // self-consistent cursor — never a cursor past unfolded data). The
+    // artifact's manifest records this watch's scope, which a restore checks.
+    // `None` (or dropping the paired sender) leaves the loop's behavior
+    // unchanged.
     mut exports: Option<mpsc::Receiver<ExportRequest>>,
     config: BatchConfig,
     parse: P,
     apply: A,
     on_applied: O,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<WatchCursor, KvError>
+) -> WatchEnd<S>
 where
     U: Send,
     // `Send + 'static`: each flush moves `store` onto a blocking task to run its
@@ -270,14 +342,27 @@ where
     // store to run it against (both repairs edit the fold). The watch task
     // sends the repair here and waits for the ack/reply before starting its
     // next watch.
-    let (repair, mut repairs) = repair::arm(repair.into(), store.is_some())?;
+    let start = resume.clone().unwrap_or_else(WatchCursor::none);
+    let early = |e: KvError, store: Option<S>| WatchEnd {
+        result: Err(e),
+        applied: start.clone(),
+        store,
+    };
+    let (repair, mut repairs) = match repair::arm(repair.into(), store.is_some()) {
+        Ok(armed) => armed,
+        Err(e) => return early(e, store),
+    };
 
     // A fold with data but no cursor can't be re-listed blind (see
     // `repair::run_watch`).
     let unanchored = match &store {
-        Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => st
-            .has_entries()
-            .map_err(|e| KvError::WatchError(format!("reading the fold at start failed: {e}")))?,
+        Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => match st.has_entries() {
+            Ok(has) => has,
+            Err(e) => {
+                let e = KvError::WatchError(format!("reading the fold at start failed: {e}"));
+                return early(e, store);
+            }
+        },
         _ => false,
     };
 
@@ -405,10 +490,11 @@ where
         }
     }
     .await;
-    if let Some(store) = fold.take_store() {
-        close_off_runtime(store).await;
+    WatchEnd {
+        result,
+        applied: fold.applied().clone(),
+        store: fold.take_store(),
     }
-    result
 }
 
 /// How long [`watch_applied`] waits for its store to close before returning
@@ -1398,6 +1484,116 @@ mod tests {
         assert_eq!(snap.cursor.as_u64(), Some(10));
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.entries["node.a"].value, b"1b");
+    }
+
+    /// A watch that dies mid-stream (a NATS heartbeat miss) hands its store
+    /// back with the cursor it committed, and a second run on the same store,
+    /// resumed from that cursor, folds what changed during the gap: the caller
+    /// never has to close the store and re-open it.
+    #[tokio::test]
+    async fn owned_watch_hands_the_store_back_and_resumes_in_process() {
+        struct DiesAfter(Mutex<Option<Vec<KvUpdate>>>);
+        #[async_trait]
+        impl KvWatcher for DiesAfter {
+            async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError> {
+                let updates = self.0.lock().unwrap().take().unwrap_or_default();
+                for u in updates {
+                    let _ = tx.send(u).await;
+                }
+                Err(KvError::WatchError(
+                    "watcher consumer error: missed idle heartbeat".into(),
+                ))
+            }
+            async fn watch_prefix(&self, _p: &str, tx: Sender<KvUpdate>) -> Result<(), KvError> {
+                self.watch_all(tx).await
+            }
+            async fn watch_prefixes(
+                &self,
+                _p: &[&str],
+                tx: Sender<KvUpdate>,
+            ) -> Result<(), KvError> {
+                self.watch_all(tx).await
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("owned.snap");
+        let (_r, store) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        // Run 1: folds a@1 and b@2, then the watch dies.
+        let end = watch_applied_owned(
+            Arc::new(DiesAfter(Mutex::new(Some(vec![
+                put("node.a", b"1", 1),
+                put("node.b", b"2", 2),
+            ])))),
+            WatchScope::All,
+            None,
+            None::<Arc<dyn KvReader>>,
+            Some(store),
+            None,
+            BatchConfig::default(),
+            |_u: &KvUpdate| Some(()),
+            |_b: Vec<()>| {},
+            |_| {},
+            sd_rx.clone(),
+        )
+        .await;
+        assert!(
+            matches!(&end.result, Err(KvError::WatchError(m)) if m.contains("missed idle heartbeat")),
+            "the watch error is surfaced"
+        );
+        assert_eq!(
+            end.applied.as_u64(),
+            Some(2),
+            "everything delivered was applied"
+        );
+        let store = end.store.expect("the store comes back intact");
+        assert_eq!(store.get("node.a").unwrap().unwrap().value, b"1");
+
+        // Run 2, same store, resumed at the applied cursor: during the gap b
+        // was deleted and c written. The stream then closes cleanly.
+        let resumed = MockWatcher {
+            full: Mutex::new(Some(vec![])),
+            from: Mutex::new(Some(vec![
+                KvUpdate::Delete {
+                    key: "node.b".into(),
+                    version: VersionToken::from_u64(3),
+                },
+                put("node.c", b"3", 4),
+            ])),
+            from_expires: false,
+            hold: false,
+        };
+        let end = watch_applied_owned(
+            Arc::new(resumed),
+            WatchScope::All,
+            Some(end.applied),
+            None::<Arc<dyn KvReader>>,
+            Some(store),
+            None,
+            BatchConfig::default(),
+            |_u: &KvUpdate| Some(()),
+            |_b: Vec<()>| {},
+            |_| {},
+            sd_rx,
+        )
+        .await;
+        assert_eq!(end.result.unwrap().as_u64(), Some(4));
+        let store = end.store.expect("the store comes back on a clean end too");
+        assert!(
+            store.get("node.b").unwrap().is_none(),
+            "the gap's delete landed"
+        );
+        assert_eq!(store.get("node.c").unwrap().unwrap().value, b"3");
+        assert_eq!(store.get("node.a").unwrap().unwrap().value, b"1");
+        drop(store);
+        let snap = crate::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(
+            snap.cursor.as_u64(),
+            Some(4),
+            "the cursor committed with the data"
+        );
     }
 
     /// A prefix-scoped resync diffs only in-scope keys: an out-of-scope key the
