@@ -177,14 +177,29 @@ impl SnapshotWriter {
         // fewer syscalls and race-free — the length we read is the length of the
         // file we hold open.
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let existing_len = file.metadata()?.len();
+        let mut existing_len = file.metadata()?.len();
+
+        // Never append after a torn record: the next record would land behind
+        // it, and the log would be corrupt mid-file for good (`load` fails, and
+        // so does every `compact`). A torn tail is what a short write leaves (a
+        // write that ran out of space at a block boundary, then a drop whose
+        // flush failed), or a crash mid-write when no `load` ran first. Cut it
+        // off with a truncate, which needs no free space, unlike `load`'s
+        // rewrite. Mid-file corruption is refused here as it is in `load`.
+        if existing_len > 0 {
+            let valid = valid_prefix_len(&fs::read(path)?)? as u64;
+            if valid < existing_len {
+                file.set_len(valid)?;
+                existing_len = valid;
+            }
+        }
 
         let mut writer = io::BufWriter::new(file);
 
         // A file with at least a full header is an existing log: everything past
         // the 6-byte header counts toward the compaction threshold. Anything
-        // shorter (brand-new, or a header torn by a crash mid-create) gets a
-        // fresh header written before the first record.
+        // shorter (brand-new, or a header torn by a crash mid-create, truncated
+        // to empty above) gets a fresh header written before the first record.
         let bytes_since_compact = if existing_len >= HEADER_LEN as u64 {
             existing_len - HEADER_LEN as u64
         } else {
@@ -785,6 +800,35 @@ fn replay_log(data: &[u8]) -> Result<(HashMap<String, KvEntry>, WatchCursor, boo
 
     let already_compact = !redundant && clean_eof;
     Ok((entries, cursor, already_compact))
+}
+
+/// The length of `data`'s longest prefix that is a whole log: the header and
+/// every complete, CRC-valid record, stopping where a torn tail begins (the
+/// same tail rules as [`replay_log`]). `0` when even the header is torn.
+/// Mid-file corruption is an error, as in `load`.
+fn valid_prefix_len(data: &[u8]) -> Result<usize, SnapshotError> {
+    if data.len() < HEADER_LEN {
+        return Ok(0);
+    }
+    if &data[0..4] != MAGIC {
+        return Err(SnapshotError::InvalidFormat("bad magic".into()));
+    }
+    let mut pos = HEADER_LEN;
+    while pos < data.len() {
+        match parse_record(&data[pos..]) {
+            Ok((_, consumed)) => pos += consumed,
+            Err(RecordError::Truncated) => break,
+            Err(RecordError::CrcMismatch { consumed }) => {
+                if pos + consumed >= data.len() || data.len() - (pos + consumed) < MIN_CURSOR_RECORD
+                {
+                    break;
+                }
+                return Err(SnapshotError::Corrupted);
+            }
+            Err(RecordError::Invalid(msg)) => return Err(SnapshotError::InvalidFormat(msg)),
+        }
+    }
+    Ok(pos)
 }
 
 enum Record<'a> {
@@ -1423,6 +1467,76 @@ mod tests {
         assert_eq!(snap.entries.len(), 3);
         assert!(snap.entries.contains_key("c"));
         assert_eq!(snap.cursor.as_u64(), Some(3));
+    }
+
+    /// A short write (the disk ran out at a block boundary) leaves part of a
+    /// record on disk, and a writer opened without a `load` first appended
+    /// after it: the log was corrupt mid-file for good, and every later
+    /// `load` and `compact` failed with a CRC mismatch. Opening now cuts the
+    /// torn tail off first.
+    #[test]
+    fn open_after_a_torn_tail_never_appends_behind_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.snap");
+
+        let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        w.write_update(&put("a", b"v1", 1)).unwrap();
+        w.checkpoint(&cursor(1)).unwrap();
+        drop(w);
+
+        // The first 6 bytes of a cursor record made it; the rest did not.
+        let mut torn = Vec::new();
+        write_cursor_record(&mut torn, &cursor(2)).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&torn[..6]).unwrap();
+        drop(f);
+
+        // No load in between: the writer is reopened as-is.
+        let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        w.write_update(&put("b", b"v2", 3)).unwrap();
+        w.checkpoint(&cursor(3)).unwrap();
+        w.compact().expect("the log compacts");
+        drop(w);
+
+        let snap = load(&path).unwrap().unwrap();
+        assert_eq!(snap.entries.len(), 2);
+        assert_eq!(snap.cursor.as_u64(), Some(3));
+    }
+
+    /// A header torn by a crash mid-create is replaced, not appended to.
+    #[test]
+    fn open_after_a_torn_header_starts_a_fresh_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.snap");
+        fs::write(&path, &MAGIC[..3]).unwrap();
+
+        let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        w.write_update(&put("a", b"v1", 1)).unwrap();
+        w.checkpoint(&cursor(1)).unwrap();
+        drop(w);
+
+        let snap = load(&path).unwrap().unwrap();
+        assert_eq!(snap.entries.len(), 1);
+    }
+
+    /// Mid-file corruption is refused on open, as `load` refuses it.
+    #[test]
+    fn open_refuses_mid_file_corruption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.snap");
+        let mut w = SnapshotWriter::open(&path, u64::MAX).unwrap();
+        w.write_update(&put("a", b"v1", 1)).unwrap();
+        w.write_update(&put("b", b"v2", 2)).unwrap();
+        w.checkpoint(&cursor(2)).unwrap();
+        drop(w);
+        let mut data = fs::read(&path).unwrap();
+        data[HEADER_LEN + 12] ^= 0xff; // the first record's value
+        fs::write(&path, &data).unwrap();
+
+        assert!(matches!(
+            SnapshotWriter::open(&path, u64::MAX),
+            Err(SnapshotError::Corrupted)
+        ));
     }
 
     #[test]

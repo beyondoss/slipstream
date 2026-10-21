@@ -482,7 +482,7 @@ Cursor:  cur_len:u8 ++ cursor_bytes
 
 Version bytes are stored as length-prefixed raw bytes, not a fixed `u64`. A 10-byte FDB versionstamp round-trips intact; a `u64`-only field would flatten it to 0 and break every subsequent CAS on a restored entry.
 
-CRC covers from the type byte through the end of the record. A truncated final record (crash mid-write) is silently discarded. A CRC mismatch in the middle of the file returns `SnapshotError::Corrupted`. Lengths are read before the CRC can be checked, so a corrupted length that points past EOF reads as a truncated tail and drops the records after it: the fold lands at an earlier cursor, the same shape as a tail lost to power loss. A value is at most 64 MiB (NATS's payload ceiling), enforced by the writer and the reader alike; a larger length is treated as corruption.
+CRC covers from the type byte through the end of the record. A truncated final record (crash mid-write, or a short write when the disk ran out) is silently discarded: `load` rewrites the log without it, and `SnapshotWriter::open` truncates it away before appending (a truncate needs no free space; appending behind a torn record would corrupt the log mid-file for good). A CRC mismatch in the middle of the file returns `SnapshotError::Corrupted`, from `load` and from `SnapshotWriter::open`. Lengths are read before the CRC can be checked, so a corrupted length that points past EOF reads as a truncated tail and drops the records after it: the fold lands at an earlier cursor, the same shape as a tail lost to power loss. A value is at most 64 MiB (NATS's payload ceiling), enforced by the writer and the reader alike; a larger length is treated as corruption.
 
 ### State Machine
 
