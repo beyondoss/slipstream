@@ -58,6 +58,9 @@
 //! cold-read folds favor RocksDB.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use fjall::config::{BlockSizePolicy, PinningPolicy};
@@ -99,6 +102,18 @@ const META_MEMTABLE_BYTES: u64 = 8 << 20;
 /// instead of 4 KiB on a cache-miss point read.
 const DATA_BLOCK_SIZE: u32 = 16 * 1024;
 
+/// L0 table count at which fjall's write halt can engage (it counts L0 *runs*,
+/// which are never more than tables, so tables is the conservative trigger).
+const L0_HALT_TABLES: usize = 30;
+
+/// How often the watchdog samples the data partition.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Consecutive samples of "L0 at the halt line, compactor idle" before the
+/// watchdog acts. Compaction picks come in bursts; 5 s idle behind 30 L0 tables
+/// is the wedge, not a gap between picks.
+const WATCHDOG_STRIKES: u32 = 5;
+
 /// Durability and read-cache configuration for [`FjallSnapshot`].
 ///
 /// Defaults to NO_SYNC (`sync: false`) — same cache philosophy as the append
@@ -119,6 +134,14 @@ pub struct FjallConfig {
     /// the cache to the hot set so hydrations stay cache-resident. `0` falls back to
     /// fjall's 32 MiB default. Set this to roughly the resident working-set size.
     pub cache_size_bytes: u64,
+
+    /// fjall flush/compaction worker threads. `0` (the default) uses
+    /// `min(cores, 16)`; on a small host that is `cores`, so hydration shares
+    /// few workers with serving.
+    pub worker_threads: usize,
+
+    /// Data-partition memtable size in bytes. `0` (the default) uses 256 MiB.
+    pub memtable_bytes: u64,
 }
 
 impl Default for FjallConfig {
@@ -128,8 +151,30 @@ impl Default for FjallConfig {
             // 1 GiB: holds index/data blocks for a ~1e6-service working set
             // resident, matching the routing registries' default resident cap.
             cache_size_bytes: 1024 * 1024 * 1024,
+            worker_threads: 0,
+            memtable_bytes: 0,
         }
     }
+}
+
+/// Point-in-time LSM health of a [`FjallSnapshot`], for a consumer's gauges.
+///
+/// `l0_tables >= 30` with `active_compactions == 0` is the shape of fjall's
+/// write-halt wedge: the writer is parked in `apply` and nothing drains L0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FjallStats {
+    /// L0 tables in the data partition. fjall throttles writes at 20 runs and halts at 30.
+    pub l0_tables: usize,
+    /// All tables in the data partition.
+    pub tables: usize,
+    /// Memtable flushes queued or running.
+    pub outstanding_flushes: usize,
+    /// Compactions running now.
+    pub active_compactions: usize,
+    /// Times the write-halt watchdog forced a major compaction to drain a wedged
+    /// L0. Non-zero means fjall's write-halt livelock was hit and recovered; a
+    /// rate of it means this node ingests faster than it compacts.
+    pub halt_rescues: u64,
 }
 
 /// On-disk durable fold backed by fjall. See the module docs in `src/snapshot_fjall.rs`.
@@ -144,6 +189,49 @@ pub struct FjallSnapshot {
     // fjall's `Config.path` is `pub(crate)`, so the export path keeps its own
     // copy of the DB directory for the artifact copy.
     path: PathBuf,
+    rescues: Arc<AtomicU64>,
+    /// Dropping the sender stops the watchdog; `Drop` joins it.
+    watchdog: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+}
+
+impl Drop for FjallSnapshot {
+    fn drop(&mut self) {
+        if let Some((stop, handle)) = self.watchdog.take() {
+            drop(stop);
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Un-wedge fjall's write halt.
+///
+/// fjall halts a writer while L0 holds `>= 30` runs, but enqueues compaction only
+/// from flushes (`try_send`, dropped when the queue is full) — and a halted
+/// writer makes no flushes. If the queued compactions finish without bringing L0
+/// under 30 the writer is parked forever (measured: raw 4-worker fjall 3.1.5 at
+/// 257M entries, L0 at 34 tables, no compaction running). A major compaction
+/// needs no queue message and drains L0, so run one when the condition persists.
+fn watchdog(db: Database, data: Keyspace, rescues: Arc<AtomicU64>, stop: mpsc::Receiver<()>) {
+    let mut strikes = 0u32;
+    // `recv_timeout` returns `Disconnected` the moment the snapshot drops.
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(WATCHDOG_INTERVAL) {
+        let wedged = data.l0_table_count() >= L0_HALT_TABLES
+            && db.active_compactions() == 0
+            && db.outstanding_flushes() == 0;
+        strikes = if wedged { strikes + 1 } else { 0 };
+        if strikes < WATCHDOG_STRIKES {
+            continue;
+        }
+        strikes = 0;
+        tracing::warn!(
+            l0_tables = data.l0_table_count(),
+            "fjall L0 at the write-halt line with an idle compactor; forcing a major compaction"
+        );
+        rescues.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = data.major_compact() {
+            tracing::error!(error = %e, "fjall write-halt rescue compaction failed");
+        }
+    }
 }
 
 impl FjallSnapshot {
@@ -153,10 +241,13 @@ impl FjallSnapshot {
     /// persisted resume cursor — [`WatchCursor::none`] when fresh — and the store.
     pub fn open(path: &Path, config: FjallConfig) -> Result<(WatchCursor, Self), SnapshotError> {
         std::fs::create_dir_all(path)?;
-        let workers = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4)
-            .min(MAX_WORKER_THREADS);
+        let workers = match config.worker_threads {
+            0 => std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4)
+                .min(MAX_WORKER_THREADS),
+            n => n,
+        };
         let mut builder = Database::builder(path).worker_threads(workers);
         // Size the LSM block cache to the working set (default 1 GiB). fjall's own
         // default is 32 MiB, far too small for the fold — see
@@ -168,7 +259,10 @@ impl FjallSnapshot {
         let data = db
             .keyspace(DATA_PARTITION, || {
                 KeyspaceCreateOptions::default()
-                    .max_memtable_size(DATA_MEMTABLE_BYTES)
+                    .max_memtable_size(match config.memtable_bytes {
+                        0 => DATA_MEMTABLE_BYTES,
+                        n => n,
+                    })
                     .data_block_size_policy(BlockSizePolicy::all(DATA_BLOCK_SIZE))
                     // Last-level filters are kept (no `expect_point_read_hits`):
                     // they are the only in-memory rejection for absent-key
@@ -198,6 +292,15 @@ impl FjallSnapshot {
             None => WatchCursor::none(),
         };
 
+        let rescues = Arc::new(AtomicU64::new(0));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("fjall-halt-watchdog".into())
+            .spawn({
+                let (db, data, rescues) = (db.clone(), data.clone(), rescues.clone());
+                move || watchdog(db, data, rescues, stop_rx)
+            })?;
+
         Ok((
             cursor.clone(),
             Self {
@@ -207,6 +310,8 @@ impl FjallSnapshot {
                 config,
                 cursor,
                 path: path.to_path_buf(),
+                rescues,
+                watchdog: Some((stop_tx, handle)),
             },
         ))
     }
@@ -222,8 +327,17 @@ impl FjallSnapshot {
     /// cache miss — without the serving path ever touching the writer.
     pub fn reader(&self) -> FjallReader {
         FjallReader {
+            db: self.db.clone(),
             data: self.data.clone(),
+            rescues: self.rescues.clone(),
         }
+    }
+
+    /// Current LSM health. Cheap. A scraper should poll this on a
+    /// [`reader`](Self::reader) handle: `apply` takes `&mut self`, so the
+    /// snapshot itself is unreachable while a halted write is parked inside it.
+    pub fn stats(&self) -> FjallStats {
+        self.reader().stats()
     }
 
     /// Force a major compaction of the data partition, blocking until done.
@@ -284,6 +398,7 @@ impl FjallSnapshot {
                 FjallConfig {
                     sync: true,
                     cache_size_bytes: 0,
+                    ..FjallConfig::default()
                 },
             )?;
             if staged_cursor != manifest.cursor {
@@ -399,10 +514,23 @@ fn copy_db_dir(src: &Path, dst: &Path) -> Result<(), SnapshotError> {
 /// are safe to run concurrently with it.
 #[derive(Clone)]
 pub struct FjallReader {
+    db: Database,
     data: Keyspace,
+    rescues: Arc<AtomicU64>,
 }
 
 impl FjallReader {
+    /// Current LSM health of the data partition; see [`FjallStats`].
+    pub fn stats(&self) -> FjallStats {
+        FjallStats {
+            l0_tables: self.data.l0_table_count(),
+            tables: self.data.table_count(),
+            outstanding_flushes: self.db.outstanding_flushes(),
+            active_compactions: self.db.active_compactions(),
+            halt_rescues: self.rescues.load(Ordering::Relaxed),
+        }
+    }
+
     /// Live entry for `key`, or `None` if absent/deleted.
     pub fn get(&self, key: &str) -> Result<Option<KvEntry>, SnapshotError> {
         match self.data.get(key.as_bytes()).map_err(map_fjall)? {
@@ -573,6 +701,7 @@ impl SnapshotStore for FjallSnapshot {
                 FjallConfig {
                     sync: true,
                     cache_size_bytes: 0,
+                    ..FjallConfig::default()
                 },
             )?;
             if staged_cursor != self.cursor {

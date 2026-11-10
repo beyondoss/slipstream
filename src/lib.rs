@@ -55,7 +55,7 @@ pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
 pub use repair::{ExpiryRepair, RestoreSource, RestoredFold};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
-pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot};
+pub use snapshot_fjall::{FjallConfig, FjallReader, FjallSnapshot, FjallStats};
 #[cfg(feature = "rocksdb")]
 pub use snapshot_rocksdb::{RocksDbConfig, RocksDbReader, RocksDbSnapshot};
 pub use stores::{

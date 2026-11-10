@@ -422,6 +422,7 @@ mod fjall_resync {
         FjallConfig {
             sync: false,
             cache_size_bytes: 64 << 20,
+            ..Default::default()
         }
     }
 
@@ -453,6 +454,7 @@ mod rocksdb_resync {
         RocksDbConfig {
             sync: false,
             cache_size_bytes: 64 << 20,
+            ..Default::default()
         }
     }
 

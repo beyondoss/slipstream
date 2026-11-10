@@ -283,6 +283,7 @@ mod fjall_bootstrap {
                     FjallConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
+                        ..Default::default()
                     },
                 )
                 .expect("open fjall")
@@ -294,6 +295,7 @@ mod fjall_bootstrap {
                     FjallConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
+                        ..Default::default()
                     },
                 )
             },
@@ -316,6 +318,7 @@ mod rocksdb_bootstrap {
                     RocksDbConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
+                        ..Default::default()
                     },
                 )
                 .expect("open rocksdb")
@@ -327,6 +330,7 @@ mod rocksdb_bootstrap {
                     RocksDbConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
+                        ..Default::default()
                     },
                 )
             },
