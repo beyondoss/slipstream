@@ -318,7 +318,6 @@ mod rocksdb_bootstrap {
                     RocksDbConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
-                        ..Default::default()
                     },
                 )
                 .expect("open rocksdb")
@@ -330,7 +329,6 @@ mod rocksdb_bootstrap {
                     RocksDbConfig {
                         sync: false,
                         cache_size_bytes: 64 << 20,
-                        ..Default::default()
                     },
                 )
             },

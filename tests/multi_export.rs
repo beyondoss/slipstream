@@ -797,7 +797,6 @@ mod rocksdb_multi {
         RocksDbConfig {
             sync: false,
             cache_size_bytes: 64 << 20,
-            ..Default::default()
         }
     }
 

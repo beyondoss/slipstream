@@ -129,7 +129,6 @@ impl Rocks {
         slipstream::RocksDbConfig {
             sync: false,
             cache_size_bytes: 4 << 20,
-            ..Default::default()
         }
     }
 }

@@ -283,7 +283,6 @@ async fn minio_full_bootstrap_loop_rocksdb() {
     let cfg = RocksDbConfig {
         sync: false,
         cache_size_bytes: 64 << 20,
-        ..Default::default()
     };
     full_bootstrap_loop(
         move |path| RocksDbSnapshot::open(path, cfg).expect("open rocksdb"),
@@ -294,7 +293,6 @@ async fn minio_full_bootstrap_loop_rocksdb() {
                 RocksDbConfig {
                     sync: false,
                     cache_size_bytes: 64 << 20,
-                    ..Default::default()
                 },
             )
         },
