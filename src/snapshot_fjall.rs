@@ -109,7 +109,7 @@ const L0_HALT_TABLES: usize = 30;
 /// How often the watchdog samples the data partition.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Consecutive samples of "L0 at the halt line, compactor idle" before the
+/// Consecutive samples of "no commits, L0 at the halt line, compactor idle" before the
 /// watchdog acts. Compaction picks come in bursts; 5 s idle behind 30 L0 tables
 /// is the wedge, not a gap between picks.
 const WATCHDOG_STRIKES: u32 = 5;
@@ -213,9 +213,17 @@ impl Drop for FjallSnapshot {
 /// needs no queue message and drains L0, so run one when the condition persists.
 fn watchdog(db: Database, data: Keyspace, rescues: Arc<AtomicU64>, stop: mpsc::Receiver<()>) {
     let mut strikes = 0u32;
+    let mut last_seqno = db.seqno();
     // `recv_timeout` returns `Disconnected` the moment the snapshot drops.
     while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(WATCHDOG_INTERVAL) {
-        let wedged = data.l0_table_count() >= L0_HALT_TABLES
+        // A halted writer commits nothing, so a moving sequence number means L0
+        // is high (tables, unlike runs, can be far past 30 on a healthy fold)
+        // but writes are flowing: not the wedge.
+        let seqno = db.seqno();
+        let stalled = seqno == last_seqno;
+        last_seqno = seqno;
+        let wedged = stalled
+            && data.l0_table_count() >= L0_HALT_TABLES
             && db.active_compactions() == 0
             && db.outstanding_flushes() == 0;
         strikes = if wedged { strikes + 1 } else { 0 };
