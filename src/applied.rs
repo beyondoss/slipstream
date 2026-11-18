@@ -56,7 +56,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
@@ -124,7 +125,7 @@ impl WatchScope {
 /// The window amortizes the cost of `apply` (e.g. one route-table clone per
 /// flush instead of one per update); `max` caps memory and latency when updates
 /// arrive faster than the window.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BatchConfig {
     /// Maximum time a batch stays open before being flushed.
     pub window: Duration,
@@ -138,6 +139,10 @@ pub struct BatchConfig {
     /// than [`max`](Self::max). Tune it together with `max` for high-fanout
     /// hydration; clamped to a minimum of 1.
     pub channel_capacity: usize,
+    /// Reports how long the current store apply has been in flight, so a
+    /// consumer can detect a store that stopped returning. `None` records
+    /// nothing. Has no effect without a store.
+    pub apply_probe: Option<ApplyProbe>,
 }
 
 impl Default for BatchConfig {
@@ -149,7 +154,74 @@ impl Default for BatchConfig {
             window: Duration::from_millis(10),
             max: 100,
             channel_capacity: 256,
+            apply_probe: None,
         }
+    }
+}
+
+/// Shows whether a watch's store apply is in flight, and for how long.
+///
+/// [`SnapshotStore::apply`] runs on a blocking task with no timeout, because
+/// abandoning it could not stop it and would lose the store. If it never
+/// returns, the watch stops advancing while the rest of the process stays
+/// healthy. Clone a probe into [`BatchConfig::apply_probe`], then poll
+/// [`in_flight`](Self::in_flight) from a metrics or health task and alert when
+/// the age passes your limit. Use one probe per watch.
+#[derive(Debug, Clone)]
+pub struct ApplyProbe {
+    inner: Arc<ApplyProbeInner>,
+}
+
+#[derive(Debug)]
+struct ApplyProbeInner {
+    epoch: Instant,
+    // Microseconds from `epoch` to the apply's start, plus one. Zero is idle.
+    started: AtomicU64,
+}
+
+impl ApplyProbe {
+    /// A probe with no apply in flight.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ApplyProbeInner {
+                epoch: Instant::now(),
+                started: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// How long the current store apply has been in flight, counted from when
+    /// it was handed to the blocking pool. `None` when no apply is in flight.
+    pub fn in_flight(&self) -> Option<Duration> {
+        let started = self.inner.started.load(Ordering::Relaxed).checked_sub(1)?;
+        Some(
+            self.inner
+                .epoch
+                .elapsed()
+                .saturating_sub(Duration::from_micros(started)),
+        )
+    }
+
+    fn begin(&self) -> ApplyInFlight {
+        let started = u64::try_from(self.inner.epoch.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
+        self.inner.started.store(started + 1, Ordering::Relaxed);
+        ApplyInFlight(self.clone())
+    }
+}
+
+impl Default for ApplyProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Held by the blocking task, so the probe clears when the apply really ends:
+/// on return, on panic, or if the task never starts.
+struct ApplyInFlight(ApplyProbe);
+
+impl Drop for ApplyInFlight {
+    fn drop(&mut self) {
+        self.0.inner.started.store(0, Ordering::Relaxed);
     }
 }
 
@@ -371,7 +443,15 @@ where
     // from as "applied" (it is — everything up to it was applied before the last
     // run persisted it).
     let applied = resume.clone().unwrap_or_else(WatchCursor::none);
-    let mut fold = Fold::new(store, parse, apply, on_applied, config.max, applied);
+    let mut fold = Fold::new(
+        store,
+        parse,
+        apply,
+        on_applied,
+        config.max,
+        applied,
+        config.apply_probe.clone(),
+    );
 
     // The loop only borrows `fold`, so every exit path — `?`, `return`, a
     // clean shutdown — comes back here with the store still owned, to be
@@ -579,6 +659,7 @@ pub(crate) struct Fold<U, S, P, A, O> {
     open: bool,
     // `applied` gained the eviction memo and the store doesn't have it yet.
     memo_dirty: bool,
+    apply_probe: Option<ApplyProbe>,
 }
 
 impl<U, S, P, A, O> Fold<U, S, P, A, O>
@@ -596,6 +677,7 @@ where
         on_applied: O,
         max: usize,
         applied: WatchCursor,
+        apply_probe: Option<ApplyProbe>,
     ) -> Self {
         // `max(1)` only guards a nonsensical `max = 0` config.
         let batch_cap = max.max(1);
@@ -613,6 +695,7 @@ where
             store_fail_streak: 0,
             open: false,
             memo_dirty: false,
+            apply_probe,
         }
     }
 
@@ -723,7 +806,9 @@ where
             // survives every restart (reproduced by
             // `transient_store_failure_never_leaves_a_cursor_gap`). Only a
             // *panicked* task (Err) loses the store: fatal.
+            let in_flight = self.apply_probe.as_ref().map(ApplyProbe::begin);
             match tokio::task::spawn_blocking(move || {
+                let _in_flight = in_flight;
                 let res = st.apply(&raw, &cur);
                 (st, raw, res)
             })
@@ -2427,6 +2512,164 @@ mod tests {
         ) -> Result<crate::artifact::ExportManifest, crate::snapshot::SnapshotError> {
             self.inner.export_to(dest_dir)
         }
+    }
+
+    /// A store whose apply waits at a gate, or panics, for the probe tests.
+    struct GatedStore {
+        inner: AppendLogSnapshot,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        panic_on_apply: bool,
+    }
+
+    impl crate::snapshot::SnapshotStore for GatedStore {
+        fn load(
+            _path: &std::path::Path,
+        ) -> Result<(WatchCursor, Self), crate::snapshot::SnapshotError> {
+            unreachable!("test store is constructed directly")
+        }
+        fn apply(
+            &mut self,
+            batch: &[KvUpdate],
+            cursor: &WatchCursor,
+        ) -> Result<(), crate::snapshot::SnapshotError> {
+            assert!(!self.panic_on_apply, "injected store panic");
+            let (open, changed) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+            drop(open);
+            self.inner.apply(batch, cursor)
+        }
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.get(key)
+        }
+        fn range(&self, prefix: &str) -> Result<Vec<KvEntry>, crate::snapshot::SnapshotError> {
+            self.inner.range(prefix)
+        }
+        fn cursor(&self) -> WatchCursor {
+            self.inner.cursor()
+        }
+        fn export_to(
+            &mut self,
+            dest_dir: &std::path::Path,
+        ) -> Result<crate::artifact::ExportManifest, crate::snapshot::SnapshotError> {
+            self.inner.export_to(dest_dir)
+        }
+    }
+
+    fn gated_store(
+        dir: &tempfile::TempDir,
+        panic_on_apply: bool,
+    ) -> (GatedStore, Arc<(Mutex<bool>, std::sync::Condvar)>) {
+        let (_, inner) = AppendLogSnapshot::load(&dir.path().join("fold")).unwrap();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let store = GatedStore {
+            inner,
+            gate: Arc::clone(&gate),
+            panic_on_apply,
+        };
+        (store, gate)
+    }
+
+    /// Opens the gate on drop, so a failed assertion cannot leave the blocking
+    /// task parked and hang the test runtime's shutdown.
+    struct OpenGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl OpenGate {
+        fn open(&self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    impl Drop for OpenGate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    async fn wait_for(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("condition not reached");
+    }
+
+    /// A store apply that does not return is visible, and its age grows, while
+    /// the cursor stays put. Releasing it clears the probe and the watch moves on.
+    #[tokio::test]
+    async fn apply_probe_reports_a_hung_store_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, gate) = gated_store(&dir, false);
+        let gate = OpenGate(gate);
+        let probe = ApplyProbe::new();
+        let applied = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&applied);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let watch = tokio::spawn(watch_applied(
+            Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true)),
+            WatchScope::All,
+            None,
+            None,
+            Some(store),
+            None,
+            BatchConfig {
+                window: Duration::from_millis(1),
+                apply_probe: Some(probe.clone()),
+                ..BatchConfig::default()
+            },
+            parse_put,
+            |_batch| {},
+            move |c: WatchCursor| seen.store(c.as_u64().unwrap(), Ordering::SeqCst),
+            sd_rx,
+        ));
+
+        wait_for(|| probe.in_flight().is_some()).await;
+        let first = probe.in_flight().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(probe.in_flight().unwrap() > first, "age must keep growing");
+        assert_eq!(applied.load(Ordering::SeqCst), 0, "cursor must not advance");
+
+        gate.open();
+        wait_for(|| applied.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(probe.in_flight(), None);
+
+        sd_tx.send(true).unwrap();
+        assert_eq!(watch.await.unwrap().unwrap().as_u64(), Some(1));
+    }
+
+    /// A panicking apply ends the watch and does not read as still in flight.
+    #[tokio::test]
+    async fn apply_probe_clears_when_the_store_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _gate) = gated_store(&dir, true);
+        let probe = ApplyProbe::new();
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let result = watch_applied(
+            Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true)),
+            WatchScope::All,
+            None,
+            None,
+            Some(store),
+            None,
+            BatchConfig {
+                window: Duration::from_millis(1),
+                apply_probe: Some(probe.clone()),
+                ..BatchConfig::default()
+            },
+            parse_put,
+            |_batch| {},
+            |_cursor| {},
+            sd_rx,
+        )
+        .await;
+
+        assert!(matches!(result, Err(KvError::WatchError(_))));
+        assert_eq!(probe.in_flight(), None);
     }
 
     /// CURSOR AUTHORITY under a transient store failure: a failed store apply

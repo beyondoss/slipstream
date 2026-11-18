@@ -43,7 +43,8 @@ mod stores;
 mod transport;
 
 pub use applied::{
-    BatchConfig, ExportRequest, WatchEnd, WatchScope, watch_applied, watch_applied_owned,
+    ApplyProbe, BatchConfig, ExportRequest, WatchEnd, WatchScope, watch_applied,
+    watch_applied_owned,
 };
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
 pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
