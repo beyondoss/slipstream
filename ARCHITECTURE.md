@@ -731,6 +731,7 @@ Production code and an exhaustive model checker running the same logic closes th
 | ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------- |
 | Transient `store.apply()` failure    | Raw batch re-queued at front; next flush commits cumulatively; streak counter incremented | Automatic up to 16 consecutive failures |
 | 16 consecutive `store.apply()` failures | Watch fail-stops: `KvError::WatchError` returned | Restart re-folds from last good cursor; investigate store (disk, permissions) |
+| `store.apply()` never returns       | The watch stops advancing, with no error and no timeout, because the blocking call cannot be cancelled | Poll `ApplyProbe::in_flight()`, alert on its age, and restart the process past your limit |
 | Live watch retention overrun (All scope) | Floor guard detects in-band (gapped delivery) or via 30 s backstop; the watch ends with `CursorExpired` | `watch_applied` repairs in process (key-listing diff, or artifact restore on an evicting bucket) |
 | Live watch retention overrun (Prefix scope) | **Undetected until the next restart** — prefix watches deliver sparse revisions, so eviction gaps are indistinguishable from non-matching subjects client-side; the floor guard is sound for All scope only (a periodic probe here would false-positive into spurious resyncs, a design the model checker rejected) | Next restart's resume-window check hits `CursorExpired` → resync repairs; operate prefix-scoped watches with retention window comfortably above the restart/redeploy interval |
 | Resync `reader.keys()` failure       | Watch fail-stops (fail-stop, not degrade — degrade semantics proven to leave stale keys permanently) | Restart re-runs full resume → expiry → resync |
@@ -835,6 +836,7 @@ Credentials priority: `creds` > `creds_file` > URL-embedded > no auth.
 | `window` | 10 ms   | Max time a batch stays open before flush                                   |
 | `max`    | 100     | Max updates per batch before early flush                                   |
 | `channel_capacity` | 256 | Depth of the watch-task → loop channel. A full channel backpressures the watch task (by design); during state-sync hydration of a large bucket it can become the effective batch boundary, so tune it together with `max` |
+| `apply_probe` | `None` | An `ApplyProbe` whose `in_flight()` returns the age of the current store apply. `apply` has no timeout, so this is how a consumer detects a store that stopped returning. |
 
 | Constant | Value | Effect |
 |---|---|---|
