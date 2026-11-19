@@ -16,6 +16,11 @@ use tokio::sync::mpsc::Sender;
 /// truth. A store persisting a cursor should write
 /// [`to_bytes`](Self::to_bytes) and read [`from_bytes`](Self::from_bytes);
 /// [`as_u64`](Self::as_u64) keeps only the position.
+///
+/// A cursor a watch produced also records which incarnation of the stream it
+/// was taken from (NATS: the stream's creation time), so a bucket deleted and
+/// recreated under the same name is never resumed from the old one's
+/// positions ([`same_incarnation`](crate::protocol::same_incarnation)).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct WatchCursor {
     version: VersionToken,
@@ -33,17 +38,20 @@ impl fmt::Debug for WatchCursor {
 }
 
 /// The longest encoding [`WatchCursor::to_bytes`] produces.
-pub(crate) const MAX_CURSOR_BYTES: usize = CURSOR_MEMO_LEN + 8;
+pub(crate) const MAX_CURSOR_BYTES: usize = CURSOR_MEMO_LEN + 16;
 
 /// A cursor with its memo: the version padded to the token's 10-byte
 /// capacity, its length, a flags byte, and — when the flags say so — the
-/// server time its message was written (u64 LE Unix milliseconds). Longer
-/// than any bare version, so the encodings never collide, and a cursor
-/// without the memo keeps the pre-memo encoding byte for byte (older builds
-/// read it; they refuse this one as too long rather than misread it).
+/// server time its message was written (u64 LE Unix milliseconds; only with
+/// the eviction memo), then the stream incarnation it was taken from (u64 LE,
+/// never 0). Longer than any bare version, so the encodings never collide,
+/// and a cursor without any memo keeps the pre-memo encoding byte for byte
+/// (older builds read it; they refuse this one as too long, or for its flag,
+/// rather than misread it).
 const CURSOR_MEMO_LEN: usize = 12;
 const CURSOR_SEEN_EVICTING: u8 = 0b01;
 const CURSOR_WRITTEN_AT: u8 = 0b10;
+const CURSOR_ORIGIN: u8 = 0b100;
 
 impl WatchCursor {
     /// No cursor — forces a full watch on next connect.
@@ -70,20 +78,27 @@ impl WatchCursor {
     }
 
     /// The cursor as a store should persist it, memo included. The time its
-    /// message was written is kept only alongside the memo: it matters only
-    /// on a bucket that evicts (`NatsKvWatcher`'s resume check).
+    /// message was written is kept only alongside the eviction memo: it matters
+    /// only on a bucket that evicts (`NatsKvWatcher`'s resume check).
     pub fn to_bytes(&self) -> Vec<u8> {
         let v = self.version.as_bytes();
-        if !self.seen_evicting {
+        let origin = self.version.origin();
+        if !self.seen_evicting && origin.is_none() {
             return v.to_vec();
         }
         let mut out = vec![0u8; CURSOR_MEMO_LEN];
         out[..v.len()].copy_from_slice(v);
         out[10] = v.len() as u8;
-        out[11] = CURSOR_SEEN_EVICTING;
-        if let Some(ms) = self.version.written_ms() {
-            out[11] |= CURSOR_WRITTEN_AT;
-            out.extend_from_slice(&ms.to_le_bytes());
+        if self.seen_evicting {
+            out[11] = CURSOR_SEEN_EVICTING;
+            if let Some(ms) = self.version.written_ms() {
+                out[11] |= CURSOR_WRITTEN_AT;
+                out.extend_from_slice(&ms.to_le_bytes());
+            }
+        }
+        if let Some(origin) = origin {
+            out[11] |= CURSOR_ORIGIN;
+            out.extend_from_slice(&origin.to_le_bytes());
         }
         out
     }
@@ -94,27 +109,46 @@ impl WatchCursor {
         if bytes.len() <= 10 {
             return VersionToken::from_raw(bytes).map(Self::from_version);
         }
-        let (head, tail) = bytes.split_at_checked(CURSOR_MEMO_LEN)?;
+        let (head, mut tail) = bytes.split_at_checked(CURSOR_MEMO_LEN)?;
         let (len, flags) = (head[10] as usize, head[11]);
-        if len > 10 || flags & !(CURSOR_SEEN_EVICTING | CURSOR_WRITTEN_AT) != 0 {
+        if len > 10
+            || flags & !(CURSOR_SEEN_EVICTING | CURSOR_WRITTEN_AT | CURSOR_ORIGIN) != 0
+            // The time is only kept with the eviction memo.
+            || (flags & CURSOR_WRITTEN_AT != 0 && flags & CURSOR_SEEN_EVICTING == 0)
+        {
+            return None;
+        }
+        let mut take_u64 = |present: bool| -> Option<Option<u64>> {
+            if !present {
+                return Some(None);
+            }
+            let (n, rest) = tail.split_at_checked(8)?;
+            tail = rest;
+            let n = u64::from_le_bytes(n.try_into().ok()?);
+            (n != 0).then_some(Some(n))
+        };
+        let written = take_u64(flags & CURSOR_WRITTEN_AT != 0)?;
+        let origin = take_u64(flags & CURSOR_ORIGIN != 0)?;
+        if !tail.is_empty() {
             return None;
         }
         let mut version = VersionToken::from_raw(&head[..len])?;
-        match (flags & CURSOR_WRITTEN_AT != 0, tail.len()) {
-            (false, 0) => {}
-            (true, 8) => {
-                let ms = u64::from_le_bytes(tail.try_into().ok()?);
-                if ms == 0 {
-                    return None;
-                }
-                version = version.written_at(ms);
-            }
-            _ => return None,
+        if let Some(ms) = written {
+            version = version.written_at(ms);
+        }
+        if let Some(origin) = origin {
+            version = version.with_origin(origin);
         }
         Some(Self {
             version,
             seen_evicting: flags & CURSOR_SEEN_EVICTING != 0,
         })
+    }
+
+    /// The stream incarnation this cursor was taken from, when recorded
+    /// (NATS: the stream's creation time in Unix nanoseconds).
+    pub(crate) fn origin(&self) -> Option<u64> {
+        self.version.origin()
     }
 
     /// The server time this cursor's message was written, when known (Unix
@@ -200,6 +234,16 @@ pub enum KvError {
     /// error is valid; the position after it is expired.
     #[error("watch cursor expired (compacted)")]
     CursorExpired,
+    /// The cursor was taken from a different incarnation of the stream: the
+    /// bucket was deleted and recreated under the same name, so its positions
+    /// mean nothing in the stream that exists now. Resuming would skip or
+    /// splice revisions without any error, so the watch refuses.
+    /// [`watch_applied`](crate::watch_applied) repairs it like an expiry
+    /// from no cursor (a re-list diff, or an artifact restore) when a repair is
+    /// armed, and fails with this error otherwise; a raw `*_from` caller
+    /// must discard the cursor and the fold built on it.
+    #[error("watch cursor belongs to a different incarnation of the stream (bucket recreated)")]
+    ForeignCursor,
 }
 
 /// What a backend's retention can do to the log a watch resumes from. These
@@ -217,6 +261,13 @@ pub struct Retention {
     /// `first_revision <= C + 1`
     /// ([`resume_window_ok`](crate::protocol::resume_window_ok)).
     pub first_revision: u64,
+    /// The newest revision in the log (NATS: the stream's `last_sequence`).
+    pub last_revision: u64,
+    /// Which incarnation of the stream this is (NATS: its creation time in
+    /// Unix nanoseconds), when the backend can say. A cursor taken from another
+    /// incarnation is no resume or restore point
+    /// ([`same_incarnation`](crate::protocol::same_incarnation)).
+    pub incarnation: Option<u64>,
 }
 
 /// Opaque version token that abstracts store-specific versioning.
@@ -230,8 +281,9 @@ pub struct Retention {
 /// every current backend.
 ///
 /// A token read off a watch may also carry the server time its message was
-/// written (NATS: the message timestamp). That time is not part of the
-/// version: equality and hashing ignore it, and it isn't in
+/// written (NATS: the message timestamp) and the stream incarnation it was
+/// read from (NATS: the stream's creation time). Neither is part of the
+/// version: equality and hashing ignore them, and they aren't in
 /// [`as_bytes`](Self::as_bytes).
 #[derive(Clone, Default)]
 pub struct VersionToken {
@@ -239,6 +291,9 @@ pub struct VersionToken {
     buf: [u8; 10],
     // Unix milliseconds of the message's server timestamp; 0 = unknown.
     written_ms: u64,
+    // The stream incarnation the message was read from (NATS: the stream's
+    // creation time, Unix ns); 0 = unknown.
+    origin: u64,
 }
 
 impl PartialEq for VersionToken {
@@ -287,6 +342,7 @@ impl VersionToken {
             len: 8,
             buf,
             written_ms: 0,
+            origin: 0,
         }
     }
 
@@ -295,6 +351,18 @@ impl VersionToken {
     pub(crate) fn written_at(mut self, unix_ms: u64) -> Self {
         self.written_ms = unix_ms;
         self
+    }
+
+    /// This version, recording the stream incarnation it was read from (NATS:
+    /// the stream's creation time, Unix ns; 0 is "unknown" and records nothing).
+    pub(crate) fn with_origin(mut self, origin: u64) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// The stream incarnation this version was read from, when recorded.
+    pub(crate) fn origin(&self) -> Option<u64> {
+        (self.origin != 0).then_some(self.origin)
     }
 
     /// The server time this version's message was written, when the backend
@@ -317,6 +385,7 @@ impl VersionToken {
             len: 10,
             buf: *vs,
             written_ms: 0,
+            origin: 0,
         }
     }
 
@@ -359,6 +428,7 @@ impl VersionToken {
             len,
             buf,
             written_ms: 0,
+            origin: 0,
         })
     }
 }
@@ -651,7 +721,7 @@ mod tests {
         assert_eq!(back, t);
 
         let mut bad = m.to_bytes();
-        bad[11] |= 0b100;
+        bad[11] |= 0b1000;
         assert_eq!(WatchCursor::from_bytes(&bad), None, "unknown flag");
         let mut bad = m.to_bytes();
         bad[11] |= CURSOR_WRITTEN_AT;
@@ -660,6 +730,54 @@ mod tests {
         bad[10] = 11;
         assert_eq!(WatchCursor::from_bytes(&bad), None, "version too long");
         assert_eq!(WatchCursor::from_bytes(&[0; 11]), None, "no such length");
+    }
+
+    /// The incarnation rides in the cursor bytes — alone, or with the eviction
+    /// memo and the written time — and every malformed shape is refused.
+    #[test]
+    fn cursor_bytes_carry_the_incarnation() {
+        let tok = || VersionToken::from_u64(42).written_at(1_700_000_000_123);
+        let c = WatchCursor::from_version(tok().with_origin(1_760_000_000_000_000_001));
+        assert_eq!(c.origin(), Some(1_760_000_000_000_000_001));
+        assert_eq!(c.to_bytes().len(), CURSOR_MEMO_LEN + 8);
+        let back = WatchCursor::from_bytes(&c.to_bytes()).unwrap();
+        assert_eq!(back.origin(), c.origin());
+        assert!(!back.seen_evicting() && back.as_u64() == Some(42));
+        assert_eq!(
+            back.written_ms(),
+            None,
+            "the time is kept only with the memo"
+        );
+
+        let m = c.clone().remembering(true);
+        assert_eq!(m.to_bytes().len(), MAX_CURSOR_BYTES);
+        let back = WatchCursor::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(back.origin(), c.origin());
+        assert_eq!(back.written_ms(), Some(1_700_000_000_123));
+        assert!(back.seen_evicting());
+
+        let unrecorded = WatchCursor::from_u64(42);
+        assert_eq!(unrecorded.origin(), None);
+        assert_eq!(
+            WatchCursor::from_bytes(&unrecorded.to_bytes())
+                .unwrap()
+                .origin(),
+            None
+        );
+
+        let mut bad = c.to_bytes();
+        bad.truncate(CURSOR_MEMO_LEN + 4);
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "origin truncated");
+        let mut bad = c.to_bytes();
+        bad.push(0);
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "trailing bytes");
+        let mut bad = c.to_bytes();
+        bad[CURSOR_MEMO_LEN..].fill(0);
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "origin 0 is no origin");
+        let mut bad = c.to_bytes();
+        bad[11] = CURSOR_WRITTEN_AT | CURSOR_ORIGIN;
+        bad.splice(CURSOR_MEMO_LEN..CURSOR_MEMO_LEN, [0u8; 8]);
+        assert_eq!(WatchCursor::from_bytes(&bad), None, "time without the memo");
     }
 
     #[test]

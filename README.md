@@ -191,9 +191,14 @@ match watcher.watch_all_from(&cursor, tx.clone()).await {
         // NATS compacted past the cursor. Full replay required.
         watcher.watch_all(tx).await?;
     }
+    // The bucket was deleted and recreated: the cursor is the old stream's.
+    // Discard it and whatever was folded under it, then start from no cursor.
+    Err(KvError::ForeignCursor) => return Err(KvError::ForeignCursor.into()),
     Err(e) => return Err(e.into()),
 }
 ```
+
+A cursor records which incarnation of the stream it was taken from (NATS: the stream's creation time). A bucket recreated under the same name restarts its revisions at 1, so a cursor from the old one is refused with `KvError::ForeignCursor` rather than resumed, whether it sits above the new head or inside the new range. [`watch_applied`](#cursor-expiry) repairs it as a fold with no cursor (the re-list diff, or an artifact restore) when a repair is armed, and fails with the error otherwise. An artifact exported from the old stream is refused as a restore source the same way. Cursors written before this was recorded are admitted while their position is possible in the current stream, and record the incarnation from the next batch on.
 
 The full replay only re-delivers what NATS still holds. On a bucket with `max_age` or `discard: old`, values that aged out are gone from it; [`watch_applied`](#cursor-expiry) restores those from an artifact.
 

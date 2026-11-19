@@ -8,6 +8,7 @@
 //! | [`pointer_publish_allowed`]| `transport::swap_pointer`           | `model.rs` `Act::Publish`, fleet `Publish` |
 //! | [`payload_prunable`]       | `transport::ObjectStoreTransport::prune` | `model.rs` `Act::Prune` |
 //! | [`resume_window_ok`]       | `nats` resume paths (`check_resume_window`), the live floor guard | every model |
+//! | [`same_incarnation`]       | `nats` resume paths (`check_resume_window`), the live floor guard, `repair::check_restore` | `model_incarnation.rs` |
 //! | [`restore_allowed`]        | `repair::check_restore`             | `model.rs` `Act::RestoreRead`, live `GuardRepair`, repair-steps `WPlan`, fleet `Repair` |
 //! | [`restore_ahead`]          | `repair::check_restore`, the main loop's re-check (`repair::fold_in`) | repair-steps restore reply |
 //! | [`listing_is_truth`] / [`listing_truth`] | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention; repair-steps `ConfigForgot` |
@@ -124,6 +125,38 @@ pub fn payload_prunable(
 /// [`resume_start_sequence`], which refuses to wrap there.
 pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
     first_sequence <= revision.saturating_add(1)
+}
+
+/// THE incarnation guard: is a cursor's position the CURRENT stream's?
+///
+/// A stream deleted and recreated under the same name numbers its revisions
+/// from 1 again, so [`resume_window_ok`] — sequences alone — admits an old
+/// incarnation's cursor whenever it is not below the new stream's floor: a
+/// cursor above the new head makes the watch skip every new revision up to it
+/// (silently, no error), and one inside the new range splices old state under
+/// the new tail. A cursor therefore records which incarnation it was taken
+/// from (`cursor_origin`; NATS: the stream's creation time in Unix ns, never
+/// 0), and a resume or restore is admitted only against the same one.
+///
+/// A cursor with no recorded origin was written before cursors recorded one.
+/// Nothing proves which incarnation it belongs to; it is admitted when its
+/// position is possible in this stream at all (`revision <= last_sequence`),
+/// so a fleet upgraded in place keeps restarting. That leaves one hole — an
+/// unrecorded cursor from an older incarnation that falls inside the new
+/// stream's range — which closes the moment the fold commits a recorded
+/// cursor (every cursor a watch produces records one). Machine-checked in
+/// `tests/model_incarnation.rs`, which also checks the alternative that
+/// refuses unrecorded cursors outright.
+pub fn same_incarnation(
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream_origin: u64,
+    last_sequence: u64,
+) -> bool {
+    match cursor_origin {
+        Some(origin) => origin == stream_origin,
+        None => revision <= last_sequence,
+    }
 }
 
 /// THE restore guard: may a fold whose cursor (`local_revision`) fell out of
@@ -353,6 +386,23 @@ mod tests {
     }
 
     #[test]
+    fn incarnation_guard_boundaries() {
+        assert!(
+            same_incarnation(Some(7), 5_000, 7, 3),
+            "same stream: any cursor"
+        );
+        assert!(
+            !same_incarnation(Some(6), 1, 7, 100),
+            "recreated: even in range"
+        );
+        assert!(same_incarnation(None, 3, 7, 3), "unrecorded, possible here");
+        assert!(
+            !same_incarnation(None, 4, 7, 3),
+            "unrecorded, beyond the head"
+        );
+    }
+
+    #[test]
     fn resume_guard_boundaries() {
         assert!(resume_window_ok(3, 4), "first retained == next read: sound");
         assert!(resume_window_ok(3, 1), "history intact");
@@ -410,6 +460,8 @@ mod tests {
             Some(Retention {
                 evicts_current_values: evicts,
                 first_revision: 9,
+                last_revision: u64::MAX,
+                incarnation: Option::None,
             })
         };
         assert_eq!(listing_truth(r(false), false), Some(true));

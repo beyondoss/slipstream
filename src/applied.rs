@@ -3041,6 +3041,8 @@ mod tests {
         Some(Retention {
             evicts_current_values: true,
             first_revision,
+            last_revision: u64::MAX,
+            incarnation: None,
         })
     }
 
@@ -3281,6 +3283,8 @@ mod tests {
             Some(Retention {
                 evicts_current_values: false,
                 first_revision: 9,
+                last_revision: u64::MAX,
+                incarnation: None,
             }),
             vec![(vec![], true)],
         ));
@@ -3655,6 +3659,8 @@ mod tests {
             Some(Retention {
                 evicts_current_values: false,
                 first_revision: 9,
+                last_revision: u64::MAX,
+                incarnation: None,
             }),
             vec![(vec![put("node.new", b"recreated-then-deleted", 5)], true)],
         ));
