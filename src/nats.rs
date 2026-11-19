@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc::Sender};
 use tracing::{debug, error, info, warn};
 
+use crate::health::LogRange;
 use crate::kv::{
     KvEntry, KvError, KvPurge, KvReader, KvUpdate, KvWatcher, KvWriter, Retention, VersionToken,
     WatchCursor,
@@ -1667,6 +1668,17 @@ impl KvWatcher for NatsKvWatcher {
         Ok(Some(Retention {
             evicts_current_values: evicts_current_values(&info.config),
             first_revision: info.state.first_sequence,
+        }))
+    }
+
+    async fn log_range(&self) -> Result<Option<LogRange>, KvError> {
+        let stream = timed(self.js.get_stream(format!("KV_{}", self.bucket)))
+            .await?
+            .map_err(|e| KvError::OperationFailed(format!("get KV stream for log range: {e}")))?;
+        let state = &stream.cached_info().state;
+        Ok(Some(LogRange {
+            first: state.first_sequence,
+            last: state.last_sequence,
         }))
     }
 }

@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 
 use crate::applied::{Fold, WatchScope};
 use crate::artifact::ExportManifest;
+use crate::health::{RepairState, WatchHealth};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
@@ -744,7 +745,9 @@ pub(crate) async fn run_watch<S: Send + 'static>(
     unanchored: bool,
     repair: Option<RepairHandle<S>>,
     tx: mpsc::Sender<KvUpdate>,
+    health: Option<WatchHealth>,
 ) -> Result<(), KvError> {
+    let health = health.as_ref();
     let shared = Arc::clone(&watcher);
     let (watcher, scope) = (watcher.as_ref(), &scope);
     let mut memo = EvictionMemo {
@@ -805,11 +808,16 @@ pub(crate) async fn run_watch<S: Send + 'static>(
             };
             let watch = watch_scope_from(watcher, scope, &cursor, tx.clone());
             match memo.watching(watcher, watch).await {
-                Err(KvError::CursorExpired) => cursor,
+                Err(KvError::CursorExpired) => {
+                    if let Some(h) = health {
+                        h.expired();
+                    }
+                    cursor
+                }
                 other => return other,
             }
         };
-        match plan(watcher, repair.as_ref(), &mut memo).await? {
+        match plan(watcher, repair.as_ref(), &mut memo, health).await? {
             Plan::ReListOnly => {
                 warn!(
                     "watch cursor expired with no repair armed (needs a store and a reader or \
@@ -824,15 +832,20 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                 warn!(
                     "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
                 );
+                note(health, RepairState::Relisting);
                 resync_stale_keys(reader, scratch, repairs).await?;
+                if let Some(h) = health {
+                    h.repair_done();
+                }
                 return memo
                     .watching(watcher, watch_scope(watcher, scope, tx))
                     .await;
             }
             Plan::Restore(reader, source, repairs) => {
                 warn!("watch cursor expired; restoring the fold from the latest artifact");
+                note(health, RepairState::Restoring);
                 let restored =
-                    restore_from_artifact(&shared, scope, reader, source, repairs, &cursor)
+                    restore_from_artifact(&shared, scope, reader, source, repairs, &cursor, health)
                         .await
                         .map_err(|e| match e {
                             KvError::WatchError(msg) if cursor.is_none() => {
@@ -849,6 +862,9 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                 // An artifact from a fold that saw eviction carries the memo
                 // (the fold took it with the artifact's cursor).
                 memo.seen |= restored.seen_evicting();
+                if let Some(h) = health {
+                    h.repair_done();
+                }
                 resume = Some(restored);
             }
         }
@@ -894,6 +910,7 @@ async fn plan<'a, S: Send>(
     watcher: &dyn KvWatcher,
     repair: Option<&'a RepairHandle<S>>,
     memo: &mut EvictionMemo<'_, S>,
+    health: Option<&WatchHealth>,
 ) -> Result<Plan<'a, S>, KvError> {
     let Some(h) = repair else {
         return Ok(Plan::ReListOnly);
@@ -914,6 +931,7 @@ async fn plan<'a, S: Send>(
                        ExpiryRepair::Restore or ExpiryRepair::Auto (or accept a re-list-only \
                        fallback with ExpiryRepair::None)";
             error!(msg);
+            note(health, RepairState::Refused(msg.into()));
             return Err(KvError::WatchError(msg.into()));
         }
         (RepairPlan::Relist, ExpiryRepair::Relist(reader)) => Plan::Relist(reader, None, &h.tx),
@@ -939,19 +957,46 @@ async fn restore_from_artifact<S: Send + 'static>(
     source: &Arc<dyn RestoreSource<S>>,
     repairs: &mpsc::Sender<RepairRequest<S>>,
     local: &WatchCursor,
+    health: Option<&WatchHealth>,
 ) -> Result<WatchCursor, KvError> {
     let prefixes = scope.prefixes();
     let fail = |msg: String| {
         error!(%msg, "cursor-expiry restore refused; no safe recovery");
         KvError::WatchError(format!("cursor-expired restore: {msg}"))
     };
+    // Observation only: what a refusal means to an operator. An artifact that
+    // covers the scope but is not ahead of the fold is a wait for the next
+    // export round; every other refusal needs a person or a valid artifact.
+    let refuse = |artifact: &ExportManifest, msg: String| {
+        let waits = artifact
+            .scope
+            .as_ref()
+            .is_some_and(|s| scope_covers(s, &prefixes))
+            && !restore_ahead(artifact.cursor.rank(), local.rank());
+        note(
+            health,
+            if waits {
+                RepairState::WaitingForArtifact(msg.clone())
+            } else {
+                RepairState::Refused(msg.clone())
+            },
+        );
+        fail(msg)
+    };
 
     let first = watcher.retention().await?.map(|r| r.first_revision);
-    let latest = source
-        .latest()
-        .await
-        .map_err(|e| fail(format!("reading the latest artifact failed: {e}")))?;
-    check_restore(&latest, local, first, &prefixes).map_err(fail)?;
+    let latest = match source.latest().await {
+        Ok(latest) => latest,
+        Err(e) => {
+            let msg = format!("reading the latest artifact failed: {e}");
+            note(health, RepairState::WaitingForArtifact(msg.clone()));
+            return Err(fail(msg));
+        }
+    };
+    if let Some(h) = health {
+        h.artifact_seen(&latest);
+    }
+    check_restore(&latest, local, first, &prefixes).map_err(|m| refuse(&latest, m))?;
 
     let restored = source
         .fetch()
@@ -960,7 +1005,8 @@ async fn restore_from_artifact<S: Send + 'static>(
     // The pointer may have advanced between the peek and the download, and
     // retention may have moved: check what actually arrived, against now.
     let first = watcher.retention().await?.map(|r| r.first_revision);
-    check_restore(restored.manifest(), local, first, &prefixes).map_err(fail)?;
+    check_restore(restored.manifest(), local, first, &prefixes)
+        .map_err(|m| refuse(restored.manifest(), m))?;
     let age_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|now| {
@@ -985,9 +1031,20 @@ async fn restore_from_artifact<S: Send + 'static>(
         })
         .await
         .map_err(|_| KvError::WatchError("watch loop ended during a restore".into()))?;
-    reply_rx
+    let reply = reply_rx
         .await
-        .map_err(|_| KvError::WatchError("watch loop dropped a restore reply".into()))?
+        .map_err(|_| KvError::WatchError("watch loop dropped a restore reply".into()))?;
+    if let Err(KvError::WatchError(msg)) = &reply {
+        note(health, RepairState::Refused(msg.clone()));
+    }
+    reply
+}
+
+/// Record a repair step on the health handle, if there is one.
+fn note(health: Option<&WatchHealth>, state: RepairState) {
+    if let Some(h) = health {
+        h.repair_step(state);
+    }
 }
 
 /// Cursor-expired stale-key resync (the key-listing diff), run BEFORE the

@@ -1,3 +1,4 @@
+use crate::health::LogRange;
 use async_trait::async_trait;
 use std::fmt;
 use tokio::sync::mpsc::Sender;
@@ -543,6 +544,16 @@ pub trait KvWatcher: Send + Sync {
     /// assume current values CAN be evicted, so the cursor-expired key-listing
     /// diff is not trusted unless the caller explicitly chose it.
     async fn retention(&self) -> Result<Option<Retention>, KvError> {
+        Ok(None)
+    }
+
+    /// The log's oldest and newest revisions now, for the watch's health
+    /// snapshot ([`WatchHealth`](crate::WatchHealth)). One request, read live.
+    ///
+    /// `Ok(None)` (the default) means the backend can't say; the snapshot
+    /// then reports no head and no lag. Observation only: nothing in the
+    /// watch's decisions reads it.
+    async fn log_range(&self) -> Result<Option<LogRange>, KvError> {
         Ok(None)
     }
 }

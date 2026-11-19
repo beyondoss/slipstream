@@ -258,6 +258,32 @@ Before diffing, both repairs flush until the store holds every delivered update:
 
 This is the layer the tunnel router (swap route table) and edge origin watcher (rebuild hashrings) both collapse onto: `parse` extracts the domain registration, `apply` swaps the live state, `on_applied` persists the cursor.
 
+### Health snapshot (`health.rs`)
+
+A watch that is stale, stuck, or refused a repair looks like a healthy one from outside, so `BatchConfig::health` takes a `WatchHealth`: one `Arc` of atomics plus a small mutex-guarded detail block. **Observation only**: the watch writes it and no cursor, repair or restore decision reads it (the tests in `tests/health.rs` and every protocol model run unchanged).
+
+| Recorded | Where | Cost |
+|---|---|---|
+| applied revision | `Fold::flush`, after the cursor advances | one relaxed store per flush |
+| last commit time | `Fold::flush`, when the store apply returns `Ok` (without a store, when the batch is applied) | one clock read + store per flush |
+| apply in flight | `Fold::flush`, around the blocking `store.apply` (a drop guard clears it on return, panic, or a task that never starts) | one clock read + two stores per flush |
+| repair state, cursor expiries | `run_watch`, at each repair step | rare |
+| newest artifact | `Fold::export` (this watch's own export) and `restore_from_artifact` (the source's `latest()`) | rare |
+| run start, end, last error | `watch_applied_owned`, once per run | rare |
+| stream head and first revision | a sampler task, one `KvWatcher::log_range` request per 30 s (`NatsKvWatcher`: one stream-info call), spawned only when a handle is set and aborted when the run ends | one request per interval, never per update |
+
+No allocation per update; the detail mutex is held for a few stores and never across an await, and `snapshot()` copies under it. A handle outlives the watch's runs, so `restarts` and `last_error` accumulate across the caller's restart loop.
+
+**Repair state is sticky where it must be.** A refused or waiting repair ends the watch, and the caller's restart retries the same expired cursor, so `Refused` and `WaitingForArtifact` persist across runs and clear only when a repair succeeds (`Relisting` and `Restoring` never overwrite them). `WaitingForArtifact` means a restore found no usable artifact: none published, none readable, or the newest is not ahead of the fold while covering the scope. `Refused` is every other refusal: an artifact outside retention or scope, a key-listing diff on an evicting bucket, or the main loop's authoritative not-ahead check. The split is made at the call site from the artifact's scope and cursor; `check_restore` itself is unchanged.
+
+**Lag is `head - applied` at the last sample.** It is exact only for `All` scope. A `Prefix` or `Prefixes` watch's cursor advances only on matching keys, so it reads nonzero lag while idle; read it as a trend. `head_sample_age` says how stale it is.
+
+**Failure modes.** A failed head sample leaves the previous one (its age grows). A backend with no `log_range` (the trait default) reports no head and no lag. `None` always means unknown, never healthy.
+
+### Presets (`preset.rs`)
+
+A `Preset` is data: a scope, an optional `(reader, restore)` pair, and a `BatchConfig`. `Preset::run` builds the `ExpiryRepair` and calls `watch_applied_owned`; it adds no mechanism and no decision. `full_replica` is `All` + `ExpiryRepair::Auto`; `node_slice` is `Prefix` + `ExpiryRepair::None`. Both require a store and an export receiver by type. What each does on cursor expiry is the repair's own behavior (see "Cursor-expiry repair"): the replica's fold ends exact or the watch fails, the slice's fold may keep keys deleted during the gap. A use case that needs a prefix scope **and** a restore (artifacts that cover the prefix) uses the low-level API with `ExpiryRepair::Restore`.
+
 ### Live retention floor guard (`stream_watch_floor_guarded`, `nats.rs:1042`)
 
 NATS does **not** error when a live consumer's position is overrun by retention — it silently skips evicted messages (the same silent-clamp behaviour that `resume_window_ok` closes at resume time). For an All-scope watch, a skipped delete marker permanently diverges the fold, with zero log lines. The floor guard closes this mid-stream:
@@ -731,11 +757,12 @@ Production code and an exhaustive model checker running the same logic closes th
 | ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------- |
 | Transient `store.apply()` failure    | Raw batch re-queued at front; next flush commits cumulatively; streak counter incremented | Automatic up to 16 consecutive failures |
 | 16 consecutive `store.apply()` failures | Watch fail-stops: `KvError::WatchError` returned | Restart re-folds from last good cursor; investigate store (disk, permissions) |
-| `store.apply()` never returns       | The watch stops advancing, with no error and no timeout, because the blocking call cannot be cancelled | Poll `ApplyProbe::in_flight()`, alert on its age, and restart the process past your limit |
+| `store.apply()` never returns       | The watch stops advancing, with no error and no timeout, because the blocking call cannot be cancelled | Poll `WatchHealth::in_flight()` (or `snapshot().apply_in_flight`), alert on its age, and restart the process past your limit |
 | Live watch retention overrun (All scope) | Floor guard detects in-band (gapped delivery) or via 30 s backstop; the watch ends with `CursorExpired` | `watch_applied` repairs in process (key-listing diff, or artifact restore on an evicting bucket) |
 | Live watch retention overrun (Prefix scope) | **Undetected until the next restart** — prefix watches deliver sparse revisions, so eviction gaps are indistinguishable from non-matching subjects client-side; the floor guard is sound for All scope only (a periodic probe here would false-positive into spurious resyncs, a design the model checker rejected) | Next restart's resume-window check hits `CursorExpired` → resync repairs; operate prefix-scoped watches with retention window comfortably above the restart/redeploy interval |
 | Resync `reader.keys()` failure       | Watch fail-stops (fail-stop, not degrade — degrade semantics proven to leave stale keys permanently) | Restart re-runs full resume → expiry → resync |
 | `CursorExpired`, bucket keeps current values | `watch_applied` lists live keys, diffs fold, applies synthetic deletes, then falls back to state-sync re-list | Automatic; raw callers use `stale_keys()` manually |
+| Cursor-expiry restore refused | The watch fails; the fold stays stale; the caller's restart retries the same expired cursor forever | `health.snapshot().repair` is `Refused(reason)` or `WaitingForArtifact(reason)`; publish a fresh artifact (inside retention, covering the scope) |
 | `CursorExpired`, bucket evicts current values | `watch_applied` restores the in-scope fold from the newest artifact and resumes from its cursor | Automatic with `ExpiryRepair::Restore`/`Auto` |
 | Fold holds data but no cursor (torn first checkpoint) | Repaired like an expiry at revision 0 before watching | Automatic with a repair armed |
 | Every message after a node's cursor SUPERSEDED (every key rewritten while it was down), evicting bucket | On an age-only (`max_age`) bucket within half of `max_age` of the cursor's message: resumes from the first retained revision (`tests/eviction.rs::supersession_only_restart_resumes_on_a_max_age_bucket`). Otherwise (a `discard: old` limit or per-message TTLs, an older cursor, or one without the memo) the cursor reads as expired, the restore needs an artifact ahead of the node, and without one the watch fail-stops (safe, unavailable) | Restarts once the next export round publishes; export more often on small hot buckets |
@@ -780,6 +807,8 @@ Production code and an exhaustive model checker running the same logic closes th
 | `src/export_lease.rs`      | `ExportLease`, `LeaseGuard`, `LeaseRecord`: fleet-wide at-most-one via embedded-expiry CAS |
 | `src/transport.rs`         | `ObjectStoreTransport`, `ArtifactTransport` trait, `run_export_round`: monotonic pointer swap, multipart upload, prune, content-addressed keys (`feature = "transport"`) |
 | `src/applied.rs`           | `watch_applied` cursor-after-apply combinator, generic over `SnapshotStore`: `WatchScope`, `BatchConfig`, the select loop, and `Fold` — the batch, applied cursor, and store every change goes through (ingest, repair corrections, flush, `ExportRequest` handling, which stamps the scope) |
+| `src/health.rs`            | `WatchHealth`, `HealthSnapshot`, `RepairState`: the observation handle and the head sampler. Writes only; no decision reads it |
+| `src/preset.rs`            | `Preset::full_replica` / `node_slice`: fixes scope and repair per use case, then calls `watch_applied_owned` |
 | `src/repair.rs`            | Cursor-expiry repair, both halves: `ExpiryRepair`, `RestoreSource`, `RestoredFold`; the watch task (`run_watch`: plan, key listing, artifact checks and fetch) and the main loop's side (`fold_in`: drain, settle, key-listing diff, artifact restore into the `Fold`); scope coverage, restore checks, the in-scope restore diff |
 | `src/lib.rs`               | Re-exports all public types; no logic                                                |
 | `benches/`                 | Criterion benchmarks: snapshot write/checkpoint/load throughput, batch throughput, ACK subject parsing |
@@ -793,6 +822,7 @@ Production code and an exhaustive model checker running the same logic closes th
 | `tests/repair_dst.rs`      | Deterministic fault injection over the REAL `watch_applied`, on every backend: a simulated NATS log and a fault store (transient failure, crash before/after/torn) at every store-apply call, across 17 scenarios (expiry repairs and the normal path; All, Prefix, multi-prefix; complete and mid-catch-up artifacts) × both delivery orders × batch sizes — ~32k schedules on the append log, every single fault on fjall and RocksDB (deep tier for the full sweep). Asserts convergence to every write minus every real delete, domain state == fold, cursor monotone, no revision regression or phantom delete seen by `apply`, and every mid-run export resumes to the truth. Reverting any of nine repair steps fails it |
 | `tests/model_repair.rs`    | Stateright model of the repair AS STEPS (drain, pre-repair flush retry, diff, chunk, cursor commit, ack/reply) interleaved with deliveries, writes, eviction, publishes, transient failures, and crashes; checks that a resumable cursor reaches the truth, cursors are monotone, the domain never regresses or loses a current value, and every run converges; eleven mutations, each caught |
 | `tests/model_fleet.rs`     | Stateright fleet model where the exporters themselves expire, restore, start cursor-less, and publish their actual folds: every published artifact is the truth at its cursor (discharges the "exporters are correct" axiom); fleet-poisoning mutations caught |
+| `tests/health.rs`          | Live NATS: the snapshot reports lag, apply in flight, a refused restore, a wait for an artifact, a cursor expiry with no repair, restarts and the last error; both presets build and run |
 | `tests/eviction.rs`        | Live NATS + local object store, on `discard: old` and `max_age` buckets: expiry restores from the artifact (aged-out key kept, aged-out gap write recovered, real delete applied, identical to the exporter); key-listing resync refused; stale artifact fails the watch; a stalled, floor-guarded watcher overrun by a 20 MB burst trips mid-stream and is restored in process, identical to the exporter |
 | `tests/model.rs`           | Stateright exhaustive model (fleet size 2–3, unbounded rounds): pointer swap theorems (no regression, no torn pair, no dangling pointer, terminal liveness) and convergence to every write minus every real delete, on buckets that keep and that evict current values (`AgeOut`, artifact restore); mutation tests prove each protocol guard load-bearing, and keep the key-listing resync on an evicting bucket as a mutation the checker must catch |
 | `tests/model_applied.rs`   | Stateright cursor-authority model: delivery → flush → transient failure → crash/restart; `DropFailedBatch` and `ResumeFromMemApplied` mutations pin both pre-fix bug classes |
@@ -836,7 +866,7 @@ Credentials priority: `creds` > `creds_file` > URL-embedded > no auth.
 | `window` | 10 ms   | Max time a batch stays open before flush                                   |
 | `max`    | 100     | Max updates per batch before early flush                                   |
 | `channel_capacity` | 256 | Depth of the watch-task → loop channel. A full channel backpressures the watch task (by design); during state-sync hydration of a large bucket it can become the effective batch boundary, so tune it together with `max` |
-| `apply_probe` | `None` | An `ApplyProbe` whose `in_flight()` returns the age of the current store apply. `apply` has no timeout, so this is how a consumer detects a store that stopped returning. |
+| `health` | `None` | A `WatchHealth` the watch records into (see "Health snapshot"). Its `apply_in_flight` is the age of the current store apply; `apply` has no timeout, so this is how a consumer detects a store that stopped returning. |
 
 | Constant | Value | Effect |
 |---|---|---|

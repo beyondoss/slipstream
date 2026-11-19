@@ -27,8 +27,10 @@
 mod applied;
 mod artifact;
 mod export_lease;
+mod health;
 mod kv;
 mod nats;
+mod preset;
 pub mod protocol;
 mod repair;
 pub mod snapshot;
@@ -43,16 +45,20 @@ mod stores;
 mod transport;
 
 pub use applied::{
-    ApplyProbe, BatchConfig, ExportRequest, WatchEnd, WatchScope, watch_applied,
-    watch_applied_owned,
+    BatchConfig, ExportRequest, WatchEnd, WatchScope, watch_applied, watch_applied_owned,
 };
 pub use artifact::{ARTIFACT_SCHEMA_VERSION, ArtifactFile, ExportManifest, MANIFEST_FILE};
 pub use export_lease::{ExportLease, LeaseGuard, LeaseRecord};
+pub use health::{
+    ArtifactHealth, DEFAULT_HEAD_SAMPLE_INTERVAL, HealthSnapshot, LastError, LogRange, RepairState,
+    WatchHealth,
+};
 pub use kv::{
     KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, Retention,
     VersionToken, WatchCursor,
 };
 pub use nats::{NatsConnection, NatsConnectionConfig, nats_connect};
+pub use preset::Preset;
 pub use repair::{ExpiryRepair, RestoreSource, RestoredFold};
 pub use snapshot::{AppendLogSnapshot, SnapshotStore};
 #[cfg(feature = "fjall")]
