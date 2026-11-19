@@ -1062,11 +1062,47 @@ fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry, origin: u64)
 /// Read BEFORE a watch attaches: every entry the watch delivers is stamped
 /// with it, so a stream recreated in between yields a stamp that mismatches
 /// and a later resume refuses, never one that vouches for the wrong stream.
+#[cfg(test)]
 async fn stream_origin(js: &async_nats::jetstream::Context, bucket: &str) -> Result<u64, KvError> {
+    stream_origin_and_evicts(js, bucket).await.map(|(o, _)| o)
+}
+
+/// [`stream_origin`] plus whether the stream evicts current values
+/// ([`evicts_current_values`]), from the same `get_stream` reply: no extra request.
+async fn stream_origin_and_evicts(
+    js: &async_nats::jetstream::Context,
+    bucket: &str,
+) -> Result<(u64, bool), KvError> {
     let stream = timed(js.get_stream(format!("KV_{bucket}")))
         .await?
         .map_err(|e| KvError::OperationFailed(format!("get KV stream for its incarnation: {e}")))?;
-    Ok(unix_ns(stream.cached_info().created))
+    let info = stream.cached_info();
+    Ok((unix_ns(info.created), evicts_current_values(&info.config)))
+}
+
+/// Buckets already warned about by [`warn_raw_watch`]. Per process and bucket,
+/// not per watcher: `KvStore::watcher()` builds a fresh watcher on every call,
+/// and a reconnect loop re-runs the watch, so a per-watcher flag would repeat.
+fn warn_raw_watch(bucket: &str, evicts: bool) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    if !evicts || crate::kv::INTERNAL_WATCH.try_with(|_| ()).is_ok() {
+        return;
+    }
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(bucket.to_string());
+    if first {
+        tracing::warn!(
+            bucket,
+            "raw watch on a bucket that evicts: its initial re-list is only what the stream \
+             still holds, and can miss current keys whose last write was evicted; use \
+             Preset::node_slice or Preset::full_replica (watch_applied) for the current set"
+        );
+    }
 }
 
 /// Stream updates from a NATS Watch into a channel until it ends or the
@@ -1579,7 +1615,8 @@ impl KvWatcher for NatsKvWatcher {
         // forever instead of failing. The streaming drain in `stream_watch` is
         // intentionally unbounded (a watch is long-lived), but establishing it
         // must not be able to hang a reconnecting caller.
-        let origin = stream_origin(&self.js, &self.bucket).await?;
+        let (origin, evicts) = stream_origin_and_evicts(&self.js, &self.bucket).await?;
+        warn_raw_watch(&self.bucket, evicts);
         let watcher = timed(self.kv.watch_with_history(">"))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
@@ -1591,7 +1628,8 @@ impl KvWatcher for NatsKvWatcher {
         // subject "$KV.BUCKET.node.abc", and ">" is the multi-level wildcard.
         // `_with_history` for the same state-sync contract as `watch_all`.
         let nats_key = format!("{prefix}>");
-        let origin = stream_origin(&self.js, &self.bucket).await?;
+        let (origin, evicts) = stream_origin_and_evicts(&self.js, &self.bucket).await?;
+        warn_raw_watch(&self.bucket, evicts);
         let watcher = timed(self.kv.watch_with_history(&nats_key))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
@@ -1613,7 +1651,8 @@ impl KvWatcher for NatsKvWatcher {
         // prefixes costs 1 consumer, not N. `_with_history` for the same
         // state-sync contract as `watch_all`.
         let keys: Vec<String> = prefixes.iter().map(|p| format!("{p}>")).collect();
-        let origin = stream_origin(&self.js, &self.bucket).await?;
+        let (origin, evicts) = stream_origin_and_evicts(&self.js, &self.bucket).await?;
+        warn_raw_watch(&self.bucket, evicts);
         let watcher = timed(self.kv.watch_many_with_history(keys))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
@@ -1627,7 +1666,7 @@ impl KvWatcher for NatsKvWatcher {
     ) -> Result<(), KvError> {
         let revision = match cursor.as_u64() {
             Some(rev) if rev > 0 => rev,
-            _ => return self.watch_all(tx).await,
+            _ => return crate::kv::internal_watch(self.watch_all(tx)).await,
         };
         let revision = self.resume_point(cursor, revision).await?;
         let start = resume_start(revision)?;
@@ -1654,7 +1693,7 @@ impl KvWatcher for NatsKvWatcher {
     ) -> Result<(), KvError> {
         let revision = match cursor.as_u64() {
             Some(rev) if rev > 0 => rev,
-            _ => return self.watch_prefix(prefix, tx).await,
+            _ => return crate::kv::internal_watch(self.watch_prefix(prefix, tx)).await,
         };
         let revision = self.resume_point(cursor, revision).await?;
         let nats_key = format!("{prefix}>");
@@ -1684,7 +1723,7 @@ impl KvWatcher for NatsKvWatcher {
         }
         let revision = match cursor.as_u64() {
             Some(rev) if rev > 0 => rev,
-            _ => return self.watch_prefixes(prefixes, tx).await,
+            _ => return crate::kv::internal_watch(self.watch_prefixes(prefixes, tx)).await,
         };
         let revision = self.resume_point(cursor, revision).await?;
 

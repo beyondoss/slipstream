@@ -531,26 +531,55 @@ pub trait KvReader: Send + Sync {
     async fn entry(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
 }
 
+tokio::task_local! {
+    /// Set while slipstream itself runs a full-scope watch (the repair
+    /// re-list, a `_from` fallback), so a backend does not warn the caller
+    /// about a raw watch they did not make.
+    pub(crate) static INTERNAL_WATCH: ();
+}
+
+/// Run `fut` marked as slipstream's own watch ([`INTERNAL_WATCH`]).
+pub(crate) async fn internal_watch<T>(fut: impl std::future::Future<Output = T>) -> T {
+    INTERNAL_WATCH.scope((), fut).await
+}
+
 /// Watch capability - optional, not all stores support real-time updates.
 ///
-/// The non-`_from` watches are **state-sync** streams: they first deliver the
-/// current value of every matching key (the "re-list", as a stream of puts plus
-/// any surviving delete markers), then live updates. A consumer starting with
-/// no cursor therefore converges on the full bucket state without a separate
-/// scan — and without the scan-to-watch race a separate scan would open. The
-/// `_from` variants skip the re-list and deliver only the delta past the cursor.
+/// The non-`_from` watches first deliver the latest revision of every matching
+/// key **that the bucket still holds** (the "re-list", as a stream of puts plus
+/// any surviving delete markers), then live updates. That is the bucket's
+/// contents, not necessarily the current set: on a bucket that evicts
+/// (`discard: Old` with `max_bytes`, `max_msgs` or `max_age`) a live key whose
+/// last write was evicted is missing from the re-list, silently. The re-list is
+/// complete only on a bucket that never evicts current values (for example
+/// `discard: New`). For the current set use [`Preset::node_slice`] or
+/// [`Preset::full_replica`] (`watch_applied`), which keep it in a fold and
+/// artifacts; see the README's section on the bounded log. The NATS backend
+/// logs one warning per bucket when a raw non-`_from` watch opens on a bucket
+/// that evicts.
+///
+/// The `_from` variants skip the re-list and deliver only the delta past the
+/// cursor.
+///
+/// [`Preset::node_slice`]: crate::Preset::node_slice
+/// [`Preset::full_replica`]: crate::Preset::full_replica
 #[async_trait]
 pub trait KvWatcher: Send + Sync {
-    /// Watch all keys: current state first, then live changes. Sends updates
-    /// through the channel. Returns when the watch ends or an error occurs.
+    /// Watch all keys: what the bucket still holds first (see the trait docs:
+    /// not the current set on a bucket that evicts), then live changes. Sends
+    /// updates through the channel. Returns when the watch ends or an error
+    /// occurs.
     async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
-    /// Watch keys matching a prefix: current state first, then live changes.
+    /// Watch keys matching a prefix: what the bucket still holds first (see the
+    /// trait docs), then live changes.
     async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError>;
 
     /// Watch keys matching ANY of `prefixes`, delivered through one channel.
     ///
-    /// The contract is exactly the union of the prefixes — no other keys. A
+    /// The contract is exactly the union of the prefixes — no other keys. The
+    /// initial re-list is what the bucket still holds, as for
+    /// [`watch_prefix`](Self::watch_prefix). A
     /// backend with native multi-filter consumers (NATS server 2.10+) serves all
     /// `prefixes` from a SINGLE consumer; that matters because consumers are a
     /// per-stream resource (measured at ~tens of KB of server state each, growing
@@ -561,7 +590,8 @@ pub trait KvWatcher: Send + Sync {
     /// Resume watching all keys from a previously saved cursor position.
     ///
     /// Returns `KvError::CursorExpired` if the backend has compacted past the
-    /// cursor — callers should fall back to a full `watch_all()`.
+    /// cursor — callers should fall back to a full `watch_all()` (and repair, as
+    /// `watch_applied` does: its re-list misses evicted keys).
     ///
     /// Default implementation ignores the cursor and delegates to `watch_all()`.
     async fn watch_all_from(
