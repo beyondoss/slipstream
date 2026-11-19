@@ -36,6 +36,8 @@ The cursor advances after `apply()` returns, not on receipt. A crash between del
 
 For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold state on disk.
 
+Operating a bucket (sizing, limits, recovery, alerts): [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ## Install
 
 ```toml
