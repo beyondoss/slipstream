@@ -2,7 +2,7 @@
 
 How many watchers, writes and bytes one NATS JetStream KV bucket can carry, how to recover from each failure, and what to alert on.
 
-Measured with the published `beyond-slipstream` 0.8.6, on self-hosted NATS 2.15.3 on AWS spot instances. Limits depend on hardware and workload. Re-measure before you rely on these numbers for another version, another NATS release or another write mix.
+Measured with the published `beyond-slipstream` 0.8.6, on self-hosted NATS 2.15.3 on AWS spot instances. The behavior these measurements describe is unchanged in 0.9.0. Limits depend on hardware and workload. Re-measure before you rely on these numbers for another NATS release or another write mix.
 
 ## Terms
 
@@ -37,6 +37,11 @@ bytes = c × W × live_size                             otherwise
 
 Given `max_bytes`, solve for `W`. Or read `W` from the sequence span, as above. Measured at 200 writes/s: 64k sequences span about 320 s.
 
+Formula accuracy, in harness ticks:
+
+- Short life (L = 30 ticks): measured window 590. Formula 564 with 750 B and 115 B constants (4.4 % under). Formula 598 with the measured 524 B and 120 B (1.4 % under).
+- Long life (L = 300 ticks): formula 112 to 160. Measured 129 (oldest log age) to 429 (creation window). The formula errs low. For export sizing that is the safe direction: it makes you export sooner, not later.
+
 Disk per fold: a RocksDB fold preallocates about 286 MB at open. Keep that in mind for many folds on one disk. Three hundred empty folds used 84 GB. Five hundred filled a 96 GB disk.
 
 ## Limits
@@ -51,7 +56,9 @@ Each row is one bucket on one R1 stream, with 3-node NATS clusters of 8 vCPU per
 |      100 |    3,200 |    2,783 ms |              536k | Broken.                                  |
 |      300 |      400 |      627 ms |              218k | Good.                                    |
 |      300 |      800 |    5,132 ms |              417k | Broken. 1.8 % write failures.            |
-|      500 |      200 |      643 ms |              202k | Marginal. n=1. One canary was reclaimed. |
+|      500 |      200 |      643 ms |              202k | Search result, n=1. Marginal. One canary was reclaimed. |
+|      500 |      200 | 875 ms, 1.34 s, 1.42 s | n/a         | 3 x 10 min checks on 8 vCPU NATS hosts, R1. 2 of 3 failed. Raw results not retained. |
+|      500 |      200 |    1,336 ms | n/a               | 4 vCPU NATS hosts (m6a.xlarge). Broken. NATS 3.0 of 4 cores. |
 |      700 |      200 |    1,331 ms |              248k | Broken.                                  |
 |    1,000 |      200 |  1.3 to 6.7 s |         300k to 402k | Broken in all five runs.           |
 
