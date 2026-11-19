@@ -451,7 +451,7 @@ let s = health.snapshot();
 | `delete()`        | Writes empty value (soft delete). Always returns `Ok(true)`      |
 | `KvUpdate::Purge` | Hard delete: all history removed from stream                     |
 | `scan()`          | `DeliverPolicy::LastPerSubject`: one entry per key, one consumer |
-| `watch_*()`       | `DeliverPolicy::LastPerSubject`: current state, then live updates |
+| `watch_*()`       | `DeliverPolicy::LastPerSubject`: what the bucket still holds, then live updates |
 | `watch_prefix()`  | Native NATS subject filter (`{prefix}>` wildcard)                |
 
 ## Feature detection

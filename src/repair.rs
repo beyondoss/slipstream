@@ -910,14 +910,19 @@ async fn watch_scope(
     scope: &WatchScope,
     tx: mpsc::Sender<KvUpdate>,
 ) -> Result<(), KvError> {
-    match scope {
-        WatchScope::All => watcher.watch_all(tx).await,
-        WatchScope::Prefix(prefix) => watcher.watch_prefix(prefix, tx).await,
-        WatchScope::Prefixes(prefixes) => {
-            let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-            watcher.watch_prefixes(&refs, tx).await
+    // Slipstream's own re-list: the repair paths cover an evicting bucket, so
+    // it must not draw the raw-watch warning meant for callers.
+    crate::kv::internal_watch(async {
+        match scope {
+            WatchScope::All => watcher.watch_all(tx).await,
+            WatchScope::Prefix(prefix) => watcher.watch_prefix(prefix, tx).await,
+            WatchScope::Prefixes(prefixes) => {
+                let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+                watcher.watch_prefixes(&refs, tx).await
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The delta watch for `scope`, resuming after `cursor`.
