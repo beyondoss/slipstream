@@ -1,10 +1,36 @@
 # Slipstream
 
-You have config in NATS JetStream: routing tables, TLS certs, WASM configs. Edge nodes need a local copy, kept in sync, that survives restarts without replaying the full stream.
+**Slipstream keeps a copy of your shared state, such as routes, config or assignments, in every service that needs it, kept in sync over NATS. Reads are local, and a restart resumes instead of starting over.**
 
-Slipstream materializes a NATS JetStream KV bucket into a local fold on each consumer. A watch cursor (a stream sequence number) tracks position in the change stream; on restart, only the delta since the last checkpoint arrives from NATS.
+**NATS only carries the changes; the copies are the state. If a copy can't be proven complete, Slipstream repairs it or tells you. It never serves it silently.**
 
-NATS is a bounded log. Entries are evicted past `max_bytes` and `max_age`. Once retention compacts past a cursor, there is no replay path from NATS. The local fold is the durable state; folds across the fleet are the only full replicas.
+```rust
+// On every edge node: keep the routes table current in a local store.
+let end = Preset::full_replica(routes.reader(), restore)
+    .run(watcher, Some(resume), store, exports_rx, parse, |batch| table.apply(batch), on_applied, shutdown)
+    .await;
+
+// Hot path: a local read, no network hop.
+let origin = table.get(host);
+```
+
+| You get | How |
+|---|---|
+| Local reads | Lookups hit your process, not NATS |
+| A current copy | Updates stream in as they're written |
+| Restart safety | The cursor is saved with the data and advances only after your `apply` returns, so a crash never skips an update |
+| Fast new nodes | A new node bootstraps from an artifact in object storage, then catches up from NATS |
+| No silent gaps | If a copy may be incomplete, the watch repairs it from an artifact or stops and tells you |
+
+**Use it for** state many processes read and few write: routing tables, certs and domains, feature flags, per-node desired state, service discovery.
+
+**Don't use it for** locks or CAS (use NATS KV with `discard: new`), work queues (JetStream work-queue streams), high-rate event fan-out, multi-key transactions or queries (Postgres), or read-your-own-write across nodes.
+
+## How it works
+
+NATS is a bounded log: entries are evicted past `max_bytes` and `max_age`. Each service folds the change stream into a local store (the fold) and saves the stream position (the cursor) with it. On restart, NATS sends only what changed since the cursor.
+
+Once NATS has evicted past a cursor, it can't replay the gap. The folds across the fleet are the only full replicas. A fold that falls past retention restores from the newest artifact a peer exported, then resumes.
 
 ```
  NATS JetStream KV
@@ -35,6 +61,8 @@ NATS is a bounded log. Entries are evicted past `max_bytes` and `max_age`. Once 
 The cursor advances after `apply()` returns, not on receipt. A crash between delivery and application re-delivers on the next start instead of silently skipping. `watch_applied` enforces this invariant.
 
 For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold state on disk.
+
+A raw `watch_*` re-list is only what the bucket still holds. On a bucket that evicts, it can miss live keys. For the current set, use `Preset::full_replica` or `Preset::node_slice`.
 
 Operating a bucket (sizing, limits, recovery, alerts): [docs/OPERATIONS.md](docs/OPERATIONS.md).
 

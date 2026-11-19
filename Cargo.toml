@@ -8,11 +8,11 @@ rust-version = "1.92"
 
 [package]
 name = "beyond-slipstream"
-version = "0.10.1"
+version = "0.10.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Watchable distributed config over NATS JetStream — cache locally, stream updates, resume from a sequence number after any restart."
+description = "Shared state in every service that needs it, kept in sync over NATS JetStream: local reads, restarts that resume, and no silently incomplete copies."
 
 [lib]
 name = "slipstream"
