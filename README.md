@@ -42,15 +42,15 @@ Operating a bucket (sizing, limits, recovery, alerts): [docs/OPERATIONS.md](docs
 
 ```toml
 [dependencies]
-beyond-slipstream = "0.9"
+beyond-slipstream = "0.10"
 ```
 
 On-disk snapshot backends are opt-in cargo features:
 
 ```toml
-beyond-slipstream = { version = "0.9", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
-beyond-slipstream = { version = "0.9", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
-beyond-slipstream = { version = "0.9", features = ["transport"] } # export/import via object_store (S3, GCS, local)
+beyond-slipstream = { version = "0.10", features = ["fjall"] }     # pure-Rust LSM, no C toolchain
+beyond-slipstream = { version = "0.10", features = ["rocksdb"] }   # RocksDB (requires C++ toolchain + libclang)
+beyond-slipstream = { version = "0.10", features = ["transport"] } # export/import via object_store (S3, GCS, local)
 ```
 
 ## Concepts
