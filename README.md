@@ -389,6 +389,58 @@ A restore holds only the keys it will delete in memory; the keys it rewrites are
 
 `Some(reader)` from older code still compiles and means `Relist`. `None` (or no `store`) falls back to the re-list alone and warns that deleted keys may persist.
 
+### Presets
+
+Two combinations of scope, repair, store and export are real. `Preset` fixes each one's scope and repair so they can't be mixed up, and requires the pieces the use case can't do without (a store, an export channel). `preset.run(..)` is a call to `watch_applied_owned`, and everything a preset doesn't fix stays an argument. The low-level API is unchanged.
+
+| | `Preset::full_replica(reader, restore)` | `Preset::node_slice(prefix)` |
+|---|---|---|
+| For | Fleet-wide tables every node folds (routes, assignments) | One node's keys under a prefix |
+| Scope | `All` | `Prefix(prefix)` |
+| On cursor expiry | `ExpiryRepair::Auto`: key-listing diff, or artifact restore on a bucket that evicts current values. The fold ends exact, or the watch fails. On `ForeignCursor` it reseeds from the new stream. | `ExpiryRepair::None`: re-list only. **Keys deleted during the gap may persist.** |
+| Needs | A durable store, a `RestoreSource`, artifacts published inside retention | A durable store, and retention that outlives the node's downtime |
+| Lag in the snapshot | The true backlog | A trend: it counts the whole bucket's revisions |
+
+```rust
+use slipstream::{Preset, WatchHealth};
+
+let health = WatchHealth::new();
+let preset = Preset::full_replica(bucket.reader(), restore).health(health.clone());
+// or: Preset::node_slice(format!("{node}.")).health(health.clone());
+
+let end = preset
+    .run(watcher, Some(resume), store, exports_rx, parse, apply, on_applied, shutdown)
+    .await;
+// end.store and end.applied come back, error or not: call `run` again to restart.
+```
+
+Opening the fold (including the first-boot artifact import) and running the export loop stay yours; a preset documents what each needs.
+
+### Health
+
+A running watch is correct without anyone looking at it, but a stale fold looks exactly like a healthy one from outside. Put a `WatchHealth` in `BatchConfig::health` (or `Preset::health`), keep a clone, and call `snapshot()` from a metrics or health task. It is a few relaxed atomic stores per flush: no allocation, no I/O, and the watch never waits on it. Use one handle per watch, and the same one across its restarts.
+
+```rust
+let s = health.snapshot();
+// s.applied, s.lag, s.last_commit_age, s.apply_in_flight, s.repair,
+// s.cursor_expiries, s.newest_artifact, s.restarts, s.last_error
+```
+
+| Field | Means | Alert when |
+|---|---|---|
+| `running` | A run is in progress on this handle | False longer than your restart backoff |
+| `applied` | Every update at or below this revision is applied (and committed, with a store) | It stops while `lag` is nonzero |
+| `last_commit_age` | Time since the store committed a batch (without a store: since it was applied). `None` until the first | Large while `lag` is nonzero |
+| `apply_in_flight` | Age of the current store apply. `None` when none is | Past your limit: `apply` has no timeout, so restart the process |
+| `stream_head`, `stream_first`, `head_sample_age` | The log's newest and oldest revision, sampled every 30 s (one stream-info request, not one per update) | `head_sample_age` several intervals old |
+| `lag` | `stream_head - applied` at the last sample. Whole-bucket, so a prefix-scoped watch reads nonzero while idle | Grows, or stays high, under `All` scope |
+| `repair` | `Idle`, `Relisting`, `Restoring`, `Reseeding` (bucket recreated, repair armed), `Refused(reason)`, `WaitingForArtifact(reason)`, `ForeignCursorRefused` (bucket recreated, no repair) | `Refused`, `WaitingForArtifact` or `ForeignCursorRefused`: the fold is stale and retrying. They clear only when a repair succeeds |
+| `cursor_expiries` | Expired cursors handled | Any increase with no repair armed (a ghost key is possible) |
+| `newest_artifact` | Cursor and age of the newest artifact this watch exported or read | Age near your export interval or the bucket's retention |
+| `restarts`, `last_error` | Runs after the first; the error that ended the last one | A rising rate |
+
+`None` means unknown, never healthy. `ApplyProbe` is replaced by this handle: `WatchHealth::in_flight()` returns what `ApplyProbe::in_flight()` did.
+
 ## NATS mapping
 
 | Concept           | NATS primitive                                                   |

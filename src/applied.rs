@@ -56,14 +56,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 use tracing::warn;
 
 use crate::artifact::ExportManifest;
+use crate::health::WatchHealth;
 use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
 use crate::repair::{self, ExpiryRepair};
 use crate::snapshot::{SnapshotError, SnapshotStore};
@@ -139,10 +139,11 @@ pub struct BatchConfig {
     /// than [`max`](Self::max). Tune it together with `max` for high-fanout
     /// hydration; clamped to a minimum of 1.
     pub channel_capacity: usize,
-    /// Reports how long the current store apply has been in flight, so a
-    /// consumer can detect a store that stopped returning. `None` records
-    /// nothing. Has no effect without a store.
-    pub apply_probe: Option<ApplyProbe>,
+    /// The watch's health handle: cursor, lag, commit age, store-apply age,
+    /// repair state, restarts, last error (see [`WatchHealth`]). Keep a clone
+    /// and poll [`snapshot`](WatchHealth::snapshot). Use one per watch, and
+    /// the same one across its restarts. `None` records nothing.
+    pub health: Option<WatchHealth>,
 }
 
 impl Default for BatchConfig {
@@ -154,74 +155,8 @@ impl Default for BatchConfig {
             window: Duration::from_millis(10),
             max: 100,
             channel_capacity: 256,
-            apply_probe: None,
+            health: None,
         }
-    }
-}
-
-/// Shows whether a watch's store apply is in flight, and for how long.
-///
-/// [`SnapshotStore::apply`] runs on a blocking task with no timeout, because
-/// abandoning it could not stop it and would lose the store. If it never
-/// returns, the watch stops advancing while the rest of the process stays
-/// healthy. Clone a probe into [`BatchConfig::apply_probe`], then poll
-/// [`in_flight`](Self::in_flight) from a metrics or health task and alert when
-/// the age passes your limit. Use one probe per watch.
-#[derive(Debug, Clone)]
-pub struct ApplyProbe {
-    inner: Arc<ApplyProbeInner>,
-}
-
-#[derive(Debug)]
-struct ApplyProbeInner {
-    epoch: Instant,
-    // Microseconds from `epoch` to the apply's start, plus one. Zero is idle.
-    started: AtomicU64,
-}
-
-impl ApplyProbe {
-    /// A probe with no apply in flight.
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ApplyProbeInner {
-                epoch: Instant::now(),
-                started: AtomicU64::new(0),
-            }),
-        }
-    }
-
-    /// How long the current store apply has been in flight, counted from when
-    /// it was handed to the blocking pool. `None` when no apply is in flight.
-    pub fn in_flight(&self) -> Option<Duration> {
-        let started = self.inner.started.load(Ordering::Relaxed).checked_sub(1)?;
-        Some(
-            self.inner
-                .epoch
-                .elapsed()
-                .saturating_sub(Duration::from_micros(started)),
-        )
-    }
-
-    fn begin(&self) -> ApplyInFlight {
-        let started = u64::try_from(self.inner.epoch.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
-        self.inner.started.store(started + 1, Ordering::Relaxed);
-        ApplyInFlight(self.clone())
-    }
-}
-
-impl Default for ApplyProbe {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Held by the blocking task, so the probe clears when the apply really ends:
-/// on return, on panic, or if the task never starts.
-struct ApplyInFlight(ApplyProbe);
-
-impl Drop for ApplyInFlight {
-    fn drop(&mut self) {
-        self.0.inner.started.store(0, Ordering::Relaxed);
     }
 }
 
@@ -450,8 +385,18 @@ where
         on_applied,
         config.max,
         applied,
-        config.apply_probe.clone(),
+        config.health.clone(),
     );
+
+    // Observation only: record the run, and sample the log's head in the
+    // background (one request per interval, never per update).
+    let sampler = config.health.as_ref().map(|h| {
+        h.run_started(fold.applied());
+        tokio::spawn(crate::health::sample_log_range(
+            Arc::clone(&watcher),
+            h.clone(),
+        ))
+    });
 
     // The loop only borrows `fold`, so every exit path — `?`, `return`, a
     // clean shutdown — comes back here with the store still owned, to be
@@ -461,7 +406,13 @@ where
         // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
         let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
         let handle = tokio::spawn(repair::run_watch(
-            watcher, scope, resume, unanchored, repair, tx,
+            watcher,
+            scope,
+            resume,
+            unanchored,
+            repair,
+            tx,
+            config.health.clone(),
         ));
         // A fatal error ends the watch, and the watch task with it.
         let stop = |e: KvError| {
@@ -570,6 +521,12 @@ where
         }
     }
     .await;
+    if let Some(sampler) = sampler {
+        sampler.abort();
+    }
+    if let Some(h) = &config.health {
+        h.run_ended(&result);
+    }
     WatchEnd {
         result,
         applied: fold.applied().clone(),
@@ -659,7 +616,7 @@ pub(crate) struct Fold<U, S, P, A, O> {
     open: bool,
     // `applied` gained the eviction memo and the store doesn't have it yet.
     memo_dirty: bool,
-    apply_probe: Option<ApplyProbe>,
+    health: Option<WatchHealth>,
 }
 
 impl<U, S, P, A, O> Fold<U, S, P, A, O>
@@ -677,7 +634,7 @@ where
         on_applied: O,
         max: usize,
         applied: WatchCursor,
-        apply_probe: Option<ApplyProbe>,
+        health: Option<WatchHealth>,
     ) -> Self {
         // `max(1)` only guards a nonsensical `max = 0` config.
         let batch_cap = max.max(1);
@@ -695,7 +652,7 @@ where
             store_fail_streak: 0,
             open: false,
             memo_dirty: false,
-            apply_probe,
+            health,
         }
     }
 
@@ -783,7 +740,11 @@ where
             // it, so it rides over from the cursor it replaces.
             let seen = self.applied.seen_evicting();
             self.applied = self.batch_high.clone().remembering(seen);
+            if let Some(h) = &self.health {
+                h.set_applied(&self.applied);
+            }
         }
+        let had_store = self.store.is_some();
         // A cursor-only advance (nothing raw to fold) still commits to the
         // store: a restore's final step moves the cursor to the artifact's
         // with no updates left. In the steady state every advance carries raw
@@ -806,7 +767,7 @@ where
             // survives every restart (reproduced by
             // `transient_store_failure_never_leaves_a_cursor_gap`). Only a
             // *panicked* task (Err) loses the store: fatal.
-            let in_flight = self.apply_probe.as_ref().map(ApplyProbe::begin);
+            let in_flight = self.health.as_ref().map(WatchHealth::begin_apply);
             match tokio::task::spawn_blocking(move || {
                 let _in_flight = in_flight;
                 let res = st.apply(&raw, &cur);
@@ -818,6 +779,9 @@ where
                     self.store = Some(st);
                     self.store_fail_streak = 0;
                     self.memo_dirty = false;
+                    if let Some(h) = &self.health {
+                        h.committed();
+                    }
                 }
                 Ok((st, raw, Err(e))) => {
                     self.store_fail_streak += 1;
@@ -851,6 +815,10 @@ where
             }
         }
         if advanced {
+            // Without a store, applying the batch is the commit.
+            if !had_store && let Some(h) = &self.health {
+                h.committed();
+            }
             (self.on_applied)(self.applied.clone());
             self.batch_high = WatchCursor::none();
         }
@@ -918,6 +886,9 @@ where
         {
             Ok((st, res)) => {
                 self.store = Some(st);
+                if let (Ok(manifest), Some(h)) = (&res, &self.health) {
+                    h.artifact_seen(manifest);
+                }
                 let _ = reply.send(res);
                 Ok(())
             }
@@ -2600,13 +2571,13 @@ mod tests {
     }
 
     /// A store apply that does not return is visible, and its age grows, while
-    /// the cursor stays put. Releasing it clears the probe and the watch moves on.
+    /// the cursor stays put. Releasing it clears the mark and the watch moves on.
     #[tokio::test]
-    async fn apply_probe_reports_a_hung_store_apply() {
+    async fn health_reports_a_hung_store_apply() {
         let dir = tempfile::tempdir().unwrap();
         let (store, gate) = gated_store(&dir, false);
         let gate = OpenGate(gate);
-        let probe = ApplyProbe::new();
+        let probe = WatchHealth::new();
         let applied = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&applied);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -2619,7 +2590,7 @@ mod tests {
             None,
             BatchConfig {
                 window: Duration::from_millis(1),
-                apply_probe: Some(probe.clone()),
+                health: Some(probe.clone()),
                 ..BatchConfig::default()
             },
             parse_put,
@@ -2629,6 +2600,10 @@ mod tests {
         ));
 
         wait_for(|| probe.in_flight().is_some()).await;
+        let hung = probe.snapshot();
+        assert!(hung.running);
+        assert!(hung.apply_in_flight.is_some());
+        assert_eq!(hung.last_commit_age, None, "nothing has committed yet");
         let first = probe.in_flight().unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(probe.in_flight().unwrap() > first, "age must keep growing");
@@ -2637,6 +2612,10 @@ mod tests {
         gate.open();
         wait_for(|| applied.load(Ordering::SeqCst) == 1).await;
         assert_eq!(probe.in_flight(), None);
+        let done = probe.snapshot();
+        assert_eq!(done.applied, Some(1));
+        assert!(done.last_commit_age.is_some(), "the store committed");
+        assert_eq!(done.apply_in_flight, None);
 
         sd_tx.send(true).unwrap();
         assert_eq!(watch.await.unwrap().unwrap().as_u64(), Some(1));
@@ -2644,10 +2623,10 @@ mod tests {
 
     /// A panicking apply ends the watch and does not read as still in flight.
     #[tokio::test]
-    async fn apply_probe_clears_when_the_store_panics() {
+    async fn health_clears_in_flight_when_the_store_panics() {
         let dir = tempfile::tempdir().unwrap();
         let (store, _gate) = gated_store(&dir, true);
-        let probe = ApplyProbe::new();
+        let probe = WatchHealth::new();
         let (_sd_tx, sd_rx) = watch::channel(false);
         let result = watch_applied(
             Arc::new(MockWatcher::new(vec![put("a", b"1", 1)], true)),
@@ -2658,7 +2637,7 @@ mod tests {
             None,
             BatchConfig {
                 window: Duration::from_millis(1),
-                apply_probe: Some(probe.clone()),
+                health: Some(probe.clone()),
                 ..BatchConfig::default()
             },
             parse_put,

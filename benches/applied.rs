@@ -13,8 +13,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use slipstream::{
-    BatchConfig, KvEntry, KvError, KvUpdate, KvWatcher, VersionToken, WatchCursor, WatchScope,
-    watch_applied,
+    BatchConfig, KvEntry, KvError, KvUpdate, KvWatcher, VersionToken, WatchCursor, WatchHealth,
+    WatchScope, watch_applied,
 };
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -72,48 +72,62 @@ fn bench_batch_throughput(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("watch_applied");
     group.throughput(Throughput::Elements(N));
-    group.bench_function("batch_1000_updates", |b| {
-        b.iter_batched(
-            // Setup (not measured): fresh scripted watcher with its own copy of
-            // the updates, since each run drains the channel.
-            || {
-                Arc::new(ScriptedWatcher {
-                    updates: Mutex::new(Some(template.clone())),
-                })
-            },
-            // Measured: run the combinator to completion over all N updates.
-            |watcher| {
-                rt.block_on(async move {
-                    let (_sd_tx, sd_rx) = watch::channel(false);
-                    watch_applied(
-                        watcher as Arc<dyn KvWatcher>,
-                        WatchScope::All,
-                        None,
-                        None, // reader: cursor-expired resync not exercised here
-                        None::<slipstream::AppendLogSnapshot>,
-                        None,
-                        BatchConfig {
-                            window: Duration::from_millis(10),
-                            max: 100,
-                            ..BatchConfig::default()
-                        },
-                        // parse: keep every put.
-                        |u: &KvUpdate| match u {
-                            KvUpdate::Put(_) => Some(()),
-                            _ => None,
-                        },
-                        // apply: no-op — isolate the batching overhead.
-                        |_batch: Vec<()>| {},
-                        |_cursor: WatchCursor| {},
-                        sd_rx,
-                    )
-                    .await
-                    .unwrap()
-                })
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    // The same loop with and without a health handle: what recording the
+    // snapshot costs the hot path.
+    for (name, with_health) in [
+        ("batch_1000_updates", false),
+        ("batch_1000_updates_health", true),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                // Setup (not measured): fresh scripted watcher with its own copy
+                // of the updates, since each run drains the channel.
+                || {
+                    Arc::new(ScriptedWatcher {
+                        updates: Mutex::new(Some(template.clone())),
+                    })
+                },
+                // Measured: run the combinator to completion over all N updates.
+                |watcher| {
+                    rt.block_on(async move {
+                        let (_sd_tx, sd_rx) = watch::channel(false);
+                        watch_applied(
+                            watcher as Arc<dyn KvWatcher>,
+                            WatchScope::All,
+                            None,
+                            None, // reader: cursor-expired resync not exercised here
+                            None::<slipstream::AppendLogSnapshot>,
+                            None,
+                            BatchConfig {
+                                window: Duration::from_millis(10),
+                                max: 100,
+                                health: with_health.then(|| {
+                                    // No head sampling in the loop: the ticker
+                                    // is a background request, not hot path.
+                                    WatchHealth::with_head_sample_interval(Duration::from_secs(
+                                        3600,
+                                    ))
+                                }),
+                                ..BatchConfig::default()
+                            },
+                            // parse: keep every put.
+                            |u: &KvUpdate| match u {
+                                KvUpdate::Put(_) => Some(()),
+                                _ => None,
+                            },
+                            // apply: no-op — isolate the batching overhead.
+                            |_batch: Vec<()>| {},
+                            |_cursor: WatchCursor| {},
+                            sd_rx,
+                        )
+                        .await
+                        .unwrap()
+                    })
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
     group.finish();
 }
 
