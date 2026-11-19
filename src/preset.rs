@@ -27,6 +27,9 @@ use crate::kv::{KvReader, KvUpdate, KvWatcher, WatchCursor};
 use crate::repair::{ExpiryRepair, RestoreSource};
 use crate::snapshot::SnapshotStore;
 
+/// The replica's `Auto` repair inputs: the live-key reader and the artifact source.
+type AutoRepair<S> = (Arc<dyn KvReader>, Arc<dyn RestoreSource<S>>);
+
 /// A use case for [`watch_applied_owned`]. Build one with
 /// [`full_replica`](Self::full_replica) or [`node_slice`](Self::node_slice),
 /// then [`run`](Self::run) it. A preset is reusable: call `run` again, with
@@ -34,7 +37,7 @@ use crate::snapshot::SnapshotStore;
 pub struct Preset<S> {
     scope: WatchScope,
     // `Some` for the replica's `Auto` repair; the slice repairs nothing.
-    auto: Option<(Arc<dyn KvReader>, Arc<dyn RestoreSource<S>>)>,
+    auto: Option<AutoRepair<S>>,
     config: BatchConfig,
 }
 
@@ -65,6 +68,14 @@ impl<S: SnapshotStore + Send + 'static> Preset<S> {
     ///
     /// A cursor-less start on a bucket that has already evicted is repaired
     /// the same way: it seeds from the artifact, never from the bucket alone.
+    ///
+    /// # What it does on `ForeignCursor`
+    ///
+    /// The bucket was deleted and recreated, so the fold belongs to the old
+    /// stream. With `Auto` armed the fold is repaired as an unanchored fold
+    /// against the current stream (health: `Reseeding`, then the repair's own
+    /// state): an artifact exported by a fold of the old stream is refused, so
+    /// the replica waits for one exported after the recreation.
     ///
     /// # What the caller still owns
     ///
@@ -104,6 +115,16 @@ impl<S: SnapshotStore + Send + 'static> Preset<S> {
     /// [`HealthSnapshot::cursor_expiries`](crate::HealthSnapshot::cursor_expiries).
     /// Alert on any increase: for this preset it means the fold may hold a
     /// ghost key.
+    ///
+    /// # What it does on `ForeignCursor`
+    ///
+    /// The bucket was deleted and recreated, so the fold holds the old
+    /// stream's keys and a re-list could not remove them. With no repair
+    /// armed the watch **fails** with `KvError::ForeignCursor`, every
+    /// restart fails the same way, and the health snapshot shows
+    /// [`RepairState::ForeignCursorRefused`](crate::RepairState::ForeignCursorRefused).
+    /// Discard the fold and cold-boot it (from an artifact exported after the
+    /// recreation, or from the bucket).
     ///
     /// A prefix scope also cannot detect, in-band, retention overrunning a
     /// live watch (only the resume-time check runs on a restart), so retention

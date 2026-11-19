@@ -17,8 +17,9 @@ use common::TestNats;
 use slipstream::snapshot::SnapshotError;
 use slipstream::{
     AppendLogSnapshot, BatchConfig, Connection, DiscardPolicy, ExportManifest, ExportRequest,
-    KvStore, KvUpdate, NatsConnection, NatsConnectionConfig, Preset, RepairState, RestoreSource,
-    RestoredFold, StoreConfig, WatchCursor, WatchEnd, WatchHealth, WatchScope, watch_applied_owned,
+    KvError, KvStore, KvUpdate, NatsConnection, NatsConnectionConfig, Preset, RepairState,
+    RestoreSource, RestoredFold, StoreConfig, WatchCursor, WatchEnd, WatchHealth, WatchScope,
+    watch_applied_owned,
 };
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -404,6 +405,89 @@ async fn slice_counts_a_cursor_expiry_it_cannot_repair() {
     assert_eq!(snap.restarts, 1, "the second run on this handle");
     assert_eq!(snap.repair, RepairState::Idle, "nothing was armed to run");
     node.stop().await.result.expect("re-list only");
+}
+
+/// A recreated bucket makes the fold's cursor foreign. With no repair armed
+/// the watch fails, and the snapshot says why; with a repair armed it reseeds
+/// and the refusal does not appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_cursor_is_refused_without_a_repair() {
+    let cfg = || StoreConfig {
+        name: "routes".into(),
+        ..Default::default()
+    };
+    let h = Harness::new(cfg()).await;
+    let (_c, fold) = h.open("fold");
+    let node = Node::spawn(
+        &h.bucket,
+        WatchScope::All,
+        fold,
+        None,
+        none(),
+        &health(),
+        false,
+    );
+    let mut rev = 0;
+    for i in 0..20 {
+        rev = h.put(&format!("old.{i}"), b"v").await;
+    }
+    node.wait_applied(rev).await;
+    let resume = node.stop().await.applied;
+
+    let client = async_nats::connect(&h._nats.url).await.unwrap();
+    async_nats::jetstream::new(client)
+        .delete_key_value("routes")
+        .await
+        .unwrap();
+    let new = h._conn.store_with_config(cfg()).await.unwrap();
+    let w = new.writer().unwrap();
+    let mut head = 0;
+    for i in 0..5 {
+        head = w
+            .put(&format!("new.{i}"), b"v")
+            .await
+            .unwrap()
+            .as_u64()
+            .unwrap();
+    }
+
+    let refused = health();
+    let (c, fold) = h.open("fold");
+    assert_eq!(c.as_u64(), resume.as_u64());
+    let node = Node::spawn(
+        &new,
+        WatchScope::All,
+        fold,
+        Some(c),
+        none(),
+        &refused,
+        false,
+    );
+    let end = timeout(Duration::from_secs(15), node.task)
+        .await
+        .expect("fails, not hangs")
+        .unwrap();
+    assert!(matches!(end.result, Err(KvError::ForeignCursor)));
+    let snap = refused.snapshot();
+    assert_eq!(snap.repair, RepairState::ForeignCursorRefused);
+    assert!(snap.last_error.is_some());
+    assert!(!snap.running);
+
+    let repaired = health();
+    let (c, fold) = h.open("fold");
+    let relist = slipstream::ExpiryRepair::Relist(new.reader());
+    let node = Node::spawn(
+        &new,
+        WatchScope::All,
+        fold,
+        Some(c),
+        relist,
+        &repaired,
+        false,
+    );
+    node.wait_applied(head).await;
+    assert_eq!(repaired.snapshot().repair, RepairState::Idle);
+    node.stop().await.result.expect("clean end");
 }
 
 #[cfg(feature = "transport")]

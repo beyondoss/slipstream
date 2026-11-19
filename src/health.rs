@@ -28,7 +28,7 @@ use crate::kv::{KvError, KvWatcher, WatchCursor};
 pub const DEFAULT_HEAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The shared, cheap-to-clone health handle of one watch. See the
-/// [module docs](self).
+/// module docs.
 #[derive(Debug, Clone)]
 pub struct WatchHealth {
     inner: Arc<Inner>,
@@ -69,7 +69,7 @@ struct ArtifactSeen {
 
 /// What the watch's cursor-expiry repair is doing, or last concluded.
 ///
-/// `Refused` and `WaitingForArtifact` are sticky: they stay until a repair
+/// `Refused`, `WaitingForArtifact` and `ForeignCursorRefused` are sticky: they stay until a repair
 /// succeeds, because the watch ends on them and the caller's restart retries
 /// the repair from the same expired cursor. A fold in either state is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +85,18 @@ pub enum RepairState {
     /// diff on a bucket that evicts current values. The reason is the one
     /// logged at `error`. Needs an operator or a newer, valid artifact.
     Refused(String),
+    /// The bucket was deleted and recreated, so the fold's cursor belongs to
+    /// the old stream, and a repair is armed: the fold is being reseeded
+    /// against the stream that exists now (a key-listing diff or an artifact
+    /// restore, whose own state follows). Not sticky: the repair's outcome
+    /// replaces it.
+    Reseeding,
+    /// The bucket was recreated and no repair is armed (`ExpiryRepair::None`,
+    /// as in [`Preset::node_slice`](crate::Preset::node_slice)): the watch
+    /// fails with `KvError::ForeignCursor` rather than keep the old stream's
+    /// keys, and its restart fails the same way. Sticky. Needs an operator to
+    /// discard the fold and cold-boot it.
+    ForeignCursorRefused,
     /// A restore is needed, but no usable artifact exists yet: none is
     /// published, the newest is not ahead of the fold, or it could not be
     /// read. A newer export round clears this on its own; if it persists the
@@ -323,7 +335,9 @@ impl WatchHealth {
         let mut d = self.detail();
         let blocked = matches!(
             d.repair,
-            RepairState::Refused(_) | RepairState::WaitingForArtifact(_)
+            RepairState::Refused(_)
+                | RepairState::WaitingForArtifact(_)
+                | RepairState::ForeignCursorRefused
         );
         if !blocked
             || matches!(

@@ -42,7 +42,7 @@ use crate::health::{RepairState, WatchHealth};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
-    plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok,
+    plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok, same_incarnation,
 };
 use crate::snapshot::{SnapshotError, SnapshotStore};
 
@@ -210,13 +210,14 @@ pub(crate) fn scope_covers(exporter: &[String], watcher: &[String]) -> bool {
 }
 
 /// Can `artifact` repair a fold at `local` whose cursor expired? Checks scope
-/// coverage, then [`restore_allowed`] (ahead + fresh) when the log's first
-/// retained revision is known, the ahead half alone when it isn't (the resume
+/// coverage, then that its cursor is this stream's
+/// ([`same_incarnation`]), then [`restore_allowed`] (ahead + fresh) when the
+/// log's retention is known, the ahead half alone when it isn't (the resume
 /// that follows re-checks the window). `Err` is the operator-facing reason.
 pub(crate) fn check_restore(
     artifact: &ExportManifest,
     local: &WatchCursor,
-    first_revision: Option<u64>,
+    log: Option<Retention>,
     watch_scope: &[String],
 ) -> Result<(), String> {
     match &artifact.scope {
@@ -237,13 +238,24 @@ pub(crate) fn check_restore(
         Some(_) => {}
     }
     let (a, l) = (artifact.cursor.rank(), local.rank());
+    if let Some(log) = log
+        && let Some(stream) = log.incarnation
+        && !same_incarnation(artifact.cursor.origin(), a, stream, log.last_revision)
+    {
+        return Err(format!(
+            "the latest artifact (cursor {a}) was exported from a different incarnation of \
+             this bucket's stream (the bucket was deleted and recreated; its positions are the \
+             old stream's), so it can't seed a fold of this one. Publish a new export round \
+             from a node folding the current stream"
+        ));
+    }
     if !restore_ahead(a, l) {
         return Err(format!(
             "the latest artifact (cursor {a}) is not ahead of the local fold (cursor {l}): \
              nothing newer to restore from; the export pipeline is behind this node"
         ));
     }
-    if let Some(first) = first_revision
+    if let Some(first) = log.map(|r| r.first_revision)
         && !restore_allowed(a, l, first)
     {
         debug_assert!(!resume_window_ok(a, first));
@@ -798,6 +810,8 @@ pub(crate) async fn run_watch<S: Send + 'static>(
     }
 
     loop {
+        // The cursor belongs to another incarnation of the stream.
+        let mut foreign = false;
         let cursor = if std::mem::take(&mut repair_first) {
             WatchCursor::none()
         } else {
@@ -813,6 +827,25 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                         h.expired();
                     }
                     cursor
+                }
+                // The bucket was recreated: this fold's positions (and what it
+                // folded under them) are the old stream's. With a repair armed
+                // it is an unanchored fold — repaired like a cursor-less start
+                // that holds data, against the stream that exists now; with
+                // none, the error stands (a re-list alone would leave the old
+                // stream's keys in the fold).
+                Err(KvError::ForeignCursor) if mode != RepairMode::None => {
+                    warn!(
+                        "the bucket was deleted and recreated: the fold's cursor belongs to the \
+                         old stream. Repairing it against the current one as an unanchored fold"
+                    );
+                    note(health, RepairState::Reseeding);
+                    foreign = true;
+                    WatchCursor::none()
+                }
+                Err(KvError::ForeignCursor) => {
+                    note(health, RepairState::ForeignCursorRefused);
+                    return Err(KvError::ForeignCursor);
                 }
                 other => return other,
             }
@@ -848,7 +881,7 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                     restore_from_artifact(&shared, scope, reader, source, repairs, &cursor, health)
                         .await
                         .map_err(|e| match e {
-                            KvError::WatchError(msg) if cursor.is_none() => {
+                            KvError::WatchError(msg) if cursor.is_none() && !foreign => {
                                 KvError::WatchError(format!(
                                     "{msg}. This node has no cursor, so it can only seed from an \
                              artifact. If none exists yet (first deploy onto a bucket that \
@@ -984,7 +1017,7 @@ async fn restore_from_artifact<S: Send + 'static>(
         fail(msg)
     };
 
-    let first = watcher.retention().await?.map(|r| r.first_revision);
+    let log = watcher.retention().await?;
     let latest = match source.latest().await {
         Ok(latest) => latest,
         Err(e) => {
@@ -996,7 +1029,7 @@ async fn restore_from_artifact<S: Send + 'static>(
     if let Some(h) = health {
         h.artifact_seen(&latest);
     }
-    check_restore(&latest, local, first, &prefixes).map_err(|m| refuse(&latest, m))?;
+    check_restore(&latest, local, log, &prefixes).map_err(|m| refuse(&latest, m))?;
 
     let restored = source
         .fetch()
@@ -1004,8 +1037,8 @@ async fn restore_from_artifact<S: Send + 'static>(
         .map_err(|e| fail(format!("fetching the latest artifact failed: {e}")))?;
     // The pointer may have advanced between the peek and the download, and
     // retention may have moved: check what actually arrived, against now.
-    let first = watcher.retention().await?.map(|r| r.first_revision);
-    check_restore(restored.manifest(), local, first, &prefixes)
+    let log = watcher.retention().await?;
+    check_restore(restored.manifest(), local, log, &prefixes)
         .map_err(|m| refuse(restored.manifest(), m))?;
     let age_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1017,7 +1050,7 @@ async fn restore_from_artifact<S: Send + 'static>(
     info!(
         cursor = ?restored.manifest().cursor,
         age_secs,
-        first_retained = ?first,
+        first_retained = ?log.map(|r| r.first_revision),
         "restoring the fold from the latest artifact"
     );
 
@@ -1511,23 +1544,61 @@ mod tests {
         );
     }
 
+    /// The log as retention reports it, knowing only its first revision.
+    fn log(first: Option<u64>) -> Option<Retention> {
+        first.map(|first_revision| Retention {
+            evicts_current_values: false,
+            first_revision,
+            last_revision: u64::MAX,
+            incarnation: None,
+        })
+    }
+
     #[test]
     fn check_restore_refusals() {
         let all = vec![String::new()];
         let local = WatchCursor::from_u64(3);
         // Ahead + fresh + covering: accepted.
-        check_restore(&manifest(9, Some(&[""])), &local, Some(8), &all).unwrap();
+        check_restore(&manifest(9, Some(&[""])), &local, log(Some(8)), &all).unwrap();
         // Unknown retention: ahead alone suffices here (the resume re-checks).
-        check_restore(&manifest(9, Some(&[""])), &local, None, &all).unwrap();
+        check_restore(&manifest(9, Some(&[""])), &local, log(None), &all).unwrap();
 
-        let err = check_restore(&manifest(9, None), &local, Some(8), &all).unwrap_err();
+        let err = check_restore(&manifest(9, None), &local, log(Some(8)), &all).unwrap_err();
         assert!(err.contains("no key scope"), "{err}");
-        let err = check_restore(&manifest(9, Some(&["node."])), &local, Some(8), &all).unwrap_err();
+        let err =
+            check_restore(&manifest(9, Some(&["node."])), &local, log(Some(8)), &all).unwrap_err();
         assert!(err.contains("does not cover"), "{err}");
-        let err = check_restore(&manifest(3, Some(&[""])), &local, None, &all).unwrap_err();
+        let err = check_restore(&manifest(3, Some(&[""])), &local, log(None), &all).unwrap_err();
         assert!(err.contains("not ahead"), "{err}");
-        let err = check_restore(&manifest(6, Some(&[""])), &local, Some(8), &all).unwrap_err();
+        let err = check_restore(&manifest(6, Some(&[""])), &local, log(Some(8)), &all).unwrap_err();
         assert!(err.contains("outside the log's retention window"), "{err}");
+    }
+
+    /// An artifact exported from another incarnation of the stream can't seed
+    /// a fold of this one, whatever its position says — even one inside the new
+    /// stream's range, ahead of the fold and inside the window.
+    #[test]
+    fn check_restore_refuses_another_incarnation() {
+        let all = vec![String::new()];
+        let local = WatchCursor::from_u64(3);
+        let stream = |incarnation, last_revision| {
+            Some(Retention {
+                evicts_current_values: false,
+                first_revision: 1,
+                last_revision,
+                incarnation: Some(incarnation),
+            })
+        };
+        let mut m = manifest(9, Some(&[""]));
+        m.cursor = WatchCursor::from_version(VersionToken::from_u64(9).with_origin(111));
+        check_restore(&m, &local, stream(111, 20), &all).unwrap();
+        let err = check_restore(&m, &local, stream(222, 20), &all).unwrap_err();
+        assert!(err.contains("different incarnation"), "{err}");
+        // Written before cursors recorded an incarnation: possible here, or not.
+        let m = manifest(9, Some(&[""]));
+        check_restore(&m, &local, stream(222, 20), &all).unwrap();
+        let err = check_restore(&m, &local, stream(222, 8), &all).unwrap_err();
+        assert!(err.contains("different incarnation"), "{err}");
     }
 
     /// The restore's updates in production order — rewritten entries from
@@ -1786,7 +1857,7 @@ mod tests {
                             let got = check_restore(
                                 &manifest(a, scope),
                                 &WatchCursor::from_u64(l),
-                                first,
+                                log(first),
                                 watcher,
                             )
                             .is_ok();

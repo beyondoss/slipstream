@@ -36,6 +36,8 @@ The cursor advances after `apply()` returns, not on receipt. A crash between del
 
 For folds that outgrow RAM, `fjall` (pure Rust) and `rocksdb` backends hold state on disk.
 
+Operating a bucket (sizing, limits, recovery, alerts): [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ## Install
 
 ```toml
@@ -191,9 +193,14 @@ match watcher.watch_all_from(&cursor, tx.clone()).await {
         // NATS compacted past the cursor. Full replay required.
         watcher.watch_all(tx).await?;
     }
+    // The bucket was deleted and recreated: the cursor is the old stream's.
+    // Discard it and whatever was folded under it, then start from no cursor.
+    Err(KvError::ForeignCursor) => return Err(KvError::ForeignCursor.into()),
     Err(e) => return Err(e.into()),
 }
 ```
+
+A cursor records which incarnation of the stream it was taken from (NATS: the stream's creation time). A bucket recreated under the same name restarts its revisions at 1, so a cursor from the old one is refused with `KvError::ForeignCursor` rather than resumed, whether it sits above the new head or inside the new range. [`watch_applied`](#cursor-expiry) repairs it as a fold with no cursor (the re-list diff, or an artifact restore) when a repair is armed, and fails with the error otherwise. An artifact exported from the old stream is refused as a restore source the same way. Cursors written before this was recorded are admitted while their position is possible in the current stream, and record the incarnation from the next batch on.
 
 The full replay only re-delivers what NATS still holds. On a bucket with `max_age` or `discard: old`, values that aged out are gone from it; [`watch_applied`](#cursor-expiry) restores those from an artifact.
 
@@ -390,7 +397,7 @@ Two combinations of scope, repair, store and export are real. `Preset` fixes eac
 |---|---|---|
 | For | Fleet-wide tables every node folds (routes, assignments) | One node's keys under a prefix |
 | Scope | `All` | `Prefix(prefix)` |
-| On cursor expiry | `ExpiryRepair::Auto`: key-listing diff, or artifact restore on a bucket that evicts current values. The fold ends exact, or the watch fails. | `ExpiryRepair::None`: re-list only. **Keys deleted during the gap may persist.** |
+| On cursor expiry | `ExpiryRepair::Auto`: key-listing diff, or artifact restore on a bucket that evicts current values. The fold ends exact, or the watch fails. On `ForeignCursor` it reseeds from the new stream. | `ExpiryRepair::None`: re-list only. **Keys deleted during the gap may persist.** |
 | Needs | A durable store, a `RestoreSource`, artifacts published inside retention | A durable store, and retention that outlives the node's downtime |
 | Lag in the snapshot | The true backlog | A trend: it counts the whole bucket's revisions |
 
@@ -427,7 +434,7 @@ let s = health.snapshot();
 | `apply_in_flight` | Age of the current store apply. `None` when none is | Past your limit: `apply` has no timeout, so restart the process |
 | `stream_head`, `stream_first`, `head_sample_age` | The log's newest and oldest revision, sampled every 30 s (one stream-info request, not one per update) | `head_sample_age` several intervals old |
 | `lag` | `stream_head - applied` at the last sample. Whole-bucket, so a prefix-scoped watch reads nonzero while idle | Grows, or stays high, under `All` scope |
-| `repair` | `Idle`, `Relisting`, `Restoring`, `Refused(reason)`, `WaitingForArtifact(reason)` | `Refused` or `WaitingForArtifact`: the fold is stale and retrying. They clear only when a repair succeeds |
+| `repair` | `Idle`, `Relisting`, `Restoring`, `Reseeding` (bucket recreated, repair armed), `Refused(reason)`, `WaitingForArtifact(reason)`, `ForeignCursorRefused` (bucket recreated, no repair) | `Refused`, `WaitingForArtifact` or `ForeignCursorRefused`: the fold is stale and retrying. They clear only when a repair succeeds |
 | `cursor_expiries` | Expired cursors handled | Any increase with no repair armed (a ghost key is possible) |
 | `newest_artifact` | Cursor and age of the newest artifact this watch exported or read | Age near your export interval or the bucket's retention |
 | `restarts`, `last_error` | Runs after the first; the error that ended the last one | A rising rate |
