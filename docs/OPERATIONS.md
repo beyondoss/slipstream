@@ -92,7 +92,7 @@ Keep `E` well below `W`. A restore needs an artifact that is ahead of the local 
 
 Measured with a 900 s export at 200 writes/s and a 320 s window:
 
-- 25 of 25 expired watchers restored, because their artifact happened to be 140 s old.
+- 50 of 50 expired watchers restored, because their artifact happened to be 140 s old.
 - Restores were refused when the artifact was not ahead of the fold. Four folds stayed stale for at least 7 minutes, until a newer artifact landed.
 
 Measured with a 60 s export: 3 of 3 expired-cursor repetitions restored, 0 refused.
@@ -106,13 +106,14 @@ At 1,000 writes/s the window is about 65 s. A 60 s export is already at the edge
 | Watcher stopped inside the window                    | Resumes from its own cursor. No restore.                                                      | Tail replay of about 15k messages.        | None.                                                                                                                 |
 | Cursor expired, artifact newer than fold and inside window | Restores from the artifact, then resumes from its cursor.                             | 7.8 to 10.4 s for 1M keys.                | None.                                                                                                                 |
 | Cursor expired, artifact not ahead of fold           | Restore refused. The watch fails and retries with backoff. The fold stays stale.             | Stale until a newer artifact lands.       | Make the exporter produce a fresh artifact: restart or relocate the lease holder, or shorten `E`. Or delete the stale fold to bootstrap from the newest artifact. |
-| Artifact missing                                     | Same path as "not ahead of fold": no artifact, no restore.                                    | Not measured with the artifact deleted. The refusal path was measured. | Re-export, and confirm a new artifact exists. Then follow the row above.                                 |
-| Node join (fresh node)                               | Imports the newest artifact. Never re-lists NATS to rebuild a bounded fold.                   | 127 ms to 1.2 s local. 12 to 15 s on AWS with 25 concurrent. | Start the node after an artifact exists. Stagger starts for large fleets.                                  |
-| Restart of 300 watchers at once                      | Write acks slow, then recover.                                                                | 0 failures of 46,218 writes. Ack max 684 ms for about 30 s. Back to 16 ms within 40 s. | None.                                                                                                       |
+| Artifact missing | Restore refused. The watch retries with backoff. The fold stays stale until an artifact exists. | 3 runs: 32 refused attempts each, then restored 80.8 s after an operator re-exported. 0 failed writes. | Re-export from a healthy fold, then wait. |
+| Node join (fresh node) | Imports the newest artifact. Never re-lists NATS to rebuild a bounded fold. | 3 runs: caught up in 10.4 s, 0 failed writes, folds correct. | None. |
+| Restart of 300 watchers at once | Write acks slow, then settle. | 1 run: 0 failures of 39,417 writes after the stop. Ack max 758 ms; no clean recovery time. | None. |
 | 1,000 consumers created at once (join storm)         | Writes fail until the consumers settle.                                                       | 2,248 failures of 48,000 writes over 20 s, up to 17,339 over 85 s. | Stagger consumer creation.                                                                              |
 | R3 stream leader killed                              | Writes fail until a new leader is elected. Folds catch up.                                    | 530 to 1,277 failed writes per kill, over 4 to 5 s. Folds caught up 7 to 9 s after the kill. 0 bad keys. | None. Alert on write failures.                                                             |
-| NATS process restart, R1 leader loss, rolling restart, single node join | Not measured.                                                              | n/a                                       | Treat as unproven. Test in staging before you rely on it.                                                             |
-| Fold lost on a node                                  | Rebuild from the newest artifact. Do not re-list NATS.                                        | See "Node join".                          | Delete the local fold. Restart the node.                                                                              |
+| NATS process restart (R1) | The stream is briefly unavailable; watches resume from their cursors. | 3 runs: NATS back in 1.3 s, folds caught up in 8.8 to 8.9 s, 0 failed writes. | None. |
+| 10 % rolling restart | Each wave of watchers resumes from its cursor. | 2 runs, 10 waves of 2 of 20 folds: 10.5 s per wave, 0 of about 155,000 writes failed, 20 of 20 folds correct. | None. |
+| Fold lost on a node | Rebuilds from the newest artifact. Do not re-list NATS. | 3 runs: 10.7 s, 0 failed writes, folds correct. | Delete the damaged fold and restart the watcher. |
 
 ## Recreating a bucket
 
