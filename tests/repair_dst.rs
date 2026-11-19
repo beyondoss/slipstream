@@ -344,6 +344,8 @@ impl KvWatcher for SimLog {
         Ok(Some(Retention {
             evicts_current_values: st.evicts_current,
             first_revision: st.first_revision(),
+            last_revision: u64::MAX,
+            incarnation: None,
         }))
     }
 }

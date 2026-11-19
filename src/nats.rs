@@ -863,6 +863,12 @@ fn unix_ms(t: time::OffsetDateTime) -> u64 {
     u64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
+/// Unix nanoseconds of a server timestamp; 0 (unknown) before the epoch. A
+/// stream's creation time in these is its incarnation (never 0 in practice).
+fn unix_ns(t: time::OffsetDateTime) -> u64 {
+    u64::try_from(t.unix_timestamp_nanos()).unwrap_or(0)
+}
+
 /// Check if a NATS message represents a KV delete/purge operation.
 fn is_kv_delete(msg: &async_nats::Message) -> bool {
     msg.headers
@@ -1012,10 +1018,14 @@ impl NatsKvReader {
 /// Convert a NATS KV entry to a KvUpdate.
 ///
 /// Takes the entry by value so the key `String` moves into the `KvUpdate`
-/// instead of allocating a fresh copy per watch event.
-fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry) -> KvUpdate {
+/// instead of allocating a fresh copy per watch event. `origin` is the
+/// incarnation of the stream the watch was attached to ([`stream_origin`]); it
+/// rides in the version so the cursor built from it records where it was taken.
+fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry, origin: u64) -> KvUpdate {
     use async_nats::jetstream::kv::Operation;
-    let version = VersionToken::from_u64(entry.revision).written_at(unix_ms(entry.created));
+    let version = VersionToken::from_u64(entry.revision)
+        .written_at(unix_ms(entry.created))
+        .with_origin(origin);
     match entry.operation {
         // An empty value is a `delete_with_version` tombstone: a delete, with
         // the tombstone's own revision — the rule `get`/`scan`/`keys` apply.
@@ -1043,15 +1053,32 @@ fn nats_entry_to_kv_update(entry: async_nats::jetstream::kv::Entry) -> KvUpdate 
     }
 }
 
-/// Stream updates from a NATS Watch into a channel until it ends or the receiver drops.
+/// The incarnation of a bucket's stream: its creation time (Unix ns). A bucket
+/// deleted and recreated under the same name is a new stream with a new
+/// creation time and revisions numbered from 1 again, so this — not the name —
+/// says whose positions a cursor holds ([`crate::protocol::same_incarnation`]).
+///
+/// Read BEFORE a watch attaches: every entry the watch delivers is stamped
+/// with it, so a stream recreated in between yields a stamp that mismatches
+/// and a later resume refuses, never one that vouches for the wrong stream.
+async fn stream_origin(js: &async_nats::jetstream::Context, bucket: &str) -> Result<u64, KvError> {
+    let stream = timed(js.get_stream(format!("KV_{bucket}")))
+        .await?
+        .map_err(|e| KvError::OperationFailed(format!("get KV stream for its incarnation: {e}")))?;
+    Ok(unix_ns(stream.cached_info().created))
+}
+
+/// Stream updates from a NATS Watch into a channel until it ends or the
+/// receiver drops, stamping each with the stream's `origin`.
 async fn stream_watch(
     mut watcher: async_nats::jetstream::kv::Watch,
     tx: &Sender<KvUpdate>,
+    origin: u64,
 ) -> Result<(), KvError> {
     while let Some(entry) = watcher.next().await {
         match entry {
             Ok(entry) => {
-                let update = nats_entry_to_kv_update(entry);
+                let update = nats_entry_to_kv_update(entry, origin);
                 if tx.send(update).await.is_err() {
                     debug!("watch receiver closed");
                     break;
@@ -1104,6 +1131,12 @@ const FLOOR_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 /// (narrowed) retention-outlives-lag operating axiom plus the resume-time
 /// check on every restart (model axiom 6).
 ///
+/// The same probes watch the stream's incarnation: a stream deleted and
+/// recreated under a live consumer makes the ordered consumer reattach and
+/// carry on from the old position in the new stream, silently. A creation time
+/// other than `origin` ends the watch with [`KvError::ForeignCursor`], which
+/// `watch_applied` repairs like a foreign resume cursor.
+///
 /// The guarantee split, precisely: the SAFETY half — never folding past
 /// unexamined evidence of loss — is unconditional in this loop (the gap
 /// check precedes processing, and a stalled downstream stalls folding too).
@@ -1113,15 +1146,31 @@ async fn stream_watch_floor_guarded(
     mut watcher: async_nats::jetstream::kv::Watch,
     tx: &Sender<KvUpdate>,
     resume_revision: u64,
+    origin: u64,
     js: &async_nats::jetstream::Context,
     bucket: &str,
 ) -> Result<(), KvError> {
     let stream_name = format!("KV_{bucket}");
-    let first_sequence = || async {
+    // The stream as it is now: `(first_sequence, last_sequence, incarnation)`.
+    let position = || async {
         let stream = timed(js.get_stream(&stream_name))
             .await?
             .map_err(|e| KvError::OperationFailed(format!("floor guard stream lookup: {e}")))?;
-        Ok::<u64, KvError>(stream.cached_info().state.first_sequence)
+        let info = stream.cached_info();
+        Ok::<_, KvError>((
+            info.state.first_sequence,
+            info.state.last_sequence,
+            unix_ns(info.created),
+        ))
+    };
+    // The bucket was recreated under this live watch.
+    let recreated = |bucket: &str| {
+        warn!(
+            bucket,
+            "the bucket was deleted and recreated under this live watch; its positions \
+             are another stream's, so the watch ends as a foreign cursor"
+        );
+        KvError::ForeignCursor
     };
     // The frontier's position has expired exactly as a resume cursor would
     // have: surface it as `CursorExpired` (mid-stream) so `watch_applied`
@@ -1153,7 +1202,10 @@ async fn stream_watch_floor_guarded(
                         // In-band gap check BEFORE processing: never fold
                         // past unexamined evidence of eviction.
                         if revision > frontier.saturating_add(1) {
-                            let first = first_sequence().await?;
+                            let (first, last, created) = position().await?;
+                            if !crate::protocol::same_incarnation(Some(origin), frontier, created, last) {
+                                return Err(recreated(bucket));
+                            }
                             if !crate::protocol::resume_window_ok(frontier, first) {
                                 return Err(trip(frontier, first, bucket));
                             }
@@ -1163,7 +1215,7 @@ async fn stream_watch_floor_guarded(
                             // see — safe for last-write-wins.
                         }
                         frontier = frontier.max(revision);
-                        let update = nats_entry_to_kv_update(entry);
+                        let update = nats_entry_to_kv_update(entry, origin);
                         if tx.send(update).await.is_err() {
                             debug!("watch receiver closed");
                             break;
@@ -1179,7 +1231,10 @@ async fn stream_watch_floor_guarded(
                 // No-traffic backstop: nothing is being delivered, so the
                 // in-band check has no evidence to act on; probe the floor
                 // directly.
-                let first = first_sequence().await?;
+                let (first, last, created) = position().await?;
+                if !crate::protocol::same_incarnation(Some(origin), frontier, created, last) {
+                    return Err(recreated(bucket));
+                }
                 if !crate::protocol::resume_window_ok(frontier, first) {
                     return Err(trip(frontier, first, bucket));
                 }
@@ -1264,7 +1319,11 @@ struct NatsKvWatcher {
 /// Returns `None` for a subject outside the bucket's keyspace, which a
 /// subject-filtered consumer should never deliver — skipped rather than
 /// surfaced, matching `kv::Watch`'s behavior.
-fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<KvUpdate> {
+fn kv_message_to_update(
+    msg: &async_nats::Message,
+    kv_prefix: &str,
+    origin: u64,
+) -> Option<KvUpdate> {
     let key = msg.subject.strip_prefix(kv_prefix)?.to_string();
     // An unparseable (or absent) ACK subject yields the UNKNOWN version, not a
     // fabricated revision 0: `from_u64(0)` is a *parseable* position that
@@ -1275,7 +1334,11 @@ fn kv_message_to_update(msg: &async_nats::Message, kv_prefix: &str) -> Option<Kv
         .reply
         .as_deref()
         .and_then(ack_fields)
-        .map(|(seq, ts)| VersionToken::from_u64(seq).written_at(ts.map_or(0, |ns| ns / 1_000_000)))
+        .map(|(seq, ts)| {
+            VersionToken::from_u64(seq)
+                .written_at(ts.map_or(0, |ns| ns / 1_000_000))
+                .with_origin(origin)
+        })
         .unwrap_or_else(VersionToken::unknown);
     let operation = msg
         .headers
@@ -1328,8 +1391,16 @@ impl NatsKvWatcher {
     ///
     /// Returns the KV stream handle it read, for a caller that creates its
     /// consumer on it.
+    ///
+    /// It also checks the cursor belongs to THIS stream
+    /// ([`crate::protocol::same_incarnation`]): a bucket recreated under the
+    /// same name restarts its revisions at 1, so a cursor from the old stream
+    /// can sit beyond the new head (the watch would deliver nothing until the
+    /// stream outgrows it) or inside the new range (old state spliced under the
+    /// new tail), and passes the window check either way.
     async fn check_resume_window(
         &self,
+        cursor_origin: Option<u64>,
         revision: u64,
     ) -> Result<async_nats::jetstream::stream::Stream, KvError> {
         let stream = timed(self.js.get_stream(format!("KV_{}", self.bucket)))
@@ -1337,9 +1408,22 @@ impl NatsKvWatcher {
             .map_err(|e| {
                 KvError::OperationFailed(format!("get KV stream for resume check: {e}"))
             })?;
-        let first = stream.cached_info().state.first_sequence;
-        // The shared protocol kernel — the same guard the model checker's
-        // Resume transition executes (`crate::protocol::resume_window_ok`).
+        let info = stream.cached_info();
+        let (first, last) = (info.state.first_sequence, info.state.last_sequence);
+        // The shared protocol kernels — the same guards the model checkers'
+        // Resume transitions execute.
+        if !crate::protocol::same_incarnation(cursor_origin, revision, unix_ns(info.created), last)
+        {
+            warn!(
+                revision,
+                cursor_origin,
+                stream_origin = unix_ns(info.created),
+                last_sequence = last,
+                "resume cursor belongs to a different incarnation of the stream (the bucket was \
+                 deleted and recreated); refusing to resume"
+            );
+            return Err(KvError::ForeignCursor);
+        }
         if !crate::protocol::resume_window_ok(revision, first) {
             warn!(
                 revision,
@@ -1420,19 +1504,23 @@ impl NatsKvWatcher {
     /// problem classified as [`KvError::CursorExpired`] (servers that do
     /// error on a compacted start), and the window re-checked AFTER the
     /// consumer exists — head eviction between the check and the creation
-    /// would otherwise clamp silently. `scope` is for the log line.
+    /// would otherwise clamp silently. `scope` is for the log line. Returns the
+    /// consumer and the incarnation of the stream it was created on, which its
+    /// updates are stamped with.
     async fn create_resume<T, E, F, Fut>(
         &self,
+        cursor_origin: Option<u64>,
         revision: u64,
         scope: &(dyn std::fmt::Debug + Sync),
         create: F,
-    ) -> Result<T, KvError>
+    ) -> Result<(T, u64), KvError>
     where
         E: std::fmt::Display,
         F: FnOnce(async_nats::jetstream::stream::Stream) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        let stream = self.check_resume_window(revision).await?;
+        let stream = self.check_resume_window(cursor_origin, revision).await?;
+        let origin = unix_ns(stream.cached_info().created);
         let created = match timed(create(stream)).await? {
             Ok(c) => c,
             Err(e) => {
@@ -1444,8 +1532,8 @@ impl NatsKvWatcher {
                 return Err(KvError::WatchError(err));
             }
         };
-        self.check_resume_window(revision).await?;
-        Ok(created)
+        self.check_resume_window(cursor_origin, revision).await?;
+        Ok((created, origin))
     }
 }
 
@@ -1490,10 +1578,11 @@ impl KvWatcher for NatsKvWatcher {
         // forever instead of failing. The streaming drain in `stream_watch` is
         // intentionally unbounded (a watch is long-lived), but establishing it
         // must not be able to hang a reconnecting caller.
+        let origin = stream_origin(&self.js, &self.bucket).await?;
         let watcher = timed(self.kv.watch_with_history(">"))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
-        stream_watch(watcher, &tx).await
+        stream_watch(watcher, &tx, origin).await
     }
 
     async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError> {
@@ -1501,10 +1590,11 @@ impl KvWatcher for NatsKvWatcher {
         // subject "$KV.BUCKET.node.abc", and ">" is the multi-level wildcard.
         // `_with_history` for the same state-sync contract as `watch_all`.
         let nats_key = format!("{prefix}>");
+        let origin = stream_origin(&self.js, &self.bucket).await?;
         let watcher = timed(self.kv.watch_with_history(&nats_key))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
-        stream_watch(watcher, &tx).await
+        stream_watch(watcher, &tx, origin).await
     }
 
     async fn watch_prefixes(&self, prefixes: &[&str], tx: Sender<KvUpdate>) -> Result<(), KvError> {
@@ -1522,10 +1612,11 @@ impl KvWatcher for NatsKvWatcher {
         // prefixes costs 1 consumer, not N. `_with_history` for the same
         // state-sync contract as `watch_all`.
         let keys: Vec<String> = prefixes.iter().map(|p| format!("{p}>")).collect();
+        let origin = stream_origin(&self.js, &self.bucket).await?;
         let watcher = timed(self.kv.watch_many_with_history(keys))
             .await?
             .map_err(|e| KvError::WatchError(e.to_string()))?;
-        stream_watch(watcher, &tx).await
+        stream_watch(watcher, &tx, origin).await
     }
 
     async fn watch_all_from(
@@ -1539,8 +1630,10 @@ impl KvWatcher for NatsKvWatcher {
         };
         let revision = self.resume_point(cursor, revision).await?;
         let start = resume_start(revision)?;
-        let watcher = self
-            .create_resume(revision, &"all", |_| self.kv.watch_all_from_revision(start))
+        let (watcher, origin) = self
+            .create_resume(cursor.origin(), revision, &"all", |_| {
+                self.kv.watch_all_from_revision(start)
+            })
             .await?;
 
         info!(revision, "resumed watch from cursor");
@@ -1549,7 +1642,7 @@ impl KvWatcher for NatsKvWatcher {
         // watch mid-stream fail-stops into the restart→resync repair path
         // instead of silently skipping evicted deletes (model:
         // tests/model_live_watch.rs).
-        stream_watch_floor_guarded(watcher, &tx, revision, &self.js, &self.bucket).await
+        stream_watch_floor_guarded(watcher, &tx, revision, origin, &self.js, &self.bucket).await
     }
 
     async fn watch_prefix_from(
@@ -1565,14 +1658,14 @@ impl KvWatcher for NatsKvWatcher {
         let revision = self.resume_point(cursor, revision).await?;
         let nats_key = format!("{prefix}>");
         let start = resume_start(revision)?;
-        let watcher = self
-            .create_resume(revision, &prefix, |_| {
+        let (watcher, origin) = self
+            .create_resume(cursor.origin(), revision, &prefix, |_| {
                 self.kv.watch_from_revision(&nats_key, start)
             })
             .await?;
 
         info!(revision, prefix, "resumed prefix watch from cursor");
-        stream_watch(watcher, &tx).await
+        stream_watch(watcher, &tx, origin).await
     }
 
     async fn watch_prefixes_from(
@@ -1617,8 +1710,8 @@ impl KvWatcher for NatsKvWatcher {
             deliver_policy: DeliverPolicy::ByStartSequence { start_sequence },
             ..Default::default()
         };
-        let consumer = self
-            .create_resume(revision, &prefixes, |stream| async move {
+        let (consumer, origin) = self
+            .create_resume(cursor.origin(), revision, &prefixes, |stream| async move {
                 stream.create_consumer(config).await
             })
             .await?;
@@ -1638,7 +1731,7 @@ impl KvWatcher for NatsKvWatcher {
                     // A subject-filtered consumer only delivers in-keyspace
                     // subjects; `None` here would be a server bug, skipped to
                     // match kv::Watch's tolerance.
-                    let Some(update) = kv_message_to_update(&msg, &kv_prefix) else {
+                    let Some(update) = kv_message_to_update(&msg, &kv_prefix, origin) else {
                         continue;
                     };
                     if tx.send(update).await.is_err() {
@@ -1667,6 +1760,8 @@ impl KvWatcher for NatsKvWatcher {
         Ok(Some(Retention {
             evicts_current_values: evicts_current_values(&info.config),
             first_revision: info.state.first_sequence,
+            last_revision: info.state.last_sequence,
+            incarnation: Some(unix_ns(info.created)),
         }))
     }
 }
@@ -1996,7 +2091,7 @@ mod tests {
     fn kv_message_decodes_put_without_operation_header() {
         // The common case: a put carries no KV-Operation header at all.
         let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"v1", None);
-        match kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace") {
+        match kv_message_to_update(&msg, "$KV.certs.", 7).expect("in keyspace") {
             KvUpdate::Put(e) => {
                 assert_eq!(e.key, "node.a");
                 assert_eq!(e.value, b"v1");
@@ -2010,13 +2105,13 @@ mod tests {
     fn kv_message_decodes_delete_and_purge_markers() {
         let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", Some("DEL"));
         assert!(matches!(
-            kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace"),
+            kv_message_to_update(&msg, "$KV.certs.", 7).expect("in keyspace"),
             KvUpdate::Delete { ref key, ref version } if key == "node.a" && version.as_u64() == Some(42)
         ));
 
         let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", Some("PURGE"));
         assert!(matches!(
-            kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace"),
+            kv_message_to_update(&msg, "$KV.certs.", 7).expect("in keyspace"),
             KvUpdate::Purge { ref key, .. } if key == "node.a"
         ));
     }
@@ -2027,7 +2122,7 @@ mod tests {
     #[test]
     fn kv_message_empty_value_is_a_delete() {
         let msg = raw_kv_msg("$KV.certs.node.a", Some(ACK_42), b"", None);
-        match kv_message_to_update(&msg, "$KV.certs.") {
+        match kv_message_to_update(&msg, "$KV.certs.", 7) {
             Some(KvUpdate::Delete { key, version }) => {
                 assert_eq!(key, "node.a");
                 assert_eq!(version.as_u64(), Some(42), "the tombstone's own revision");
@@ -2041,7 +2136,7 @@ mod tests {
         // A subject-filtered consumer should never deliver this; the decode
         // skips rather than mis-keys it.
         let msg = raw_kv_msg("$KV.other.node.a", Some(ACK_42), b"v", None);
-        assert!(kv_message_to_update(&msg, "$KV.certs.").is_none());
+        assert!(kv_message_to_update(&msg, "$KV.certs.", 7).is_none());
     }
 
     #[test]
@@ -2052,7 +2147,7 @@ mod tests {
         // the persisted cursor to 0 (full replay on next restart); unknown
         // is skipped by the cursor-authority loop instead.
         let msg = raw_kv_msg("$KV.certs.node.a", None, b"v", None);
-        match kv_message_to_update(&msg, "$KV.certs.").expect("in keyspace") {
+        match kv_message_to_update(&msg, "$KV.certs.", 7).expect("in keyspace") {
             KvUpdate::Put(e) => {
                 assert!(e.version.is_unknown());
                 assert_eq!(e.version.as_u64(), None);
@@ -2228,7 +2323,14 @@ mod floor_guard_tests {
         // fails this bound.
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            stream_watch_floor_guarded(watch, &tx, 1, &js, "guard"),
+            stream_watch_floor_guarded(
+                watch,
+                &tx,
+                1,
+                stream_origin(&js, "guard").await.unwrap(),
+                &js,
+                "guard",
+            ),
         )
         .await
         .expect("the trip must be IN-BAND (immediate), not backstop-paced")
@@ -2236,6 +2338,48 @@ mod floor_guard_tests {
         // Reported as an expired cursor so `watch_applied` repairs it in
         // process through the same path as a resume-time expiry.
         assert!(matches!(err, KvError::CursorExpired), "{err:?}");
+        drop(tx);
+        let _ = drain.await;
+    }
+
+    /// A bucket recreated under a LIVE watch: the guarded loop is told the
+    /// incarnation the watch attached to, and the stream now has another
+    /// (here: the watch claims a creation time the stream does not have). The
+    /// first probe that reads the stream ends the watch as a foreign cursor,
+    /// which `watch_applied` repairs — the ordered consumer would otherwise
+    /// carry on from the old position in the new stream, silently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recreated_stream_trips_the_live_guard() {
+        let server = TestNats::start().await;
+        let (js, kv) = seeded_bucket(&server.url).await;
+        let origin = stream_origin(&js, "guard").await.unwrap();
+
+        // A gapped delivery (resume claims revision 1, first delivery is 3).
+        let watch = kv.watch_all_from_revision(3).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_watch_floor_guarded(watch, &tx, 1, origin + 1, &js, "guard"),
+        )
+        .await
+        .expect("the in-band check must trip immediately")
+        .expect_err("another incarnation must end the watch");
+        assert!(matches!(err, KvError::ForeignCursor), "{err:?}");
+
+        // The same watch against its own incarnation is not tripped by it.
+        let watch = kv.watch_all_from_revision(3).await.unwrap();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(64);
+        let guard = tokio::spawn(async move {
+            stream_watch_floor_guarded(watch, &tx2, 1, origin, &js, "guard").await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("delivers")
+            .expect("alive");
+        assert_eq!(first.version().as_u64(), Some(3));
+        assert_eq!(first.version().origin(), Some(origin), "stamped");
+        guard.abort();
         drop(tx);
         let _ = drain.await;
     }
@@ -2261,10 +2405,17 @@ mod floor_guard_tests {
         // Resume from revision 1: deliveries jump 2 and 3 — gapped, benign.
         let watch = kv.watch_all_from_revision(2).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let guard =
-            tokio::spawn(
-                async move { stream_watch_floor_guarded(watch, &tx, 1, &js, "guard").await },
-            );
+        let guard = tokio::spawn(async move {
+            stream_watch_floor_guarded(
+                watch,
+                &tx,
+                1,
+                stream_origin(&js, "guard").await.unwrap(),
+                &js,
+                "guard",
+            )
+            .await
+        });
 
         let mut got = Vec::new();
         while got.len() < 4 {

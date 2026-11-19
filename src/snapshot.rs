@@ -1807,6 +1807,8 @@ mod tests {
             Some(Retention {
                 evicts_current_values: evicts,
                 first_revision: first,
+                last_revision: u64::MAX,
+                incarnation: None,
             })
         };
 
