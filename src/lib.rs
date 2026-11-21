@@ -28,10 +28,10 @@ mod applied;
 mod artifact;
 mod export_lease;
 mod health;
+mod kernels;
 mod kv;
 mod nats;
 mod preset;
-pub mod protocol;
 mod repair;
 pub mod snapshot;
 #[cfg(feature = "fjall")]
@@ -53,6 +53,7 @@ pub use health::{
     ArtifactHealth, DEFAULT_HEAD_SAMPLE_INTERVAL, HealthSnapshot, LastError, LogRange, RepairState,
     WatchHealth,
 };
+pub use kernels::protocol;
 pub use kv::{
     KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, Retention,
     VersionToken, WatchCursor,

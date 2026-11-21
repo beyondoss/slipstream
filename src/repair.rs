@@ -39,6 +39,7 @@ use tracing::{error, info, warn};
 use crate::applied::{Fold, WatchScope};
 use crate::artifact::ExportManifest;
 use crate::health::{RepairState, WatchHealth};
+use crate::kernels::applied::{Action, Event, RepairKind};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
@@ -1149,79 +1150,127 @@ where
     A: FnMut(Vec<U>) + Send,
     O: FnMut(WatchCursor) + Send,
 {
-    let req = match req {
-        RepairRequest::Evicting => return fold.remember_evicting().await,
-        req => req,
+    let kind = match &req {
+        RepairRequest::Evicting => RepairKind::Evicting,
+        RepairRequest::Relist { .. } => RepairKind::Relist,
+        RepairRequest::Restore { .. } => RepairKind::Restore,
     };
-    // Fold everything the watch task delivered before it asked for this
-    // repair. A floor-guard trip ends a live watch mid-stream with updates
-    // still buffered in the channel: the repair must see them (it diffs the
-    // fold) and supersede them (one applied after the repair would resurrect
-    // pre-repair state, and could even move the cursor backward). The watch
-    // task is parked on the ack/reply, so this drains exactly that backlog.
-    while let Ok(u) = backlog.try_recv() {
-        if fold.ingest(u) {
-            fold.flush().await?;
+    // The kernel orders the repair's steps; this runs them.
+    let mut req = Some(req);
+    for act in &fold.decide(Event::RepairRequested(kind)) {
+        match act {
+            Action::RememberEvicting => return fold.remember_evicting().await,
+            // Fold everything the watch task delivered before it asked for
+            // this repair. A floor-guard trip ends a live watch mid-stream
+            // with updates still buffered in the channel: the repair must see
+            // them (it diffs the fold) and supersede them (one applied after
+            // the repair would resurrect pre-repair state, and could even
+            // move the cursor backward). The watch task is parked on the
+            // ack/reply, so this drains exactly that backlog.
+            Action::DrainBacklog => {
+                while let Ok(u) = backlog.try_recv() {
+                    if fold.ingest(u) {
+                        fold.flush().await?;
+                    }
+                }
+            }
+            // Both repairs diff the STORE, so it must hold everything
+            // delivered. A transient store failure re-queues the batch, which
+            // the diff can't see: it would miss a re-queued put that a
+            // deletion during the gap has since removed, and the put would
+            // then commit and resurrect the key.
+            Action::Settle => fold.settle().await?,
+            Action::RunRelist => {
+                let Some(RepairRequest::Relist {
+                    reader,
+                    scratch,
+                    ack,
+                }) = req.take()
+                else {
+                    unreachable!("RunRelist follows a Relist request")
+                };
+                relist(fold, &*reader, scratch, prefixes).await?;
+                // Ack AFTER the deletes are applied: the watch task is holding
+                // the fallback watch until it hears back, which is what orders
+                // deletes before the re-list (tests/model_resync_order.rs
+                // proves the barrier load-bearing). If the flush's STORE apply
+                // failed transiently, the deletes sit re-queued at the FRONT
+                // of the raw batch — still strictly before any re-list put in
+                // the eventual cumulative commit, and the domain apply saw
+                // them before this ack either way.
+                let mut ack = Some(ack);
+                for act in &fold.decide(Event::RelistFolded) {
+                    match act {
+                        Action::AckResync => {
+                            if let Some(ack) = ack.take() {
+                                let _ = ack.send(());
+                            }
+                        }
+                        other => unreachable!("fold_in: {other:?}"),
+                    }
+                }
+            }
+            Action::RunRestore => {
+                let Some(RepairRequest::Restore {
+                    restored,
+                    reader,
+                    watcher,
+                    reply,
+                }) = req.take()
+                else {
+                    unreachable!("RunRestore follows a Restore request")
+                };
+                return restore_request(fold, restored, reader, watcher, reply, prefixes).await;
+            }
+            other => unreachable!("fold_in: {other:?}"),
         }
     }
-    // Both repairs diff the STORE, so it must hold everything delivered. A
-    // transient store failure re-queues the batch, which the diff can't see:
-    // it would miss a re-queued put that a deletion during the gap has since
-    // removed, and the put would then commit and resurrect the key.
-    fold.settle().await?;
-    match req {
-        RepairRequest::Evicting => unreachable!("handled above"),
-        RepairRequest::Relist {
-            reader,
-            scratch,
-            ack,
-        } => {
-            relist(fold, &*reader, scratch, prefixes).await?;
-            // Ack AFTER the deletes are applied: the watch task is holding
-            // the fallback watch until it hears back, which is what orders
-            // deletes before the re-list (tests/model_resync_order.rs proves
-            // the barrier load-bearing). If the flush's STORE apply failed
-            // transiently, the deletes sit re-queued at the FRONT of the raw
-            // batch — still strictly before any re-list put in the eventual
-            // cumulative commit, and the domain apply saw them before this ack
-            // either way.
-            let _ = ack.send(());
-            Ok(())
-        }
-        RepairRequest::Restore {
-            restored,
-            reader,
-            watcher,
-            reply,
-        } => {
-            let target = restored.manifest().cursor.clone();
-            // The authoritative ahead check (the watch task's ran against its
-            // resume cursor; a mid-watch expiry delivered past that). A
-            // restore never moves the fold backward.
-            if !restore_ahead(target.rank(), fold.applied().rank()) {
-                let msg = format!(
-                    "cursor-expired restore: the latest artifact (cursor {target:?}) is not \
+    Ok(())
+}
+
+/// The restore repair, main-loop half: refuse an artifact that is not ahead of
+/// the fold, otherwise fold it in and reply with its cursor.
+async fn restore_request<U, S, P, A, O>(
+    fold: &mut Fold<U, S, P, A, O>,
+    restored: RestoredFold<S>,
+    reader: Arc<dyn KvReader>,
+    watcher: Arc<dyn KvWatcher>,
+    reply: oneshot::Sender<Result<WatchCursor, KvError>>,
+    prefixes: &[String],
+) -> Result<(), KvError>
+where
+    U: Send,
+    S: SnapshotStore + Send + 'static,
+    P: FnMut(&KvUpdate) -> Option<U> + Send,
+    A: FnMut(Vec<U>) + Send,
+    O: FnMut(WatchCursor) + Send,
+{
+    let target = restored.manifest().cursor.clone();
+    // The authoritative ahead check (the watch task's ran against its
+    // resume cursor; a mid-watch expiry delivered past that). A
+    // restore never moves the fold backward.
+    if !restore_ahead(target.rank(), fold.applied().rank()) {
+        let msg = format!(
+            "cursor-expired restore: the latest artifact (cursor {target:?}) is not \
                      ahead of the fold (cursor {:?}); nothing newer to restore from",
-                    fold.applied()
-                );
-                error!(%msg, "cursor-expiry repair refused");
-                // The watch task fails with this; its channel closing ends the
-                // loop.
-                let _ = reply.send(Err(KvError::WatchError(msg)));
-                return Ok(());
-            }
-            match restore(fold, restored, &*reader, &*watcher, prefixes).await? {
-                Ok(()) => {
-                    let _ = reply.send(Ok(target));
-                }
-                Err(msg) => {
-                    error!(%msg, "cursor-expiry repair refused");
-                    let _ = reply.send(Err(KvError::WatchError(msg)));
-                }
-            }
-            Ok(())
+            fold.applied()
+        );
+        error!(%msg, "cursor-expiry repair refused");
+        // The watch task fails with this; its channel closing ends the
+        // loop.
+        let _ = reply.send(Err(KvError::WatchError(msg)));
+        return Ok(());
+    }
+    match restore(fold, restored, &*reader, &*watcher, prefixes).await? {
+        Ok(()) => {
+            let _ = reply.send(Ok(target));
+        }
+        Err(msg) => {
+            error!(%msg, "cursor-expiry repair refused");
+            let _ = reply.send(Err(KvError::WatchError(msg)));
         }
     }
+    Ok(())
 }
 
 /// The key-listing diff, main-loop half: synthetic deletes for in-scope keys
