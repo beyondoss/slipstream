@@ -64,6 +64,9 @@ use tracing::warn;
 
 use crate::artifact::ExportManifest;
 use crate::health::WatchHealth;
+use crate::kernels::applied::{
+    Action, Actions, Event, Fatal, Queued, State as KState, StoreOutcome, step,
+};
 use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
 use crate::repair::{self, ExpiryRepair};
 use crate::snapshot::{SnapshotError, SnapshotStore};
@@ -576,12 +579,6 @@ async fn close_off_runtime<S: Send + 'static>(store: S) {
     }
 }
 
-/// Consecutive store-apply failures that fail-stop the watch. A transient
-/// failure re-queues its raw batch (cursor authority: the store's cursor and
-/// contents advance together, always); a persistent streak fail-stops before
-/// the re-queued backlog grows without bound.
-const MAX_STORE_APPLY_FAILURES: u32 = 16;
-
 /// The cursor-after-apply fold behind [`watch_applied`]: the pending batch,
 /// the applied cursor, and the store they commit to. Every change to the
 /// fold — stream updates, repair corrections, exports — goes through it, so
@@ -611,11 +608,10 @@ pub(crate) struct Fold<U, S, P, A, O> {
     // to apply", hence covered. Reset to `none()` after every flush.
     batch_high: WatchCursor,
     applied: WatchCursor,
-    store_fail_streak: u32,
-    // A batch opened since the last flush (the window timer is armed).
-    open: bool,
-    // `applied` gained the eviction memo and the store doesn't have it yet.
-    memo_dirty: bool,
+    // Every decision about when and what commits lives in the kernel
+    // (`kernels::applied`): this struct holds the data, runs the effects, and
+    // decides nothing.
+    k: KState,
     health: Option<WatchHealth>,
 }
 
@@ -649,9 +645,7 @@ where
             raw: Vec::new(),
             batch_high: WatchCursor::none(),
             applied,
-            store_fail_streak: 0,
-            open: false,
-            memo_dirty: false,
+            k: KState::default(),
             health,
         }
     }
@@ -661,19 +655,41 @@ where
     /// when persisting — the raw batch, so a window packed with
     /// parse-rejected updates can't grow it without bound.
     pub(crate) fn ingest(&mut self, u: KvUpdate) -> bool {
-        // Cursor authority: every received update bumps the pending
-        // high-water, regardless of whether `parse` keeps it — but only when
-        // it carries a real position. An unknown version (e.g. an unparseable
-        // ACK subject on the hand-built multi-prefix consumer path) must
-        // neither mint a fake cursor nor clobber the real high from earlier in
-        // the batch; skipping it under-advances at worst, and re-delivery on
-        // resume is idempotent.
-        if !u.version().is_unknown() {
-            self.batch_high = WatchCursor::from_version(u.version().clone());
-        }
+        // The kernel decides whether this update's position becomes the
+        // pending cursor (never an unknown one).
+        let high =
+            (!u.version().is_unknown()).then(|| WatchCursor::from_version(u.version().clone()));
         self.correct(u);
-        self.open = true;
-        self.batch.len() >= self.max || self.raw.len() >= self.max
+        let acts = self.decide(Event::Received {
+            positioned: high.is_some(),
+            queued: self.queued(),
+            max: self.max,
+        });
+        let mut flush_now = false;
+        for act in &acts {
+            match act {
+                Action::RecordHigh => {
+                    self.batch_high = high.clone().expect("positioned implies a cursor");
+                }
+                Action::FlushNow => flush_now = true,
+                other => unreachable!("ingest: {other:?}"),
+            }
+        }
+        flush_now
+    }
+
+    /// Feed the kernel one event; the new state is kept, the actions returned.
+    pub(crate) fn decide(&mut self, e: Event) -> Actions {
+        let (k, acts) = step(self.k, e);
+        self.k = k;
+        acts
+    }
+
+    fn queued(&self) -> Queued {
+        Queued {
+            batch: self.batch.len(),
+            raw: self.raw.len(),
+        }
     }
 
     /// Queue a repair's state correction (a synthetic delete, a restored
@@ -696,7 +712,12 @@ where
     /// restore's last step, taking the artifact's cursor. The next flush
     /// commits it.
     pub(crate) fn advance_to(&mut self, cursor: WatchCursor) {
-        self.batch_high = cursor;
+        for act in &self.decide(Event::AdvanceTo) {
+            match act {
+                Action::RecordHigh => self.batch_high = cursor.clone(),
+                other => unreachable!("advance_to: {other:?}"),
+            }
+        }
     }
 
     /// Flush the pending batch, in order: run the domain `apply` (if
@@ -710,119 +731,127 @@ where
     /// irrecoverably, which breaks the resume-after-restart guarantee, so it
     /// is surfaced as fatal.
     pub(crate) async fn flush(&mut self) -> Result<(), KvError> {
-        self.open = false;
-        // Nothing received since the last flush → nothing to do at all.
-        // (`raw` can be non-empty with no cursor advance only via a repair's
-        // corrections, or a re-queued batch.)
-        if self.batch.is_empty()
-            && self.raw.is_empty()
-            && self.batch_high.is_none()
-            && !self.memo_dirty
-        {
-            return Ok(());
-        }
-        if !self.batch.is_empty() {
-            // INVARIANT: apply() runs and RETURNS before any cursor advance
-            // below. Move the batch out so a panicking apply can't leave
-            // half-consumed state behind.
-            //
-            // `replace` (not `take`) leaves a pre-sized Vec behind so each
-            // batch after the first doesn't re-climb the reallocation ladder
-            // (4→8→…→cap).
-            (self.apply)(std::mem::replace(
-                &mut self.batch,
-                Vec::with_capacity(self.batch_cap),
-            ));
-        }
-        let advanced = !self.batch_high.is_none();
-        if advanced {
-            // The eviction memo never clears: a stream position doesn't carry
-            // it, so it rides over from the cursor it replaces.
-            let seen = self.applied.seen_evicting();
-            self.applied = self.batch_high.clone().remembering(seen);
-            if let Some(h) = &self.health {
-                h.set_applied(&self.applied);
-            }
-        }
-        let had_store = self.store.is_some();
-        // A cursor-only advance (nothing raw to fold) still commits to the
-        // store: a restore's final step moves the cursor to the artifact's
-        // with no updates left. In the steady state every advance carries raw
-        // updates, so this changes nothing there.
-        if (!self.raw.is_empty() || advanced || self.memo_dirty)
-            && let Some(mut st) = self.store.take()
-        {
-            let raw = std::mem::take(&mut self.raw);
-            // Fold at the post-advance cursor. A repair-only batch (synthetic
-            // updates) leaves the cursor where it was (they are a state
-            // correction, not log entries), which is safe: an unchanged —
-            // possibly expired — cursor only ever re-runs the same repair on
-            // the next restart.
-            let cur = self.applied.clone();
-            // Hand the store AND the raw batch back on a clean return: a
-            // *failed* apply (Ok(Err)) RE-QUEUES the batch so the next flush
-            // commits it cumulatively — the store's cursor and contents always
-            // advance together. Dropping the failed batch instead lets the
-            // NEXT successful flush advance the cursor over a hole that
-            // survives every restart (reproduced by
-            // `transient_store_failure_never_leaves_a_cursor_gap`). Only a
-            // *panicked* task (Err) loses the store: fatal.
-            let in_flight = self.health.as_ref().map(WatchHealth::begin_apply);
-            match tokio::task::spawn_blocking(move || {
-                let _in_flight = in_flight;
-                let res = st.apply(&raw, &cur);
-                (st, raw, res)
-            })
-            .await
-            {
-                Ok((st, _raw, Ok(()))) => {
-                    self.store = Some(st);
-                    self.store_fail_streak = 0;
-                    self.memo_dirty = false;
-                    if let Some(h) = &self.health {
-                        h.committed();
+        let mut acts = self.decide(Event::FlushRequested {
+            queued: self.queued(),
+            has_store: self.store.is_some(),
+        });
+        // What the store fold handed back, for the actions that follow it.
+        let mut landed: Option<(S, Vec<KvUpdate>)> = None;
+        let mut failure = String::new();
+        loop {
+            let mut next = None;
+            for act in &acts {
+                match *act {
+                    Action::ApplyDomain => {
+                        // INVARIANT: apply() runs and RETURNS before any
+                        // cursor advance. Move the batch out so a panicking
+                        // apply can't leave half-consumed state behind.
+                        //
+                        // `replace` (not `take`) leaves a pre-sized Vec behind
+                        // so each batch after the first doesn't re-climb the
+                        // reallocation ladder (4→8→…→cap).
+                        (self.apply)(std::mem::replace(
+                            &mut self.batch,
+                            Vec::with_capacity(self.batch_cap),
+                        ));
                     }
-                }
-                Ok((st, raw, Err(e))) => {
-                    self.store_fail_streak += 1;
-                    let streak = self.store_fail_streak;
-                    if streak >= MAX_STORE_APPLY_FAILURES {
+                    Action::AdvanceApplied => {
+                        // The eviction memo never clears: a stream position
+                        // doesn't carry it, so it rides over from the cursor
+                        // it replaces.
+                        let seen = self.applied.seen_evicting();
+                        self.applied = self.batch_high.clone().remembering(seen);
+                        if let Some(h) = &self.health {
+                            h.set_applied(&self.applied);
+                        }
+                    }
+                    Action::FoldStore => {
+                        let mut st = self.store.take().expect("FoldStore implies a store");
+                        let raw = std::mem::take(&mut self.raw);
+                        // Fold at the post-advance cursor. A repair-only batch
+                        // (synthetic updates) leaves the cursor where it was,
+                        // which is safe: an unchanged — possibly expired —
+                        // cursor only ever re-runs the same repair on the next
+                        // restart.
+                        let cur = self.applied.clone();
+                        let in_flight = self.health.as_ref().map(WatchHealth::begin_apply);
+                        let outcome = match tokio::task::spawn_blocking(move || {
+                            let _in_flight = in_flight;
+                            let res = st.apply(&raw, &cur);
+                            (st, raw, res)
+                        })
+                        .await
+                        {
+                            Ok((st, raw, Ok(()))) => {
+                                landed = Some((st, raw));
+                                StoreOutcome::Ok
+                            }
+                            Ok((st, raw, Err(e))) => {
+                                failure = e.to_string();
+                                landed = Some((st, raw));
+                                StoreOutcome::Failed
+                            }
+                            Err(e) => {
+                                failure = e.to_string();
+                                StoreOutcome::Panicked
+                            }
+                        };
+                        next = Some(self.decide(Event::StoreDone(outcome)));
+                    }
+                    Action::StoreCommitted => {
+                        let (st, _raw) = landed.take().expect("a landed store");
+                        self.store = Some(st);
+                        if let Some(h) = &self.health {
+                            h.committed();
+                        }
+                    }
+                    Action::Requeue => {
+                        let streak = self.k.fail_streak;
+                        let (st, raw) = landed.take().expect("a landed store");
+                        warn!(error = %failure, streak,
+                            "snapshot store apply failed; batch re-queued for the next flush");
+                        self.store = Some(st);
+                        // Prepend: the failed range precedes anything received
+                        // since (stream order is preserved for the eventual
+                        // cumulative commit).
+                        let newer = std::mem::replace(&mut self.raw, raw);
+                        self.raw.extend(newer);
+                    }
+                    Action::Fail(Fatal::StoreFailStreak) => {
+                        let streak = self.k.fail_streak;
                         // A persistently failing store would otherwise grow
                         // the re-queued batch without bound while the fold
                         // silently stales. Fail-stop: the restart refolds the
                         // tail from the store's last good cursor.
-                        warn!(error = %e, streak,
+                        warn!(error = %failure, streak,
                             "snapshot store apply failing persistently; aborting watch");
                         return Err(KvError::WatchError(format!(
-                            "snapshot store apply failed {streak} consecutive times: {e}"
+                            "snapshot store apply failed {streak} consecutive times: {failure}"
                         )));
                     }
-                    warn!(error = %e, streak,
-                        "snapshot store apply failed; batch re-queued for the next flush");
-                    self.store = Some(st);
-                    // Prepend: the failed range precedes anything received
-                    // since (stream order is preserved for the eventual
-                    // cumulative commit).
-                    let newer = std::mem::replace(&mut self.raw, raw);
-                    self.raw.extend(newer);
-                }
-                Err(e) => {
-                    warn!(error = %e, "snapshot store task panicked; aborting watch");
-                    return Err(KvError::WatchError(format!(
-                        "snapshot store task panicked: {e}"
-                    )));
+                    Action::Fail(Fatal::StorePanicked) => {
+                        warn!(error = %failure, "snapshot store task panicked; aborting watch");
+                        return Err(KvError::WatchError(format!(
+                            "snapshot store task panicked: {failure}"
+                        )));
+                    }
+                    Action::CommitWithoutStore => {
+                        if let Some(h) = &self.health {
+                            h.committed();
+                        }
+                    }
+                    Action::NotifyApplied => {
+                        (self.on_applied)(self.applied.clone());
+                        self.batch_high = WatchCursor::none();
+                    }
+                    other => unreachable!("flush: {other:?}"),
                 }
             }
-        }
-        if advanced {
-            // Without a store, applying the batch is the commit.
-            if !had_store && let Some(h) = &self.health {
-                h.committed();
+            match next {
+                Some(n) => acts = n,
+                None => return Ok(()),
             }
-            (self.on_applied)(self.applied.clone());
-            self.batch_high = WatchCursor::none();
         }
-        Ok(())
     }
 
     /// Remember, durably, that the bucket's retention evicts current values:
@@ -830,12 +859,18 @@ where
     /// does every artifact exported from it. Commits at once, even with
     /// nothing else to fold.
     pub(crate) async fn remember_evicting(&mut self) -> Result<(), KvError> {
-        if self.applied.seen_evicting() {
-            return Ok(());
+        let acts = self.decide(Event::RememberEvicting {
+            already_seen: self.applied.seen_evicting(),
+            has_store: self.store.is_some(),
+        });
+        for act in &acts {
+            match act {
+                Action::SetMemo => self.applied = self.applied.clone().remembering(true),
+                Action::Flush => self.flush().await?,
+                other => unreachable!("remember_evicting: {other:?}"),
+            }
         }
-        self.applied = self.applied.clone().remembering(true);
-        self.memo_dirty = self.store.is_some();
-        self.flush().await
+        Ok(())
     }
 
     /// Flush until the store holds every update received: a transient store
@@ -843,10 +878,15 @@ where
     /// flush's own fail-stop bound.
     pub(crate) async fn settle(&mut self) -> Result<(), KvError> {
         self.flush().await?;
-        while !self.raw.is_empty() {
+        loop {
+            let acts = self.decide(Event::SettleCheck {
+                raw_queued: self.raw.len(),
+            });
+            if !acts.contains(Action::Flush) {
+                return Ok(());
+            }
             self.flush().await?;
         }
-        Ok(())
     }
 
     /// Export the fold (see [`ExportRequest`]). The pending batch is flushed
@@ -868,13 +908,23 @@ where
         ExportRequest { dest_dir, reply }: ExportRequest,
         scope: &[String],
     ) -> Result<(), KvError> {
-        self.flush().await?;
-        let Some(mut st) = self.store.take() else {
-            let _ = reply.send(Err(SnapshotError::Backend(
-                "watch_applied runs without a snapshot store; nothing to export".into(),
-            )));
-            return Ok(());
-        };
+        let acts = self.decide(Event::ExportRequested {
+            has_store: self.store.is_some(),
+        });
+        for act in &acts {
+            match act {
+                Action::Flush => self.flush().await?,
+                Action::ExportStore => {}
+                Action::ReplyNoStore => {
+                    let _ = reply.send(Err(SnapshotError::Backend(
+                        "watch_applied runs without a snapshot store; nothing to export".into(),
+                    )));
+                    return Ok(());
+                }
+                other => unreachable!("export: {other:?}"),
+            }
+        }
+        let mut st = self.store.take().expect("ExportStore implies a store");
         let scope = scope.to_vec();
         match tokio::task::spawn_blocking(move || {
             let res = st
@@ -913,7 +963,7 @@ where
 
     /// A batch is open: the window timer must be armed.
     fn is_open(&self) -> bool {
-        self.open
+        self.k.open
     }
 
     /// Move the store out (to a blocking task); [`put_store`](Self::put_store)

@@ -355,6 +355,8 @@ Every decision the protocol's correctness rests on is a pure function in `src/ke
 | `cursorless_start_needs_repair` | `repair::run_watch` | `model_repair.rs`, `model_fleet.rs` |
 | `restore_key` | `repair::restore_diff` | `model_repair.rs` |
 
+**The cursor-authority kernel** (`src/kernels/applied.rs`) is the one stateful kernel: `step(state, event) -> (state, actions)`, no I/O, async or clock. `applied::Fold` turns what it observes (a received update, a flush request, a store result, an export or repair request) into an `Event`, calls `step`, and runs the returned `Action`s through its interpreter; it decides nothing itself. The kernel owns what has no other home: whether a batch is open, whether a stream position is pending, the unsynced eviction memo, the store-failure streak, and where an in-flight flush or resync is. It decides which flush steps run and in which order (domain `apply` before the cursor moves), that a failed store fold re-queues its raw batch at the front (and the streak bound that fail-stops), that an export flushes first, and that the resync's ack follows the folded deletes. The data (updates, cursors, the store) stay in the shell. The models still describe this control flow by hand (`tests/model_applied.rs`, `tests/model_resync_order.rs`); moving them onto `step` is the next change.
+
 **`pointer_publish_allowed(current: &PointerState, candidate_rank: u64) → bool`**
 
 The monotonic pointer guard. Returns `true` for an open slot, a corrupt pointer, or a candidate at or above the existing cursor — and `false` exactly when the existing pointer is parseable and strictly newer.

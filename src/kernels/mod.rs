@@ -5,4 +5,5 @@
 //! plain data types, and nothing here touches tokio, async-nats, futures or
 //! `std::io`. No I/O, no async, no clock.
 
+pub mod applied;
 pub mod protocol;
