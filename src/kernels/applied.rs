@@ -228,7 +228,9 @@ pub enum ResumeFrom {
 /// still holds its store.
 #[inline]
 pub const fn resume_from(holds_store: bool) -> ResumeFrom {
-    if holds_store {
+    // Mutation (model tests only): resume from the in-memory cursor even
+    // with a store.
+    if holds_store && !cfg!(feature = "mut_resume_from_memory") {
         ResumeFrom::Store
     } else {
         ResumeFrom::Memory
@@ -304,6 +306,7 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                         // The failed range precedes anything received since:
                         // it goes back to the front, so the store's cursor
                         // and contents advance together.
+                        #[cfg(not(feature = "mut_drop_failed_batch"))]
                         a.push(Action::Requeue);
                         finish(&mut s, &mut a, advanced, true);
                     }
@@ -346,6 +349,10 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                 a.push(Action::Settle);
                 if kind == RepairKind::Relist {
                     s.relisting = true;
+                    // Mutation (model tests only): ack the parked watch task
+                    // before the deletes are folded.
+                    #[cfg(feature = "mut_no_ack_barrier")]
+                    a.push(Action::AckResync);
                     a.push(Action::RunRelist);
                 } else {
                     a.push(Action::RunRestore);
@@ -358,6 +365,7 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             // the gap converges.
             if s.relisting {
                 s.relisting = false;
+                #[cfg(not(feature = "mut_no_ack_barrier"))]
                 a.push(Action::AckResync);
             }
         }
@@ -371,12 +379,14 @@ mod tests {
 
     const Q: Queued = Queued { batch: 1, raw: 1 };
 
+    #[cfg(not(feature = "mut_resume_from_memory"))]
     #[test]
     fn the_resume_cursor_is_the_stores_whenever_a_store_holds_the_data() {
         assert_eq!(resume_from(true), ResumeFrom::Store);
         assert_eq!(resume_from(false), ResumeFrom::Memory);
     }
 
+    #[cfg(not(feature = "mut_drop_failed_batch"))]
     fn flush(s: State, has_store: bool) -> (State, Actions) {
         step(
             s,
@@ -406,6 +416,7 @@ mod tests {
         assert!(s.high && a.as_slice() == [Action::RecordHigh]);
     }
 
+    #[cfg(not(feature = "mut_drop_failed_batch"))]
     #[test]
     fn a_failed_store_fold_requeues_and_still_notifies() {
         let (s, _) = received(State::default(), true);
@@ -435,6 +446,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "mut_no_ack_barrier"))]
     #[test]
     fn a_resync_acks_only_after_its_deletes_are_folded() {
         let (s, a) = step(State::default(), Event::RepairRequested(RepairKind::Relist));

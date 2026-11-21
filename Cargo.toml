@@ -69,3 +69,16 @@ rocksdb = ["dep:rocksdb"]
 # Artifact transport: tar wire format + object_store (S3/GCS/Azure/local-fs)
 # upload/download, plus run_export_round. tokio/fs streams downloads to disk.
 transport = ["dep:object_store", "dep:tar", "tokio/fs"]
+
+# MODEL-TEST MUTATIONS. Each breaks one decision in `kernels::applied` so the
+# matching Stateright model (`tests/model_applied.rs`,
+# `tests/model_resync_order.rs`) must find a counterexample. They exist only to
+# prove the models can fail. NEVER enable them in a production build: each one
+# reintroduces a data-loss or ordering bug. Run one with
+# `cargo test --test <model> --features mut_<name>`.
+# A failed store apply drops its raw batch instead of re-queuing it.
+mut_drop_failed_batch = []
+# A restart resumes from the in-memory cursor even when a store holds the data.
+mut_resume_from_memory = []
+# The resync acks before its synthetic deletes are folded.
+mut_no_ack_barrier = []

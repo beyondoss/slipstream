@@ -5,5 +5,7 @@
 //! plain data types, and nothing here touches tokio, async-nats, futures or
 //! `std::io`. No I/O, no async, no clock.
 
+// Consumers: `applied::Fold`, `repair::fold_in`, `tests/model_applied.rs`,
+// `tests/model_resync_order.rs` (re-exported as `cursor_kernel`).
 pub mod applied;
 pub mod protocol;

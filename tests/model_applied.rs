@@ -1,38 +1,52 @@
-//! Exhaustive model-check of `watch_applied`'s CURSOR AUTHORITY — the
+//! Exhaustive model-check of `watch_applied`'s CURSOR AUTHORITY: the
 //! invariant the entire resume story sits on: the store's persisted cursor
 //! never advances past data that is not in the store. A violation is a
 //! restart-surviving hole in the fold: silent data loss, strictly worse
 //! than anything the transport could do.
 //!
-//! Modeled: the delivery → batch → flush pipeline with TRANSIENT STORE
-//! FAILURES (re-queued for cumulative commit — `applied.rs`'s flush path),
-//! crashes at any point, and restarts that resume from the store's
-//! persisted cursor. Flush boundaries interleave freely, which is a
+//! Modeled: the delivery -> batch -> flush pipeline with TRANSIENT STORE
+//! FAILURES, crashes at any point, and restarts that resume from the cursor
+//! the kernel names. Flush boundaries interleave freely, which is a
 //! superset of every window/max/shutdown/export trigger policy.
 //!
-//! Mutations — both are REAL bug classes, the first found live:
-//! - `DropFailedBatch`: a failed store apply drops its raw batch and the
-//!   next successful flush advances the cursor over the hole. THIS WAS THE
-//!   SHIPPED CODE until `transient_store_failure_never_leaves_a_cursor_gap`
-//!   reproduced it (found while writing this model); the fix re-queues the
-//!   failed batch. The checker proves the old behavior violates the
-//!   invariant.
-//! - `ResumeFromMemApplied`: restart resumes from the in-memory applied
-//!   cursor instead of the store's persisted one. The in-memory cursor
-//!   legitimately runs ahead of the store across failed flushes (the
-//!   domain-apply side is not transactional with the store), so resuming
-//!   from it skips the un-stored gap. Pins WHY the resume source must be
-//!   the store's own cursor. This covers the in-process resume too:
-//!   `WatchEnd::applied` (and `watch_applied`'s return) is the store's
-//!   cursor, not the in-memory one.
+//! THE MODEL RUNS THE PRODUCTION KERNEL. Every decision (which flush steps
+//! run, whether a failed store fold re-queues its batch, the failure streak
+//! that fail-stops, which cursor a restart resumes from) comes from
+//! `slipstream::cursor_kernel::{step, resume_from}`, the functions
+//! `applied::Fold` calls. The model keeps only environment state (what the
+//! stream delivered, what the store holds, crashes) and feeds the kernel
+//! events; it interprets the returned actions the way `Fold` does, one for
+//! one, and restates no decision.
 //!
-//! Fidelity note: unlike the transport and live-watch models, there is no
-//! shared decision kernel here — the invariant is carried by control-flow
-//! structure (what gets re-queued, which cursor is committed, where the
-//! restart resumes), not by a guard expression. Fidelity therefore rests on
-//! the transition audit against `applied.rs`'s flush macro plus the
-//! mutation contrast, and the empirical twin in `applied.rs` tests.
+//! Mutations are cargo features that break the KERNEL (see Cargo.toml), not
+//! the model. Run with `--features <name>`; each flips this file's test to
+//! assert the counterexample is found:
+//! - `mut_drop_failed_batch`: the kernel stops emitting `Requeue`, so a failed
+//!   store apply drops its raw batch and the next successful flush advances
+//!   the cursor over the hole. THIS WAS THE SHIPPED CODE until
+//!   `transient_store_failure_never_leaves_a_cursor_gap` reproduced it.
+//! - `mut_resume_from_memory`: `resume_from` names the in-memory applied
+//!   cursor even with a store. That cursor legitimately runs ahead of the
+//!   store across failed flushes, so resuming from it skips the un-stored gap.
+//!
+//! Fidelity: transitions are the kernel's. Events fed: `Received` (positioned,
+//! `max` unbounded: the flush point is a free model step instead, which
+//! covers every `FlushNow`), `FlushRequested`, `StoreDone(Ok | Failed)`.
+//! Not fed: the eviction memo (`RememberEvicting`), export and repair events
+//! (repairs: `tests/model_repair.rs`, `tests/model_resync_order.rs`), unparsed
+//! updates, no-store runs (there is no store cursor to protect), and
+//! `StoreDone(Panicked)` (the store is gone; only a fresh open recovers).
+//! `Fail(StoreFailStreak)` ends the run and restarts it, like a crash.
+//! Actions are interpreted as `Fold` does: `Requeue` leaves the raw range
+//! queued, its absence after a failure drops it; `AdvanceApplied` moves the
+//! in-memory cursor to the pending position; `FoldStore` takes the raw batch.
+//! The state space is finite (revisions are capped, the failure streak is
+//! bounded by the kernel), so every run, mutated ones included, terminates
+//! without a depth cut that could hide a violation.
 
+use slipstream::cursor_kernel::{
+    Action, Event, Fatal, Flush, Queued, ResumeFrom, State as K, StoreOutcome, resume_from, step,
+};
 use stateright::{Checker, Model, Property};
 
 /// Stream revisions run 1..=MAX_REV.
@@ -42,22 +56,25 @@ const MAX_REV: u8 = 5;
 struct St {
     /// Bucket high-water revision.
     head: u8,
-    /// Delivered to the loop (in-memory; lost on crash).
+    /// Delivered to the loop (in-memory; lost on crash). Also the pending
+    /// stream position (every modeled update is positioned).
     delivered: u8,
-    /// The store's PERSISTED cursor — what a restart resumes from.
+    /// The store's PERSISTED cursor: what a restart resumes from.
     store_cursor: u8,
-    /// Lower bound of the re-queued/pending raw range: the store holds
-    /// complete contents up to `store_cursor`; the loop holds raw updates
-    /// (`q_from`, `delivered`]. Shipped semantics keep `q_from ==
-    /// store_cursor` (re-queue on failure); the DropFailedBatch mutation
-    /// lets it advance past the store.
+    /// Lower bound of the queued raw range: the store holds complete
+    /// contents up to `store_cursor`; the loop holds raw updates
+    /// (`q_from`, `delivered`].
     q_from: u8,
     /// The in-memory applied cursor: advances at every flush attempt,
     /// success or failure (the domain apply is not transactional with the
     /// store).
     applied_mem: u8,
+    /// The cursor the running store fold commits at, while one runs.
+    inflight: Option<u8>,
+    /// The production kernel's state.
+    k: K,
     /// Latched when a commit left the store's contents incomplete below its
-    /// cursor — the restart-surviving hole. THE invariant: never latches.
+    /// cursor: the restart-surviving hole. THE invariant: never latches.
     holes: bool,
 }
 
@@ -65,35 +82,45 @@ struct St {
 enum Act {
     /// A new revision lands in the bucket.
     Churn,
-    /// The watch delivers the next revision to the loop.
+    /// The watch delivers the next revision: `Event::Received`.
     Deliver,
-    /// A flush whose store apply SUCCEEDS: commits (`q_from`, `delivered`]
-    /// with cursor `delivered`, atomically (backend axiom: data + cursor in
-    /// one transaction).
-    FlushOk,
-    /// A flush whose store apply FAILS transiently. Shipped: the raw batch
-    /// is re-queued (`q_from` unchanged — the next FlushOk commits
-    /// cumulatively); the in-memory applied cursor still advances.
-    /// DropFailedBatch mutation: the batch is dropped (`q_from` jumps to
-    /// `delivered`).
-    FlushFail,
+    /// A flush boundary: `Event::FlushRequested`.
+    Flush,
+    /// The store fold returns: `Event::StoreDone`.
+    StoreDone(StoreOutcome),
     /// Process crash: all in-memory state is lost; the restart reopens the
-    /// store and resumes the watch from its persisted cursor (or, under the
-    /// ResumeFromMemApplied mutation, from the in-memory applied cursor —
-    /// as if the caller trusted `on_applied` instead of the store).
+    /// store and resumes from the cursor `resume_from` names.
     CrashRestart,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mutation {
-    None,
-    DropFailedBatch,
-    ResumeFromMemApplied,
-}
-
 #[derive(Clone)]
-struct AppliedLoop {
-    mutation: Mutation,
+struct AppliedLoop;
+
+impl AppliedLoop {
+    fn queued(s: &St) -> Queued {
+        Queued {
+            batch: (s.delivered - s.applied_mem) as usize,
+            raw: (s.delivered - s.q_from) as usize,
+        }
+    }
+
+    /// The run ends (crash or fail-stop) and restarts from `resume_from`.
+    fn restart(s: &mut St) {
+        let resume = match resume_from(true) {
+            ResumeFrom::Store => s.store_cursor,
+            ResumeFrom::Memory => s.applied_mem,
+        };
+        // Resuming above the store's cursor never re-delivers the un-stored
+        // gap: it is permanently skipped.
+        if resume > s.store_cursor {
+            s.holes = true;
+        }
+        s.delivered = resume;
+        s.q_from = resume.max(s.store_cursor);
+        s.applied_mem = resume;
+        s.inflight = None;
+        s.k = K::default();
+    }
 }
 
 impl Model for AppliedLoop {
@@ -107,6 +134,8 @@ impl Model for AppliedLoop {
             store_cursor: 0,
             q_from: 0,
             applied_mem: 0,
+            inflight: None,
+            k: K::default(),
             holes: false,
         }]
     }
@@ -115,12 +144,15 @@ impl Model for AppliedLoop {
         if s.head < MAX_REV {
             acts.push(Act::Churn);
         }
-        if s.delivered < s.head {
-            acts.push(Act::Deliver);
-        }
-        if s.delivered > s.q_from {
-            acts.push(Act::FlushOk);
-            acts.push(Act::FlushFail);
+        if let Flush::Storing { .. } = s.k.flush {
+            // The loop awaits the store fold: nothing else runs on it.
+            acts.push(Act::StoreDone(StoreOutcome::Ok));
+            acts.push(Act::StoreDone(StoreOutcome::Failed));
+        } else {
+            if s.delivered < s.head {
+                acts.push(Act::Deliver);
+            }
+            acts.push(Act::Flush);
         }
         // A crash is possible at any moment.
         acts.push(Act::CrashRestart);
@@ -130,142 +162,172 @@ impl Model for AppliedLoop {
         let mut s = s.clone();
         match a {
             Act::Churn => s.head += 1,
-            Act::Deliver => s.delivered += 1,
-            Act::FlushOk => {
-                // Atomic commit of (`q_from`, `delivered`] at cursor
-                // `delivered`. If `q_from` ran ahead of the store's cursor
-                // (a dropped batch), the committed contents are missing
-                // (`store_cursor`, `q_from`] while the cursor claims them:
-                // the hole, permanent from here on.
-                if s.q_from > s.store_cursor {
-                    s.holes = true;
-                }
-                s.store_cursor = s.delivered;
-                s.q_from = s.delivered;
-                s.applied_mem = s.delivered;
-            }
-            Act::FlushFail => {
-                // The domain apply ran and the in-memory cursor advanced
-                // regardless; only the store commit failed.
-                s.applied_mem = s.delivered;
-                match self.mutation {
-                    // Shipped: re-queue — `q_from` stays put, the next
-                    // FlushOk commits cumulatively.
-                    Mutation::None | Mutation::ResumeFromMemApplied => {}
-                    // The pre-fix behavior: the failed batch is dropped.
-                    Mutation::DropFailedBatch => s.q_from = s.delivered,
+            Act::Deliver => {
+                s.delivered += 1;
+                let (k, acts) = step(
+                    s.k,
+                    Event::Received {
+                        positioned: true,
+                        queued: Self::queued(&s),
+                        max: usize::MAX,
+                    },
+                );
+                s.k = k;
+                for act in &acts {
+                    match act {
+                        // The pending position is `delivered`.
+                        Action::RecordHigh => {}
+                        other => unreachable!("received: {other:?}"),
+                    }
                 }
             }
-            Act::CrashRestart => {
-                let resume = match self.mutation {
-                    Mutation::ResumeFromMemApplied => s.applied_mem,
-                    _ => s.store_cursor,
-                };
-                // Resuming above the store's cursor never re-delivers the
-                // un-stored gap: it is permanently skipped.
-                if resume > s.store_cursor {
-                    s.holes = true;
+            Act::Flush => {
+                let before = s.clone();
+                let (k, acts) = step(
+                    s.k,
+                    Event::FlushRequested {
+                        queued: Self::queued(&s),
+                        has_store: true,
+                    },
+                );
+                s.k = k;
+                for act in &acts {
+                    match act {
+                        // The domain apply has no model-visible effect.
+                        Action::ApplyDomain => {}
+                        Action::AdvanceApplied => s.applied_mem = s.delivered,
+                        Action::FoldStore => s.inflight = Some(s.applied_mem),
+                        // Nothing observes the consumer notification.
+                        Action::NotifyApplied => {}
+                        other => unreachable!("flush: {other:?}"),
+                    }
                 }
-                s.delivered = resume;
-                s.q_from = resume.max(s.store_cursor);
-                s.applied_mem = resume;
+                if s == before {
+                    return None;
+                }
             }
+            Act::StoreDone(outcome) => {
+                let (k, acts) = step(s.k, Event::StoreDone(outcome));
+                s.k = k;
+                let cursor = s.inflight.take().expect("a fold is in flight");
+                let mut requeued = false;
+                let mut failed_run = false;
+                for act in &acts {
+                    match act {
+                        Action::StoreCommitted => {
+                            // Atomic commit of (`q_from`, `cursor`] at
+                            // `cursor` (backend axiom: data + cursor in one
+                            // transaction). If `q_from` ran ahead of the
+                            // store's cursor (a dropped batch), the committed
+                            // contents are missing (`store_cursor`, `q_from`]
+                            // while the cursor claims them: the hole.
+                            if s.q_from > s.store_cursor {
+                                s.holes = true;
+                            }
+                            s.store_cursor = cursor;
+                            s.q_from = cursor;
+                        }
+                        Action::Requeue => requeued = true,
+                        Action::NotifyApplied => {}
+                        Action::Fail(Fatal::StoreFailStreak) => failed_run = true,
+                        other => unreachable!("store done: {other:?}"),
+                    }
+                }
+                if outcome == StoreOutcome::Failed && !requeued {
+                    // The raw batch was taken for the fold and never went
+                    // back: it is gone from the queue.
+                    s.q_from = cursor;
+                }
+                if failed_run {
+                    Self::restart(&mut s);
+                }
+            }
+            Act::CrashRestart => Self::restart(&mut s),
         }
         Some(s)
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        let mut props: Vec<Property<Self>> = Vec::new();
-
-        if self.mutation == Mutation::None {
+        vec![
             // THE cursor-authority invariant, over every interleaving of
             // delivery, flush boundaries, transient store failures, and
             // crashes: the store's cursor never claims data it dropped.
-            props.push(Property::<Self>::always(
+            Property::<Self>::always(
                 "the store's contents are always complete up to its cursor",
                 |_, s| !s.holes,
-            ));
+            ),
             // Cursor authority restated structurally: the pending raw range
-            // always begins exactly at the store's cursor — nothing between
+            // always begins exactly at the store's cursor: nothing between
             // the store and the loop can fall on the floor.
-            props.push(Property::<Self>::always(
+            Property::<Self>::always(
                 "the re-queued range is always anchored at the store cursor",
                 |_, s| s.q_from == s.store_cursor,
-            ));
-            // Terminal liveness: every maximal run ends fully caught up.
-            // (CrashRestart is always enabled, so no state is terminal in
-            // the strict sense; quiescence here is head reached + nothing
-            // pending + store caught up, checked as: whenever nothing is
-            // deliverable or flushable, the store is at the head.)
-            props.push(Property::<Self>::always(
-                "quiescence implies the store is at the head",
-                |_, s| {
-                    let quiesced =
-                        s.head == MAX_REV && s.delivered == s.head && s.q_from == s.delivered;
-                    !quiesced || s.store_cursor == s.head
-                },
-            ));
+            ),
+            // Quiescence: whenever nothing is deliverable and nothing is
+            // queued, the store is at the head.
+            Property::<Self>::always("quiescence implies the store is at the head", |_, s| {
+                let quiesced =
+                    s.head == MAX_REV && s.delivered == s.head && s.q_from == s.delivered;
+                !quiesced || s.store_cursor == s.head
+            }),
             // Vacuity witnesses: failures really happen and are really
-            // recovered from (a failed flush precedes a successful
-            // cumulative one), and crashes really replay.
-            props.push(Property::<Self>::sometimes(
+            // recovered from, and the in-memory cursor really runs ahead.
+            Property::<Self>::sometimes(
                 "a failed flush is followed by a cumulative successful commit",
                 |_, s| s.store_cursor > 0 && s.applied_mem == s.store_cursor && s.head > 1,
-            ));
-            props.push(Property::<Self>::sometimes(
+            ),
+            Property::<Self>::sometimes(
                 "the in-memory cursor runs ahead of the store across a failure",
                 |_, s| s.applied_mem > s.store_cursor,
-            ));
-        } else {
-            // Each mutation must produce the hole — proving the respective
-            // rule (re-queue on failure; resume from the store's cursor) is
-            // load-bearing, not incidental.
-            props.push(Property::<Self>::sometimes(
-                "HAZARD reachable: cursor advances over dropped data",
-                |_, s| s.holes,
-            ));
-        }
-
-        props
+            ),
+        ]
     }
 }
 
-fn check(mutation: Mutation, label: &str) {
-    let model = AppliedLoop { mutation };
-    let checker = model.checker().spawn_bfs().join();
+fn run(label: &str) -> impl Checker<AppliedLoop> {
+    let started = std::time::Instant::now();
+    let checker = AppliedLoop.checker().spawn_bfs().join();
     println!(
-        "{label}: {} states, {} unique",
+        "{label}: {} states, {} unique, {:?}",
         checker.state_count(),
         checker.unique_state_count(),
+        started.elapsed(),
     );
-    checker.assert_properties();
+    checker
 }
 
-/// The SHIPPED flush semantics (failed store applies re-queue their raw
-/// batch; restarts resume from the store's persisted cursor): cursor
-/// authority holds over every interleaving of delivery, flushing, transient
-/// failure, and crash.
+/// The production kernel: failed store applies re-queue their raw batch;
+/// restarts resume from the store's persisted cursor. Cursor authority
+/// holds over every interleaving of delivery, flushing, transient failure,
+/// and crash.
+#[cfg(not(any(feature = "mut_drop_failed_batch", feature = "mut_resume_from_memory")))]
 #[test]
-fn shipped_flush_semantics_preserve_cursor_authority() {
-    check(Mutation::None, "applied: shipped");
+fn the_kernel_preserves_cursor_authority() {
+    run("applied: kernel").assert_properties();
 }
 
-/// The PRE-FIX behavior (failed batch dropped, warn-and-continue): the
-/// checker reaches the restart-surviving hole — the machine-checked record
-/// of the bug `transient_store_failure_never_leaves_a_cursor_gap`
-/// reproduced live.
+/// Kernel mutation: a failed batch is dropped (the pre-fix behavior). The
+/// checker reaches the restart-surviving hole.
+#[cfg(feature = "mut_drop_failed_batch")]
 #[test]
 fn dropping_failed_batches_corrupts_the_fold() {
-    check(Mutation::DropFailedBatch, "applied: drop-on-fail (pre-fix)");
+    let c = run("applied: mut_drop_failed_batch");
+    assert!(
+        c.discovery("the store's contents are always complete up to its cursor")
+            .is_some(),
+        "no counterexample"
+    );
 }
 
-/// Resuming from the in-memory applied cursor instead of the store's
-/// persisted one skips the un-stored gap: pins why the restart's resume
-/// source must be the store itself.
+/// Kernel mutation: restart resumes from the in-memory cursor. The checker
+/// reaches the skipped gap.
+#[cfg(feature = "mut_resume_from_memory")]
 #[test]
 fn resuming_from_memory_cursor_corrupts_the_fold() {
-    check(
-        Mutation::ResumeFromMemApplied,
-        "applied: resume-from-memory",
+    let c = run("applied: mut_resume_from_memory");
+    assert!(
+        c.discovery("the store's contents are always complete up to its cursor")
+            .is_some(),
+        "no counterexample"
     );
 }
