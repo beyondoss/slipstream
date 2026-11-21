@@ -67,7 +67,8 @@ use tracing::warn;
 use crate::artifact::ExportManifest;
 use crate::health::WatchHealth;
 use crate::kernels::applied::{
-    Action, Actions, Event, Fatal, Queued, State as KState, StoreOutcome, step,
+    Action, Actions, Event, Fatal, Queued, ResumeFrom, State as KState, StoreOutcome, resume_from,
+    step,
 };
 use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
 use crate::repair::{self, ExpiryRepair};
@@ -543,10 +544,7 @@ where
     // The resume point is the store's own cursor, never the in-memory one:
     // a transient store failure leaves the fold ahead of the store, and its
     // re-queued batch dies with the fold. A lost store has no cursor to read.
-    let applied = match fold.store_cursor() {
-        Some(c) => c,
-        None => fold.applied().clone(),
-    };
+    let applied = fold.resume_cursor();
     WatchEnd {
         result: result.map(|_| applied.clone()),
         applied,
@@ -983,9 +981,13 @@ where
         self.k.open
     }
 
-    /// The store's persisted cursor, when the fold holds a store.
-    pub(crate) fn store_cursor(&self) -> Option<WatchCursor> {
-        self.store.as_ref().map(S::cursor)
+    /// The cursor to hand the caller as `resume`; the kernel picks its source
+    /// ([`resume_from`]), this only reads it.
+    pub(crate) fn resume_cursor(&self) -> WatchCursor {
+        match (resume_from(self.store.is_some()), &self.store) {
+            (ResumeFrom::Store, Some(st)) => st.cursor(),
+            _ => self.applied.clone(),
+        }
     }
 
     /// Move the store out (to a blocking task); [`put_store`](Self::put_store)

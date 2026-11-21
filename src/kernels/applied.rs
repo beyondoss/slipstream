@@ -212,6 +212,29 @@ fn finish(s: &mut State, a: &mut Actions, advanced: bool, had_store: bool) {
     }
 }
 
+/// Which cursor a run hands its caller as the next `resume`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResumeFrom {
+    /// The store's own persisted cursor: it never names data the store lacks,
+    /// while the in-memory cursor runs ahead of it across a failed store
+    /// apply (the re-queued batch dies with the run).
+    Store,
+    /// No store holds the data (none given, or lost): the in-memory applied
+    /// cursor is the only position there is.
+    Memory,
+}
+
+/// The resume cursor's source at the end of a run. `holds_store`: the fold
+/// still holds its store.
+#[inline]
+pub const fn resume_from(holds_store: bool) -> ResumeFrom {
+    if holds_store {
+        ResumeFrom::Store
+    } else {
+        ResumeFrom::Memory
+    }
+}
+
 /// The one transition function.
 #[inline]
 pub fn step(mut s: State, e: Event) -> (State, Actions) {
@@ -347,6 +370,12 @@ mod tests {
     use super::*;
 
     const Q: Queued = Queued { batch: 1, raw: 1 };
+
+    #[test]
+    fn the_resume_cursor_is_the_stores_whenever_a_store_holds_the_data() {
+        assert_eq!(resume_from(true), ResumeFrom::Store);
+        assert_eq!(resume_from(false), ResumeFrom::Memory);
+    }
 
     fn flush(s: State, has_store: bool) -> (State, Actions) {
         step(
