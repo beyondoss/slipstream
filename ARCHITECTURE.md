@@ -339,9 +339,9 @@ Every NATS operation is wrapped in `timed()` (30 s). Without it, a CLOSE_WAIT co
 
 A token read off a watch also carries, outside its bytes and ignored by equality, the server time its message was written and the stream incarnation it was read from. The cursor built from it records both (see Watch resumption).
 
-### Machine-Checked Protocol Kernels (`protocol.rs`)
+### Machine-Checked Protocol Kernels (`src/kernels/protocol.rs`)
 
-Every decision the protocol's correctness rests on is a pure function in `protocol.rs`. Production code and the Stateright models (`tests/model*.rs`) call the **same functions** — not hand-synchronized copies. A change to any of them is re-verified against the full bounded state space on the next model run. A model expresses a mutation by forging a kernel's *input* (e.g. the listing is "the truth" on an evicting bucket), never by re-implementing the decision; each mutation must produce a counterexample.
+Every decision the protocol's correctness rests on is a pure function in `src/kernels/protocol.rs`. Production code and the Stateright models (`tests/model*.rs`) call the **same functions** — not hand-synchronized copies. A change to any of them is re-verified against the full bounded state space on the next model run. A model expresses a mutation by forging a kernel's *input* (e.g. the listing is "the truth" on an evicting bucket), never by re-implementing the decision; each mutation must produce a counterexample.
 
 | Kernel | Production | Models |
 | --- | --- | --- |
@@ -718,9 +718,9 @@ The legacy layout wrote the payload at `<key>.payload.tar` and the manifest at `
 
 Machine-checked as three theorems in `tests/model.rs`: published cursor never regresses, pointer target always fetchable (zero-grace prune), bootstrap never silently diverges.
 
-### Why extract protocol guards into `protocol.rs` and share them with the model?
+### Why extract protocol guards into `src/kernels/protocol.rs` and share them with the model?
 
-Production code and an exhaustive model checker running the same logic closes the drift gap between proof and implementation. Previously the models had their own inline copies; a change to the production decision would not update them, leaving the proof covering the old variant. Extracting every decision into `protocol.rs` and importing it from both call sites means every model run verifies the current production code, not a snapshot. The cost is a hard dependency: the models import `pub mod protocol` directly, so the module cannot go private.
+Production code and an exhaustive model checker running the same logic closes the drift gap between proof and implementation. Previously the models had their own inline copies; a change to the production decision would not update them, leaving the proof covering the old variant. Extracting every decision into `src/kernels/protocol.rs` and importing it from both call sites means every model run verifies the current production code, not a snapshot. The cost is a hard dependency: the models import `pub mod protocol` directly, so the module cannot go private.
 
 ### Why write in sorted key order during compaction?
 
