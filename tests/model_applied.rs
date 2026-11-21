@@ -22,7 +22,9 @@
 //!   legitimately runs ahead of the store across failed flushes (the
 //!   domain-apply side is not transactional with the store), so resuming
 //!   from it skips the un-stored gap. Pins WHY the resume source must be
-//!   the store's own cursor.
+//!   the store's own cursor. This covers the in-process resume too:
+//!   `WatchEnd::applied` (and `watch_applied`'s return) is the store's
+//!   cursor, not the in-memory one.
 //!
 //! Fidelity note: unlike the transport and live-watch models, there is no
 //! shared decision kernel here — the invariant is carried by control-flow

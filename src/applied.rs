@@ -42,11 +42,13 @@
 //!   logic; for the tunnel router it swaps the route table, for the edge origin
 //!   watcher it rebuilds the hashrings.
 //! - `on_applied`: fires once per flush, *after* `apply` returns, with the new
-//!   applied cursor. Without a store, callers use it to persist the cursor for
-//!   the next restart. WITH a store, resume from the store's own cursor
-//!   instead: across a transient store failure the batch is re-queued, but
+//!   applied cursor. A notification, not a resume source with a store:
+//!   across a transient store failure the batch is re-queued, but
 //!   `on_applied` has already reported the advanced cursor — ahead of what the
-//!   store made durable — so resuming from it could skip that batch.
+//!   store made durable — so resuming from it could skip that batch. Without
+//!   a store, callers use it to persist the cursor for the next restart. WITH
+//!   a store, resume from the store's own cursor (what [`watch_applied`] and
+//!   [`WatchEnd::applied`] return).
 //!
 //! ## Panics
 //!
@@ -165,8 +167,10 @@ impl Default for BatchConfig {
 /// Subscribes per `scope` (resuming from `resume` when it carries a position),
 /// batches updates per `config`, applies each batch via `apply`, and only then
 /// advances the cursor / folds the batch into `store` / calls `on_applied`.
-/// Returns the final applied cursor when the watch ends (shutdown signalled, or
-/// the underlying stream closed).
+/// Returns the final resume cursor when the watch ends (shutdown signalled, or
+/// the underlying stream closed): with a store, the store's persisted cursor
+/// (which can trail what `apply` has seen after a transient store failure);
+/// without one, the applied cursor. Persist it as the next `resume`.
 ///
 /// On every exit, `Ok` or `Err`, the store is closed on its own thread, never
 /// on the runtime, and the return waits up to 30 s for that close — so a
@@ -280,12 +284,17 @@ where
 
 /// How a [`watch_applied_owned`] run ended.
 pub struct WatchEnd<S> {
-    /// The run's result: the applied cursor on a clean end or a shutdown, the
-    /// error otherwise.
+    /// The run's result: on a clean end or a shutdown, the same cursor as
+    /// [`applied`](Self::applied); the error otherwise.
     pub result: Result<WatchCursor, KvError>,
-    /// The applied cursor at the end, error or not: everything up to it was
-    /// applied and, with a store, committed with it. The `resume` for the next
-    /// run.
+    /// The resume point, error or not. With a store (returned in
+    /// [`store`](Self::store)) it is the store's own persisted cursor:
+    /// everything up to it is in the store. It can trail what `apply` has seen
+    /// (a transient store failure re-queues a batch inside the run, and that
+    /// batch is dropped with it when the run ends), so resuming from it
+    /// re-delivers that batch instead of skipping it. Without a store, or when
+    /// the store was lost, it is the in-memory cursor: everything up to it was
+    /// applied.
     pub applied: WatchCursor,
     /// The store, intact. `None` when none was given, or it was lost (a
     /// flush task panicked).
@@ -295,11 +304,12 @@ pub struct WatchEnd<S> {
 /// [`watch_applied`], handing the store back instead of closing it.
 ///
 /// On every exit, a watch error included, the [`WatchEnd`] carries the store
-/// intact and the applied cursor it committed with (data and cursor commit
-/// together). A caller that keeps readers open on the store can therefore
-/// resume in-process: call again with the same store and `resume` set to
-/// [`WatchEnd::applied`]. Nothing the store holds is re-applied out of order and
-/// nothing is skipped. A store that comes back `None` was lost (a flush task
+/// intact and [`WatchEnd::applied`], the cursor the store itself holds (data and
+/// cursor commit together), never the in-memory cursor, which a failed store
+/// write can leave ahead of it. A caller that keeps readers open on the store
+/// can therefore resume in-process: call again with the same store and
+/// `resume` set to [`WatchEnd::applied`]. Nothing the store holds is re-applied
+/// out of order and nothing is skipped. A store that comes back `None` was lost (a flush task
 /// panicked); only a fresh open recovers from that. Closing a returned store
 /// is the caller's job: drop it off the runtime (fjall's `Database::drop` can
 /// block; see [`watch_applied`]).
@@ -352,7 +362,7 @@ where
     let start = resume.clone().unwrap_or_else(WatchCursor::none);
     let early = |e: KvError, store: Option<S>| WatchEnd {
         result: Err(e),
-        applied: start.clone(),
+        applied: store.as_ref().map_or_else(|| start.clone(), S::cursor),
         store,
     };
     let (repair, mut repairs) = match repair::arm(repair.into(), store.is_some()) {
@@ -527,9 +537,16 @@ where
     if let Some(h) = &config.health {
         h.run_ended(&result);
     }
+    // The resume point is the store's own cursor, never the in-memory one:
+    // a transient store failure leaves the fold ahead of the store, and its
+    // re-queued batch dies with the fold. A lost store has no cursor to read.
+    let applied = match fold.store_cursor() {
+        Some(c) => c,
+        None => fold.applied().clone(),
+    };
     WatchEnd {
-        result,
-        applied: fold.applied().clone(),
+        result: result.map(|_| applied.clone()),
+        applied,
         store: fold.take_store(),
     }
 }
@@ -914,6 +931,11 @@ where
     /// A batch is open: the window timer must be armed.
     fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The store's persisted cursor, when the fold holds a store.
+    pub(crate) fn store_cursor(&self) -> Option<WatchCursor> {
+        self.store.as_ref().map(S::cursor)
     }
 
     /// Move the store out (to a blocking task); [`put_store`](Self::put_store)
@@ -3711,5 +3733,89 @@ mod tests {
         .await
         .expect_err("Restore without a store must be refused");
         assert!(err.to_string().contains("need a store"), "{err}");
+    }
+
+    /// In-process resume at [`WatchEnd::applied`] after a run whose final flush
+    /// hit a transient store failure: the failed batch is re-queued inside the
+    /// fold and dropped with it, so `applied` must be the store's cursor (0),
+    /// not the in-memory one (1). Resuming from the in-memory cursor skipped
+    /// `node.a` for good: the cursor sat past data the store never held.
+    #[tokio::test(start_paused = true)]
+    async fn in_process_resume_after_failed_final_flush_leaves_no_hole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_r, inner) = AppendLogSnapshot::open(&dir.path().join("f.snap"), u64::MAX).unwrap();
+        let store = FailOnceStore {
+            inner,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let watcher = Arc::new(MockWatcher::new(vec![put("node.a", b"1", 1)], true));
+        let task = tokio::spawn(watch_applied_owned(
+            watcher,
+            WatchScope::All,
+            None,
+            None::<Arc<dyn KvReader>>,
+            Some(store),
+            None,
+            BatchConfig {
+                window: Duration::from_secs(3600),
+                max: 100,
+                ..BatchConfig::default()
+            },
+            parse_put,
+            |_b: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The shutdown's final flush is the one the store rejects.
+        sd_tx.send(true).unwrap();
+        let end = task.await.unwrap();
+        let store = end.store.expect("the store comes back");
+        assert!(
+            store.get("node.a").unwrap().is_none(),
+            "the store never held node.a"
+        );
+        assert_eq!(
+            end.applied.as_u64(),
+            store.cursor().as_u64(),
+            "applied is the store's cursor, not the in-memory one"
+        );
+        assert_eq!(
+            end.result.as_ref().unwrap().as_u64(),
+            store.cursor().as_u64(),
+            "the shutdown's Ok cursor claims no more than the store holds"
+        );
+
+        // The next run resumes from `applied` on the same store; the stream
+        // re-delivers everything after it.
+        // `applied` is the store's empty cursor, so the resume is a full watch.
+        let resumed = MockWatcher {
+            full: Mutex::new(Some(vec![put("node.a", b"1", 1), put("node.b", b"2", 2)])),
+            from: Mutex::new(Some(vec![])),
+            from_expires: false,
+            hold: false,
+        };
+        let (_t, sd_rx2) = watch::channel(false);
+        let end2 = watch_applied_owned(
+            Arc::new(resumed),
+            WatchScope::All,
+            Some(end.applied),
+            None::<Arc<dyn KvReader>>,
+            Some(store),
+            None,
+            BatchConfig::default(),
+            parse_put,
+            |_b: Vec<Vec<u8>>| {},
+            |_| {},
+            sd_rx2,
+        )
+        .await;
+        let store = end2.store.unwrap();
+        assert!(
+            store.get("node.a").unwrap().is_some(),
+            "HOLE: cursor past data the store never held"
+        );
+        assert!(store.get("node.b").unwrap().is_some());
     }
 }
