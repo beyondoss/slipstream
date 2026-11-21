@@ -53,6 +53,7 @@ pub use health::{
     ArtifactHealth, DEFAULT_HEAD_SAMPLE_INTERVAL, HealthSnapshot, LastError, LogRange, RepairState,
     WatchHealth,
 };
+pub use kernels::applied as cursor_kernel;
 pub use kernels::protocol;
 pub use kv::{
     KvEntry, KvError, KvPurge, KvReader, KvTtl, KvUpdate, KvWatcher, KvWriter, Retention,
