@@ -178,6 +178,10 @@ pub fn same_incarnation(
 /// `tests/model.rs` (`RestoreRead`) and `tests/model_live_watch.rs`
 /// (`GuardRepair`).
 pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
+    // Mutation (model tests only): no guard.
+    if cfg!(feature = "mut_no_restore_guard") {
+        return true;
+    }
     restore_ahead(artifact_revision, local_revision)
         && resume_window_ok(artifact_revision, first_sequence)
 }
@@ -202,6 +206,12 @@ pub fn listing_is_truth(
     first_revision: u64,
     seen_evicting: bool,
 ) -> bool {
+    // Mutations (model tests only): trust the listing on an evicting bucket;
+    // forget what the fold saw.
+    if cfg!(feature = "mut_relist_on_evicting") {
+        return true;
+    }
+    let seen_evicting = seen_evicting && !cfg!(feature = "mut_no_eviction_memo");
     !seen_evicting && (!evicts_current_values || resume_window_ok(0, first_revision))
 }
 
@@ -271,6 +281,8 @@ pub fn cursorless_start_needs_repair(
     fold_has_data: bool,
     listing_truth: Option<bool>,
 ) -> bool {
+    // Mutation (model tests only): a fold with data is taken as empty.
+    let fold_has_data = fold_has_data && !cfg!(feature = "mut_unanchored_relist");
     match mode {
         RepairMode::None => false,
         _ if fold_has_data => true,
@@ -317,6 +329,14 @@ pub fn restore_key(
     identical: bool,
     listed_live: bool,
 ) -> KeyRestore {
+    // Mutations (model tests only): forge both sides revisionless (the
+    // pre-fix diff: take anything not identical); forge the key unlisted.
+    let strip = |k: KeyState| match k {
+        KeyState::At(_) if cfg!(feature = "mut_restore_ignores_versions") => KeyState::At(None),
+        k => k,
+    };
+    let (local, artifact) = (strip(local), strip(artifact));
+    let listed_live = listed_live && !cfg!(feature = "mut_restore_ignores_listing");
     match (local, artifact) {
         (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
             if l > a {
