@@ -40,6 +40,10 @@ time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 url = "2"
+# The `verus!` macro and the spec library. A normal build erases every proof (the macro expands to the plain Rust),
+# so production pays nothing; only `cargo verus` checks them (`mise run verify`). Pinned to the release in
+# dev/verus/VERSION.env.
+vstd = "=0.0.0-2026-11-01-0251"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -103,3 +107,9 @@ mut_restore_ignores_versions = []
 mut_restore_ignores_listing = []
 # The fold forgets that it saw retention evict current values.
 mut_no_eviction_memo = []
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }

@@ -427,6 +427,25 @@ A start with no cursor repairs first when the fold holds data anyway (a re-list 
 
 The per-key restore decision: take the artifact's entry unless the local one is newer (never a move backward), and delete a key the artifact lacks unless the bucket lists it live (never a phantom delete). `tests/model_repair.rs` catches both pre-fix variants as kernel mutation features (`mut_restore_ignores_versions`, `mut_restore_ignores_listing`).
 
+### What is proven (Verus, `mise run verify`)
+
+The kernels are checked twice: Stateright finds counterexamples in a bounded world, and Verus proves the kernel's own decisions for every input, with no bound. The proofs live inside `verus!` blocks in `src/kernels/`; a normal `cargo build` (and a published crate) erases them, so nothing but the `vstd` macro crate is added. `mise run verify` (CI job `Verify (Verus)`) runs `cargo verus verify` with the Verus release pinned in `dev/verus/VERSION.env`, in a fresh target dir, and must report 0 errors. No `assume`, `admit` or `external_body` stands in for kernel logic. Every `mut_*` feature turns at least one obligation red (`mise run verify -- -- --features mut_x`).
+
+`src/kernels/protocol.rs`: each function has an `ensures` giving exactly what it decides (`*_spec` is the readable table; Verus checks the code equals it), and these theorems:
+
+| Theorem | Where | Says |
+| --- | --- | --- |
+| `a_publish_never_regresses_the_pointer` | `protocol.rs:91` | an admitted publish never lowers a parseable pointer: its rank is monotone |
+| `a_publish_at_or_above_the_pointer_is_admitted` | `protocol.rs:104` | liveness: a publish at or above the pointer (or over an open or corrupt slot) is always admitted |
+| `a_pruned_payload_is_never_published_after` | `protocol.rs:162` | what the prune guard deletes can never be published later: no dangling pointer, at any timing |
+| `the_target_and_unknown_objects_are_never_pruned` | `protocol.rs:178` | the pointer's target and unparseable objects are never pruned |
+| `a_fresh_artifact_is_always_restorable` | `protocol.rs:315` | liveness: an artifact ahead of the fold and inside the window is always admitted |
+| `only_an_explicit_relist_can_be_refused` | `protocol.rs:451` | liveness: `Auto` and `Restore` are never refused; a refusal exists only for an explicit `Relist` on a listing known not to be the truth |
+| `restore_key` ensures | `protocol.rs:526` | a newer local entry is kept (never backward); a key listed live is never deleted; a delete needs a local entry the artifact lacks |
+| `resume_window_ok` / `resume_start_sequence` ensures | `protocol.rs:215`, `:625` | the window and the next sequence are exact in unbounded integers; no wrap at `u64::MAX` |
+
+Proving `gap_holds_no_eviction` found a real overflow: with `max_age = cursor_age = u64::MAX` the saturating multiply made the check pass for a cursor older than the retention. It now compares `age <= max / 2`.
+
 ### Export Round State Machine
 
 ```
