@@ -382,3 +382,85 @@ async fn the_old_streams_eviction_memo_does_not_distrust_the_new_streams_listing
         "the new stream never evicted: {c:?}"
     );
 }
+
+/// A fold of the old stream whose FIRST checkpoint tore: its data is on disk,
+/// its final cursor record is not. Nothing but the fold's own record can say
+/// which stream that data is of.
+fn tear_the_cursor(fleet: &Fleet, name: &str) {
+    let (cursor, _) = fleet.open(name);
+    let record = 4 + 1 + 1 + cursor.to_bytes().len() as u64;
+    let path = fleet.path(name);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    file.set_len(len - record).unwrap();
+    let (torn, _) = fleet.open(name);
+    assert!(torn.is_none(), "the cursor is torn off: {torn:?}");
+}
+
+/// The torn fold of the old stream: `k` at revision 18 ("old"), cursor 20.
+async fn torn_old_fold(fleet: &Fleet) -> Arc<dyn KvStore> {
+    let (_c, old) = open_bucket(&fleet.nats, plain()).await;
+    let a = spawn_node(&old, fleet.open("a").1, None, ExpiryRepair::None);
+    for i in 0..17 {
+        put(&old, &format!("o.{i}"), "o").await;
+    }
+    assert_eq!(put(&old, "k", "old").await, 18);
+    put(&old, "o.17", "o").await;
+    put(&old, "o.18", "o").await;
+    wait_applied(&a, 20).await;
+    stop(a).await.expect("clean stop");
+    tear_the_cursor(fleet, "a");
+    old
+}
+
+/// Data and no cursor, across a recreation: the fold's own record of its
+/// stream says it is another's, so a restore replaces it key for key. Without
+/// the record the data's provenance is unknown, and the restore kept `k` at
+/// the old stream's higher revision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torn_first_checkpoint_of_the_old_stream_is_foreign_to_the_recreated_one() {
+    let fleet = Fleet::new().await;
+    let _old = torn_old_fold(&fleet).await;
+    let (_c, new) = recreate(&fleet.nats, plain()).await;
+    put(&new, "k", "new").await;
+    let mut head = 1;
+    for i in 1..25 {
+        head = put(&new, &format!("n.{i}"), "n").await;
+    }
+    let exporter = spawn_node(&new, fleet.open("x").1, None, ExpiryRepair::None);
+    wait_applied(&exporter, head).await;
+    assert_eq!(
+        fleet.publish(&exporter, "art").await,
+        PublishOutcome::Published
+    );
+    stop(exporter).await.expect("clean stop");
+
+    let (cursor, fold) = fleet.open("a");
+    let node = spawn_node(&new, fold, Some(cursor), fleet.restore_only(&new));
+    wait_applied(&node, head).await;
+    stop(node).await.expect("clean stop");
+    assert_fold_is_bucket(&fleet.path("a"), &new).await;
+}
+
+/// The same torn fold on the SAME stream is its own: its newer entries are
+/// kept (a restore never moves a key backward), and the fold ends exactly the
+/// bucket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torn_first_checkpoint_of_this_stream_is_trusted() {
+    let fleet = Fleet::new().await;
+    let old = torn_old_fold(&fleet).await;
+    put(&old, "late", "l").await;
+    let head = put(&old, "k2", "x").await;
+    let exporter = spawn_node(&old, fleet.open("x").1, None, ExpiryRepair::None);
+    wait_applied(&exporter, head).await;
+    assert_eq!(
+        fleet.publish(&exporter, "art").await,
+        PublishOutcome::Published
+    );
+    stop(exporter).await.expect("clean stop");
+    let (cursor, fold) = fleet.open("a");
+    let node = spawn_node(&old, fold, Some(cursor), fleet.restore_only(&old));
+    wait_applied(&node, head).await;
+    stop(node).await.expect("clean stop");
+    assert_fold_is_bucket(&fleet.path("a"), &old).await;
+}
