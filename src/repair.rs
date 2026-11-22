@@ -25,7 +25,7 @@
 //! a fold (here or in an artifact) holds the former.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ use tracing::{error, info, warn};
 use crate::applied::{Fold, WatchScope};
 use crate::artifact::ExportManifest;
 use crate::health::{RepairState, WatchHealth};
-use crate::kernels::applied::{Action, Event, RepairKind};
+use crate::kernels::applied::{Action, Event, Refusal, RepairKind};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
@@ -1210,7 +1210,7 @@ where
                     }
                 }
             }
-            Action::RunRestore => {
+            Action::CheckAhead => {
                 let Some(RepairRequest::Restore {
                     restored,
                     reader,
@@ -1218,7 +1218,7 @@ where
                     reply,
                 }) = req.take()
                 else {
-                    unreachable!("RunRestore follows a Restore request")
+                    unreachable!("CheckAhead follows a Restore request")
                 };
                 return restore_request(fold, restored, reader, watcher, reply, prefixes).await;
             }
@@ -1228,8 +1228,11 @@ where
     Ok(())
 }
 
-/// The restore repair, main-loop half: refuse an artifact that is not ahead of
-/// the fold, otherwise fold it in and reply with its cursor.
+/// The restore repair, main-loop half: the kernel orders the steps (the ahead
+/// check, the diff, the listing and its window re-check, the chunks, the
+/// cursor commit, the reply); this runs them. A refusal replies with an error
+/// and changes nothing; the watch task fails with it and the main loop
+/// carries on.
 async fn restore_request<U, S, P, A, O>(
     fold: &mut Fold<U, S, P, A, O>,
     restored: RestoredFold<S>,
@@ -1246,31 +1249,235 @@ where
     O: FnMut(WatchCursor) + Send,
 {
     let target = restored.manifest().cursor.clone();
-    // The authoritative ahead check (the watch task's ran against its
-    // resume cursor; a mid-watch expiry delivered past that). A
-    // restore never moves the fold backward.
-    if !restore_ahead(target.rank(), fold.applied().rank()) {
-        let msg = format!(
-            "cursor-expired restore: the latest artifact (cursor {target:?}) is not \
-                     ahead of the fold (cursor {:?}); nothing newer to restore from",
-            fold.applied()
-        );
-        error!(%msg, "cursor-expiry repair refused");
-        // The watch task fails with this; its channel closing ends the
-        // loop.
-        let _ = reply.send(Err(KvError::WatchError(msg)));
-        return Ok(());
-    }
-    match restore(fold, restored, &*reader, &*watcher, prefixes).await? {
-        Ok(()) => {
-            let _ = reply.send(Ok(target));
-        }
-        Err(msg) => {
-            error!(%msg, "cursor-expiry repair refused");
-            let _ = reply.send(Err(KvError::WatchError(msg)));
+    let prefixes = disjoint(prefixes);
+    let max = fold.batch_cap();
+    let mut restored = Some(restored);
+    let mut reply = Some(reply);
+    // What the diff left: the keys to rewrite (spilled) and the delete
+    // candidates, until the chunks fold them.
+    let mut diff: Option<(KeySpill, HashSet<String>)> = None;
+    // The first retained revision when the listing's window re-check failed.
+    let mut aged: Option<u64> = None;
+
+    let ahead = restore_ahead(target.rank(), fold.applied().rank());
+    let mut todo: VecDeque<Action> = fold
+        .decide(Event::RestoreAhead { ahead })
+        .into_iter()
+        .copied()
+        .collect();
+    while let Some(act) = todo.pop_front() {
+        let next = match act {
+            Action::Refuse(why) => {
+                let msg = match why {
+                    // The watch task's check ran against its resume cursor; a
+                    // mid-watch expiry delivered past that.
+                    Refusal::NotAhead => format!(
+                        "cursor-expired restore: the latest artifact (cursor {target:?}) is not \
+                         ahead of the fold (cursor {:?}); nothing newer to restore from",
+                        fold.applied()
+                    ),
+                    Refusal::WindowAged => format!(
+                        "cursor-expired restore: the log evicted writes after the artifact's \
+                         cursor ({target:?}, first retained revision {}) while the restore was \
+                         listing live keys, so the listing can't vouch for them; nothing was \
+                         changed. Exports must run well inside the bucket's max_age / discard \
+                         turnover",
+                        aged.map_or_else(|| "?".to_string(), |f| f.to_string())
+                    ),
+                };
+                error!(%msg, "cursor-expiry repair refused");
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Err(KvError::WatchError(msg)));
+                }
+                let _ = tokio::task::spawn_blocking(move || drop((restored, diff))).await;
+                return Ok(());
+            }
+            Action::RunDiff => {
+                let Some(r) = restored.take() else {
+                    unreachable!("the artifact is held until the reply")
+                };
+                let (r, spill, deletes) = run_diff(fold, r, &prefixes).await?;
+                restored = Some(r);
+                let has_deletes = !deletes.is_empty();
+                diff = Some((spill, deletes));
+                fold.decide(Event::RestoreDiffed { has_deletes })
+            }
+            Action::ListLive => {
+                let Some((_, deletes)) = diff.as_mut() else {
+                    unreachable!("ListLive follows the diff")
+                };
+                // A delete candidate the bucket lists live is kept: its
+                // current value is a write after the artifact's cursor, which
+                // the resume delivers (`restore_key`'s `listed_live`). A
+                // failed listing fails the watch, like the key-listing
+                // repair's.
+                for prefix in &prefixes {
+                    reader
+                        .for_each_key(prefix, &mut |key| {
+                            deletes.remove(&key);
+                        })
+                        .await
+                        .map_err(|e| {
+                            repair_fatal(format!(
+                                "cursor-expired restore: listing live keys under {prefix:?} \
+                                 failed: {e}"
+                            ))
+                        })?;
+                }
+                // Retention only moves forward, so a check after the listing
+                // covers every write before it (`tests/model_repair.rs`).
+                // Nothing is folded yet.
+                let first = watcher.retention().await?.map(|r| r.first_revision);
+                let window_ok = first.is_none_or(|f| resume_window_ok(target.rank(), f));
+                if !window_ok {
+                    aged = first;
+                }
+                fold.decide(Event::RestoreListed { window_ok })
+            }
+            Action::FoldChunks => {
+                let Some((spill, deletes)) = diff.take() else {
+                    unreachable!("FoldChunks follows the diff")
+                };
+                info!(
+                    from = ?fold.applied(),
+                    to = ?target,
+                    rewritten = spill.len(),
+                    deleted = deletes.len(),
+                    "cursor-expired restore: replacing the in-scope fold with the artifact's"
+                );
+                let Some(r) = restored.take() else {
+                    unreachable!("the artifact is held until the reply")
+                };
+                restored = Some(fold_chunks(fold, r, spill, deletes, max).await?);
+                fold.decide(Event::RestoreFolded)
+            }
+            Action::CommitCursor => {
+                // The fold IS the artifact's (in scope): take its cursor,
+                // committed to the store with the final chunk's re-queued
+                // remainder, if any.
+                fold.advance_to(target.clone());
+                fold.flush().await?;
+                continue;
+            }
+            Action::ReplyRestored => {
+                // Closing an LSM can block; drop the temporary fold and its
+                // scratch dir off the async thread.
+                let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Ok(target));
+                }
+                return Ok(());
+            }
+            other => unreachable!("restore_request: {other:?}"),
+        };
+        for a in &next {
+            todo.push_back(*a);
         }
     }
     Ok(())
+}
+
+/// Diff the fold against the artifact ([`restore_diff`]): the keys to rewrite
+/// are spilled to scratch, and only the keys the restore would delete are
+/// held, so memory stays bounded at any fold size.
+async fn run_diff<U, S, P, A, O>(
+    fold: &mut Fold<U, S, P, A, O>,
+    restored: RestoredFold<S>,
+    prefixes: &[String],
+) -> Result<(RestoredFold<S>, KeySpill, HashSet<String>), KvError>
+where
+    U: Send,
+    S: SnapshotStore + Send + 'static,
+    P: FnMut(&KvUpdate) -> Option<U> + Send,
+    A: FnMut(Vec<U>) + Send,
+    O: FnMut(WatchCursor) + Send,
+{
+    let Some(st) = fold.take_store() else {
+        unreachable!("repairs are armed only with a store")
+    };
+    let scope = prefixes.to_vec();
+    // The artifact fold moves into the blocking task and comes back with the
+    // store.
+    let owned = restored;
+    let (st, owned, diff) = tokio::task::spawn_blocking(move || {
+        let diff = (|| {
+            let mut spill = KeySpill::new(owned.scratch.as_deref())?;
+            let candidates = restore_diff(&st, owned.fold(), &scope, |key| {
+                spill.push(&key).map_err(SnapshotError::from)
+            })?;
+            Ok::<_, SnapshotError>((spill, candidates))
+        })();
+        (st, owned, diff)
+    })
+    .await
+    .map_err(|e| repair_fatal(format!("cursor-expired restore: diff task panicked: {e}")))?;
+    fold.put_store(st);
+    let (spill, deletes) = diff.map_err(|e| {
+        repair_fatal(format!(
+            "cursor-expired restore: diffing the fold against the artifact failed: {e}"
+        ))
+    })?;
+    Ok((owned, spill, deletes))
+}
+
+/// Fold the difference through parse/apply/store in `max`-sized chunks, values
+/// read back per chunk. These carry no stream position: every chunk commits
+/// under the old cursor, so a crash part-way re-runs the (idempotent) restore
+/// on restart.
+async fn fold_chunks<U, S, P, A, O>(
+    fold: &mut Fold<U, S, P, A, O>,
+    mut restored: RestoredFold<S>,
+    spill: KeySpill,
+    deletes: HashSet<String>,
+    max: usize,
+) -> Result<RestoredFold<S>, KvError>
+where
+    U: Send,
+    S: SnapshotStore + Send + 'static,
+    P: FnMut(&KvUpdate) -> Option<U> + Send,
+    A: FnMut(Vec<U>) + Send,
+    O: FnMut(WatchCursor) + Send,
+{
+    let mut spill = spill
+        .into_reader()
+        .map_err(|e| repair_fatal(format!("cursor-expired restore: reading scratch: {e}")))?;
+    loop {
+        let (r, sp, updates) = tokio::task::spawn_blocking(move || {
+            let updates = spill
+                .take(max)
+                .map_err(SnapshotError::from)
+                .and_then(|keys| materialize(restored.fold(), keys));
+            (restored, spill, updates)
+        })
+        .await
+        .map_err(|e| repair_fatal(format!("cursor-expired restore: read task panicked: {e}")))?;
+        restored = r;
+        spill = sp;
+        let updates = updates.map_err(|e| {
+            repair_fatal(format!(
+                "cursor-expired restore: reading the artifact failed: {e}"
+            ))
+        })?;
+        if updates.is_empty() {
+            break;
+        }
+        for u in updates {
+            fold.correct(u);
+        }
+        fold.flush().await?;
+    }
+    let mut deletes = deletes.into_iter();
+    loop {
+        let chunk: Vec<_> = deletes.by_ref().take(max).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        for key in chunk {
+            fold.correct(restore_delete(key));
+        }
+        fold.flush().await?;
+    }
+    Ok(restored)
 }
 
 /// The key-listing diff, main-loop half: synthetic deletes for in-scope keys
@@ -1386,150 +1593,6 @@ where
         fold.flush().await?;
     }
     fold.flush().await
-}
-
-/// The artifact restore, main-loop half: replace the in-scope fold with the
-/// artifact's ([`restore_diff`]), then take its cursor.
-///
-/// Memory stays bounded at any fold size. The keys to rewrite are spilled to
-/// scratch and read back a chunk at a time; only the keys the restore would
-/// delete are held, and the bucket's listing is streamed past them rather
-/// than collected. With no delete candidates the listing is skipped.
-async fn restore<U, S, P, A, O>(
-    fold: &mut Fold<U, S, P, A, O>,
-    mut restored: RestoredFold<S>,
-    reader: &dyn KvReader,
-    watcher: &dyn KvWatcher,
-    prefixes: &[String],
-) -> Result<Result<(), String>, KvError>
-where
-    U: Send,
-    S: SnapshotStore + Send + 'static,
-    P: FnMut(&KvUpdate) -> Option<U> + Send,
-    A: FnMut(Vec<U>) + Send,
-    O: FnMut(WatchCursor) + Send,
-{
-    let target = restored.manifest().cursor.clone();
-    let Some(st) = fold.take_store() else {
-        unreachable!("repairs are armed only with a store")
-    };
-    let prefixes = disjoint(prefixes);
-    let max = fold.batch_cap();
-    let scope = prefixes.clone();
-    let (st, r, diff) = tokio::task::spawn_blocking(move || {
-        let diff = (|| {
-            let mut spill = KeySpill::new(restored.scratch.as_deref())?;
-            let candidates = restore_diff(&st, restored.fold(), &scope, |key| {
-                spill.push(&key).map_err(SnapshotError::from)
-            })?;
-            Ok::<_, SnapshotError>((spill, candidates))
-        })();
-        (st, restored, diff)
-    })
-    .await
-    .map_err(|e| repair_fatal(format!("cursor-expired restore: diff task panicked: {e}")))?;
-    fold.put_store(st);
-    restored = r;
-    let (spill, mut deletes) = diff.map_err(|e| {
-        repair_fatal(format!(
-            "cursor-expired restore: diffing the fold against the artifact failed: {e}"
-        ))
-    })?;
-
-    // A delete candidate the bucket lists live is kept: its current value is a
-    // write after the artifact's cursor, which the resume delivers
-    // (`restore_key`'s `listed_live`). A failed listing fails the watch, like
-    // the key-listing repair's.
-    if !deletes.is_empty() {
-        for prefix in &prefixes {
-            reader
-                .for_each_key(prefix, &mut |key| {
-                    deletes.remove(&key);
-                })
-                .await
-                .map_err(|e| {
-                    repair_fatal(format!(
-                        "cursor-expired restore: listing live keys under {prefix:?} failed: {e}"
-                    ))
-                })?;
-        }
-        // The listing vouches for every write after the artifact's cursor only
-        // while the log still holds all of them: one that aged out before the
-        // listing is unlisted, and would be deleted. Retention only moves
-        // forward, so a check after the listing covers it
-        // (`tests/model_repair.rs`, `NoListingRecheck`). Nothing is folded yet.
-        if let Some(first) = watcher.retention().await?.map(|r| r.first_revision)
-            && !resume_window_ok(target.rank(), first)
-        {
-            let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
-            return Ok(Err(format!(
-                "cursor-expired restore: the log evicted writes after the artifact's cursor \
-                 ({:?}, first retained revision {first}) while the restore was listing live \
-                 keys, so the listing can't vouch for them; nothing was changed. Exports must \
-                 run well inside the bucket's max_age / discard turnover",
-                target
-            )));
-        }
-    }
-    info!(
-        from = ?fold.applied(),
-        to = ?target,
-        rewritten = spill.len(),
-        deleted = deletes.len(),
-        "cursor-expired restore: replacing the in-scope fold with the artifact's"
-    );
-
-    // Fold the difference through parse/apply/store in `max`-sized chunks,
-    // values read back per chunk. These carry no stream position: every chunk
-    // commits under the old cursor, so a crash part-way re-runs the
-    // (idempotent) restore on restart.
-    let mut spill = spill
-        .into_reader()
-        .map_err(|e| repair_fatal(format!("cursor-expired restore: reading scratch: {e}")))?;
-    loop {
-        let (r, sp, updates) = tokio::task::spawn_blocking(move || {
-            let updates = spill
-                .take(max)
-                .map_err(SnapshotError::from)
-                .and_then(|keys| materialize(restored.fold(), keys));
-            (restored, spill, updates)
-        })
-        .await
-        .map_err(|e| repair_fatal(format!("cursor-expired restore: read task panicked: {e}")))?;
-        restored = r;
-        spill = sp;
-        let updates = updates.map_err(|e| {
-            repair_fatal(format!(
-                "cursor-expired restore: reading the artifact failed: {e}"
-            ))
-        })?;
-        if updates.is_empty() {
-            break;
-        }
-        for u in updates {
-            fold.correct(u);
-        }
-        fold.flush().await?;
-    }
-    let mut deletes = deletes.into_iter();
-    loop {
-        let chunk: Vec<_> = deletes.by_ref().take(max).collect();
-        if chunk.is_empty() {
-            break;
-        }
-        for key in chunk {
-            fold.correct(restore_delete(key));
-        }
-        fold.flush().await?;
-    }
-    // Now the fold IS the artifact's (in scope): take its cursor, committed to
-    // the store with the final chunk's re-queued remainder, if any.
-    fold.advance_to(target);
-    fold.flush().await?;
-    // Closing an LSM can block; drop the temporary fold and its scratch dir
-    // off the async thread.
-    let _ = tokio::task::spawn_blocking(move || drop(restored)).await;
-    Ok(Ok(()))
 }
 
 #[cfg(test)]

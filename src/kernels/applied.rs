@@ -49,6 +49,36 @@ pub struct State {
     pub flush: Flush,
     /// A resync's synthetic deletes are being folded; the ack is owed after.
     pub relisting: bool,
+    /// Where an artifact restore is.
+    pub restore: Restore,
+}
+
+/// Where an artifact restore is. Every step waits on a fact the shell
+/// observes, so an event that arrives out of phase is ignored (a restart
+/// builds a fresh `State`: a crash part-way leaves the whole repair to re-run).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Restore {
+    #[default]
+    Idle,
+    /// Settled; waiting for the authoritative ahead check.
+    Ahead,
+    /// Diffing the fold against the artifact.
+    Diff,
+    /// Listing live keys for the delete candidates.
+    Listing,
+    /// Folding the difference under the old cursor.
+    Fold,
+}
+
+/// Why a restore changed nothing and replied with an error. The watch fails
+/// with it; the main loop carries on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// The artifact is not ahead of the fold: a restore never moves it back.
+    NotAhead,
+    /// The log evicted writes after the artifact's cursor while the live keys
+    /// were listed, so the listing cannot vouch for them.
+    WindowAged,
 }
 
 /// What the shell's queues hold, as facts.
@@ -104,6 +134,17 @@ pub enum Event {
     RepairRequested(RepairKind),
     /// The resync's synthetic deletes are folded.
     RelistFolded,
+    /// The authoritative ahead check ran: `ahead` is
+    /// `protocol::restore_ahead(artifact cursor, applied cursor)`.
+    RestoreAhead { ahead: bool },
+    /// The fold was diffed against the artifact: `has_deletes`, some key the
+    /// artifact lacks is a delete candidate.
+    RestoreDiffed { has_deletes: bool },
+    /// The live keys were listed and retention re-read after: `window_ok` is
+    /// `protocol::resume_window_ok(artifact cursor, first retained revision)`.
+    RestoreListed { window_ok: bool },
+    /// The difference is folded and flushed.
+    RestoreFolded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,8 +193,22 @@ pub enum Action {
     DrainBacklog,
     /// Run the resync's listing diff.
     RunRelist,
-    /// Run the artifact restore.
-    RunRestore,
+    /// The authoritative ahead check; answer with `RestoreAhead`.
+    CheckAhead,
+    /// Diff the fold against the artifact; answer with `RestoreDiffed`.
+    RunDiff,
+    /// List the live keys, then re-read retention; answer with `RestoreListed`.
+    ListLive,
+    /// Fold the difference in chunks, each flushed, under the OLD cursor;
+    /// answer with `RestoreFolded`.
+    FoldChunks,
+    /// Take the artifact's cursor and flush it, with the final chunk's
+    /// re-queued remainder if any.
+    CommitCursor,
+    /// Reply to the watch task with the artifact's cursor.
+    ReplyRestored,
+    /// Reply to the watch task with an error: nothing was changed.
+    Refuse(Refusal),
     /// Remember the eviction memo durably.
     RememberEvicting,
     /// Release the watch task parked on the resync: the deletes are folded.
@@ -355,10 +410,59 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                     a.push(Action::AckResync);
                     a.push(Action::RunRelist);
                 } else {
-                    a.push(Action::RunRestore);
+                    s.restore = Restore::Ahead;
+                    a.push(Action::CheckAhead);
                 }
             }
         },
+        Event::RestoreAhead { ahead } => {
+            if s.restore == Restore::Ahead {
+                // A restore never moves the fold backward.
+                if ahead {
+                    s.restore = Restore::Diff;
+                    a.push(Action::RunDiff);
+                } else {
+                    s.restore = Restore::Idle;
+                    a.push(Action::Refuse(Refusal::NotAhead));
+                }
+            }
+        }
+        Event::RestoreDiffed { has_deletes } => {
+            if s.restore == Restore::Diff {
+                // Nothing to delete: no listing to vouch for, so nothing to
+                // re-check.
+                if has_deletes {
+                    s.restore = Restore::Listing;
+                    a.push(Action::ListLive);
+                } else {
+                    s.restore = Restore::Fold;
+                    a.push(Action::FoldChunks);
+                }
+            }
+        }
+        Event::RestoreListed { window_ok } => {
+            if s.restore == Restore::Listing {
+                // The listing vouches for every write after the artifact's
+                // cursor only while the log still holds all of them.
+                if window_ok {
+                    s.restore = Restore::Fold;
+                    a.push(Action::FoldChunks);
+                } else {
+                    s.restore = Restore::Idle;
+                    a.push(Action::Refuse(Refusal::WindowAged));
+                }
+            }
+        }
+        Event::RestoreFolded => {
+            if s.restore == Restore::Fold {
+                s.restore = Restore::Idle;
+                // Now the fold IS the artifact's (in scope): its cursor
+                // commits with the final chunk's re-queued remainder, and only
+                // then does the watch task hear of it.
+                a.push(Action::CommitCursor);
+                a.push(Action::ReplyRestored);
+            }
+        }
         Event::RelistFolded => {
             // The ack barrier: the fallback watch starts only after the
             // synthetic deletes are folded, so a delete-then-recreate during
@@ -459,6 +563,82 @@ mod tests {
         assert_eq!(a.as_slice(), [Action::AckResync]);
         let (_, a) = step(s, Event::RelistFolded);
         assert!(a.as_slice().is_empty(), "one ack per resync");
+    }
+
+    /// Drive a restore through the kernel: the facts each step reports.
+    fn restore(ahead: bool, has_deletes: bool, window_ok: bool) -> Vec<Action> {
+        let mut seen = Vec::new();
+        let (mut s, a) = step(
+            State::default(),
+            Event::RepairRequested(RepairKind::Restore),
+        );
+        assert_eq!(
+            a.as_slice(),
+            [Action::DrainBacklog, Action::Settle, Action::CheckAhead]
+        );
+        seen.extend(a.as_slice());
+        let events = [
+            Event::RestoreAhead { ahead },
+            Event::RestoreDiffed { has_deletes },
+            Event::RestoreListed { window_ok },
+            Event::RestoreFolded,
+        ];
+        for e in events {
+            let (next, a) = step(s, e);
+            s = next;
+            seen.extend(a.as_slice());
+        }
+        assert_eq!(s.restore, Restore::Idle, "a restore ends idle");
+        seen
+    }
+
+    #[test]
+    fn a_restore_commits_the_cursor_after_the_diff_and_replies_last() {
+        let seen = restore(true, true, true);
+        assert_eq!(
+            &seen[3..],
+            [
+                Action::RunDiff,
+                Action::ListLive,
+                Action::FoldChunks,
+                Action::CommitCursor,
+                Action::ReplyRestored,
+            ]
+        );
+        // No delete candidate: no listing, so no window re-check.
+        let seen = restore(true, false, true);
+        assert_eq!(
+            &seen[3..],
+            [
+                Action::RunDiff,
+                Action::FoldChunks,
+                Action::CommitCursor,
+                Action::ReplyRestored,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restore_refuses_before_it_changes_anything() {
+        assert_eq!(
+            &restore(false, true, true)[3..],
+            [Action::Refuse(Refusal::NotAhead)]
+        );
+        assert_eq!(
+            &restore(true, true, false)[3..],
+            [
+                Action::RunDiff,
+                Action::ListLive,
+                Action::Refuse(Refusal::WindowAged)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restore_event_out_of_phase_is_ignored() {
+        let (s, a) = step(State::default(), Event::RestoreFolded);
+        assert!(a.as_slice().is_empty());
+        assert_eq!(s, State::default());
     }
 
     #[test]
