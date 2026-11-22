@@ -39,7 +39,7 @@ use tracing::{error, info, warn};
 use crate::applied::{Fold, WatchScope};
 use crate::artifact::ExportManifest;
 use crate::health::{RepairState, WatchHealth};
-use crate::kernels::applied::{Action, Event, RepairKind, Refusal};
+use crate::kernels::applied::{Action, Event, Refusal, RepairKind};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,

@@ -568,7 +568,10 @@ mod tests {
     /// Drive a restore through the kernel: the facts each step reports.
     fn restore(ahead: bool, has_deletes: bool, window_ok: bool) -> Vec<Action> {
         let mut seen = Vec::new();
-        let (mut s, a) = step(State::default(), Event::RepairRequested(RepairKind::Restore));
+        let (mut s, a) = step(
+            State::default(),
+            Event::RepairRequested(RepairKind::Restore),
+        );
         assert_eq!(
             a.as_slice(),
             [Action::DrainBacklog, Action::Settle, Action::CheckAhead]
