@@ -31,6 +31,25 @@
 //! Mutations the checker must catch: the key-listing repair on an evicting
 //! bucket, and a cursor-less start that re-lists an already-evicted bucket —
 //! each poisons the fleet's artifacts.
+//!
+//! **This check is bounded; it has an unbounded twin.** `src/kernels/fleet_proofs.rs`
+//! proves the same induction in Verus for any number of nodes, keys and writes, with
+//! the log's retention eviction and stream recreation, crash/restart at every point
+//! (even mid-restore), and the restore's own steps interleaved, over the same shared
+//! kernels (`applied::step_spec` through `applied_proofs`, and the `protocol` specs).
+//! What it adds, which this model cannot see:
+//!
+//! - on MANY keys the invariant is "complete together with the log after the cursor",
+//!   not "equals the truth at the cursor": a restore keeps a stale entry of a key the
+//!   bucket lists live (`restore_key`), and the resume delivers the later write
+//!   (`fleet_proofs::finding_f3_*`). With one key that entry is the truth, so the two
+//!   statements coincide here;
+//! - a restore over a fold of a RECREATED stream keeps stale entries by revision
+//!   number (`finding_f2_*`), and a dead incarnation's pointer refuses every publish
+//!   of the new stream (`finding_f1_*`); this model has one incarnation;
+//! - liveness as a ranking function under named fairness axioms (`nrank`).
+//!
+//! The proof's mutations are the same `mut_*` features: `mise run verify -- --features mut_x`.
 
 use slipstream::protocol::{
     PointerState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,

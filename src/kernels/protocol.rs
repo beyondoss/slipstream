@@ -252,14 +252,24 @@ pub fn same_incarnation(
     last_sequence: u64,
 ) -> (r: bool)
     ensures
-        r == match cursor_origin {
-            Some(origin) => origin == stream_origin,
-            None => revision <= last_sequence,
-        },
+        r == same_incarnation_spec(cursor_origin, revision, stream_origin, last_sequence),
         // A recorded origin decides alone: the position is never consulted, so a recreated stream refuses an old cursor
         // wherever it falls.
         cursor_origin is Some ==> (r <==> cursor_origin->Some_0 == stream_origin),
 {
+    match cursor_origin {
+        Some(origin) => origin == stream_origin,
+        None => revision <= last_sequence,
+    }
+}
+
+/// [`same_incarnation`]'s table.
+pub open spec fn same_incarnation_spec(
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream_origin: u64,
+    last_sequence: u64,
+) -> bool {
     match cursor_origin {
         Some(origin) => origin == stream_origin,
         None => revision <= last_sequence,
@@ -286,7 +296,7 @@ pub fn same_incarnation(
 /// (`GuardRepair`).
 pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> (r: bool)
     ensures
-        r == (artifact_revision > local_revision && resume_window_spec(artifact_revision, first_sequence)),
+        r == restore_allowed_spec(artifact_revision, local_revision, first_sequence),
         // Never backward, never stale: an admitted restore is strictly ahead of the fold and resumable from its cursor.
         r ==> artifact_revision > local_revision && first_sequence as int <= artifact_revision as int + 1,
 {
@@ -296,6 +306,11 @@ pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequen
     }
     restore_ahead(artifact_revision, local_revision)
         && resume_window_ok(artifact_revision, first_sequence)
+}
+
+/// [`restore_allowed`]: strictly ahead of the fold, and resumable from the artifact's cursor.
+pub open spec fn restore_allowed_spec(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
+    artifact_revision > local_revision && resume_window_spec(artifact_revision, first_sequence)
 }
 
 /// The "ahead" half of [`restore_allowed`], on its own: what the main loop

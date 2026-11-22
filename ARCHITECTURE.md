@@ -478,6 +478,43 @@ Proving `step` equal to its spec found that a failure streak above the bound (un
 
 Each `mut_*` feature turns an obligation red (`mise run verify -- --features mut_x`): `mut_drop_failed_batch`, `mut_no_ack_barrier`, `mut_no_drain`, `mut_no_settle_retry`, `mut_cursor_before_diff`, `mut_no_listing_recheck` (and `mut_no_restore_guard`) fail `step`'s proof of equality with `step_spec`, whose theorems above are the properties those mutations break; `mut_resume_from_memory` fails `resume_from`'s postcondition; the protocol ones fail their `ensures`.
 
+### What is proven about the fleet and the transport (Verus, no bound)
+
+`tests/model_fleet.rs`, `tests/model.rs` check three nodes and one key (Stateright). `src/kernels/fleet_proofs.rs` and `src/kernels/transport_proofs.rs` are their unbounded twins: any number of nodes, keys, writes, evictions, restarts and stream recreations. The log is a spec (`Log`: writes, deletes, head eviction, incarnation); the nodes run the production cursor kernel (`applied::step_spec`, through `applied_proofs::w_step`, one event at a time) and the production repair decisions through their `*_spec` tables (`restore_allowed_spec`, `plan_repair_spec`, `listing_truth_spec`, `cursorless_spec`, `restore_key_spec`, `same_incarnation`, `publish_allowed_spec`, `prunable_spec`). Nothing restates a decision. A mutation forges a decision's input exactly as the `mut_*` feature forges the code.
+
+| Theorem | Where | Says |
+| --- | --- | --- |
+| `a_fresh_fleet_satisfies_the_invariant` | `fleet_proofs.rs:1218` | base case: any number of fresh nodes over an empty log |
+| `every_fleet_action_preserves_the_invariant` | `fleet_proofs.rs:1241` | `finv` is inductive over every action of every node: deliver, flush, crash at any point (even mid-restore), floor guard on a foreign cursor, key-listing repair, restore (begin, chunks, commit), publish; and write, delete, head eviction, stream recreation |
+| `every_live_nodes_fold_is_the_truth_at_its_cursor` | `fleet_proofs.rs:1440` | a node of the current incarnation holds only real writes, and the truth at its cursor on every key not written since |
+| `every_published_artifact_is_the_truth_at_its_cursor` | `fleet_proofs.rs:1455` | the same of the pointer's artifact |
+| `a_converged_fold_is_the_truth` / `an_artifact_at_the_head_is_the_truth` | `fleet_proofs.rs:1470`, `:1483` | at the head every key is "not written since": exactly the truth |
+| `a_restore_leaves_the_fold_complete_at_both_cursors` | `fleet_proofs.rs:874` | `restore_key` over every key leaves a fold complete at the old cursor (a restore cut short is safe) and at the artifact's |
+| `a_restore_never_moves_a_key_backward_or_deletes_a_live_one` | `fleet_proofs.rs:934` | the kernel's per-key guarantees over the whole key space |
+| `the_trusted_listing_is_the_truth` | `fleet_proofs.rs:261` | a listing the planner trusts is the truth |
+| `folding_the_log_forward_keeps_a_fold_ok` | `fleet_proofs.rs:326` | delivery from `a` to `b` keeps a complete fold complete |
+| `a_node_is_converged_or_a_fair_step_lowers_its_rank_or_it_is_blocked` | `fleet_proofs.rs:1679` | liveness: a ranking function (`nrank`) every fair step lowers; a node is converged or blocked |
+| `a_converged_node_unblocks_every_blocked_one` | `fleet_proofs.rs:1879` | liveness: a converged node's publish is admitted and gives every blocked node an artifact |
+| `a_blocked_node_names_the_write_that_aged_out` | `fleet_proofs.rs:1928` | the one fail-stop is loud and exact: revision `first - 1` was evicted after the node's cursor and no artifact of this stream holds it |
+| `every_step_preserves_the_invariant` | `transport_proofs.rs:174` | transport invariant over every interleaving of N exporters, pruners and fetchers with stale reads |
+| `the_pointer_never_regresses` | `transport_proofs.rs:261` | the monotone-pointer theorem lifted to the whole protocol |
+| `prune_never_deletes_the_pointers_target` | `transport_proofs.rs:287` | whatever a pruner read, what it may delete is not the pointer's current target |
+| `a_fetch_gets_its_payload_or_a_detected_miss` | `transport_proofs.rs:305` | a fetch racing a prune gets the object its read named or a miss, never another payload; a miss means the pointer moved strictly past it |
+| `a_fresh_read_never_misses_without_a_publish`, `a_lost_cas_means_a_publish_happened` | `transport_proofs.rs:325`, `:337` | liveness: a refused fetch retries; a lost CAS is paid for by a publish |
+
+**The statement.** `finv`: every node of the current incarnation holds a real fold (every entry a write of the log) that is *complete* at its cursor `c`: equal to the truth at `c` on every key not written after `c`; every published artifact of the current incarnation likewise. Exact equality at `c` is not what the code keeps and is not an invariant (F3): an artifact at `C` is complete together with the log after `C`, and a restore keeps the stale entry of a key the bucket lists live (`restore_key`) because the resume delivers its later write. At the head every key is "not written since", so a converged node holds exactly the truth. The Stateright model (one key, atomic repair) cannot show the difference.
+
+**Environment axioms (the liveness rests on these and on nothing in slipstream).** *F-a* NATS delivers a received revision while its window holds; *F-b* the disk works (a flush lands, chunks fold, the commit flushes); *F-c* the object store answers (publish, the artifact read); *F-d* quiescence: from some point the log takes no more writes, evictions or recreations and nodes no more crashes. For the transport: *O1* a payload path names its content for ever; *O2* the pointer is written only by a publish; *O3* a compare-and-swap succeeds exactly when the object is unchanged since the read. Also: the retention config is constant inside an incarnation (the `seen_evicting` memo guards a toggle); positions are `u64`; the relist (key-listing repair) is one atomic step (its steps are `tests/model_repair.rs`, `tests/resync.rs`); a cursor with no recorded origin is `tests/model_incarnation.rs`'s.
+
+**Findings the proofs surfaced** (each a Verus-checked concrete state of the shipped decisions, in `fleet_proofs.rs`):
+
+- **F1** (`finding_f1_*`) the pointer guard compares ranks only, never the incarnation. A pointer whose artifact is the old stream's, ranked above the new head, refuses every publish of the new stream until the head passes it, while `same_incarnation` refuses to restore from it: a node that must restore has no artifact though other nodes hold the head. The unblock theorem assumes no such pointer.
+- **F2** (`finding_f2_*`) a restore over the fold of a recreated stream keeps old entries that carry a higher revision number than the artifact's (`restore_key` decides by revision number). The fleet's restore step requires the local entries be real writes of the log; a foreign fold is `blocked_by_foreign_fold`.
+- **F3** (`finding_f3_*`) the statement above.
+- **F4** (`finding_f4_*`) the eviction memo (`seen_evicting`) rides the cursor and survives a recreation, so on the new, un-evicted bucket the exact listing is distrusted and a restore is planned; a fleet whose nodes are all foreign has no node to publish an artifact of the new stream.
+
+`mise run verify` runs both files. Mutations (`--features mut_x`) turn these red: `mut_no_restore_guard` fails `lemma_begin` (the artifact is ahead of the cursor) and `prog_repair` (the artifact is inside the window); `mut_relist_on_evicting` and `mut_unanchored_relist` fail `lemma_relist` (the re-listed fold is the truth); `mut_restore_ignores_versions` and `mut_restore_ignores_listing` fail `a_restore_never_moves_a_key_backward_or_deletes_a_live_one`; `mut_resume_from_memory` fails `lemma_crash` and `a_restart_preserves_the_invariant`. `mut_no_eviction_memo` guards a retention toggle, which the closed world excludes; it fails `listing_is_truth`'s contract only. The `applied` ones (`mut_drop_failed_batch`, `mut_no_ack_barrier`, `mut_no_drain`, `mut_no_settle_retry`, `mut_cursor_before_diff`, `mut_no_listing_recheck`) fail `step`'s equality with `step_spec`, which every fleet node runs.
+
 ### Export Round State Machine
 
 ```
