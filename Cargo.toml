@@ -72,7 +72,7 @@ transport = ["dep:object_store", "dep:tar", "tokio/fs"]
 
 # MODEL-TEST MUTATIONS. Each breaks one decision in `kernels::applied` so the
 # matching Stateright model (`tests/model_applied.rs`,
-# `tests/model_resync_order.rs`) must find a counterexample. They exist only to
+# `tests/model_resync_order.rs`, `tests/model_repair.rs`) must find a counterexample. They exist only to
 # prove the models can fail. NEVER enable them in a production build: each one
 # reintroduces a data-loss or ordering bug. Run one with
 # `cargo test --test <model> --features mut_<name>`.
@@ -82,3 +82,24 @@ mut_drop_failed_batch = []
 mut_resume_from_memory = []
 # The resync acks before its synthetic deletes are folded.
 mut_no_ack_barrier = []
+# A repair does not drain the watch task's delivered backlog first.
+mut_no_drain = []
+# The pre-repair flush runs once instead of until the store holds everything.
+mut_no_settle_retry = []
+# A restore commits the artifact's cursor before it diffs the fold.
+mut_cursor_before_diff = []
+# A restore skips its ahead check and its listing window re-check, and the
+# watch task its `restore_allowed` guard.
+mut_no_restore_guard = []
+# A restore skips the window re-check after listing live keys.
+mut_no_listing_recheck = []
+# The key-listing diff is trusted on a bucket that evicts current values.
+mut_relist_on_evicting = []
+# A fold with data but no cursor is re-listed blind.
+mut_unanchored_relist = []
+# The restore takes the artifact's value even when the local one is newer.
+mut_restore_ignores_versions = []
+# The restore deletes keys the bucket lists live.
+mut_restore_ignores_listing = []
+# The fold forgets that it saw retention evict current values.
+mut_no_eviction_memo = []

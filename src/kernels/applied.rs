@@ -380,7 +380,9 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             }
         }
         Event::SettleCheck { raw_queued } => {
-            if raw_queued > 0 {
+            // Mutation (model tests only): settle with one flush, not until
+            // the store holds everything.
+            if raw_queued > 0 && !cfg!(feature = "mut_no_settle_retry") {
                 a.push(Action::Flush);
             }
         }
@@ -400,6 +402,8 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             RepairKind::Relist | RepairKind::Restore => {
                 // The repair diffs the STORE, so it sees everything delivered:
                 // drain the watch task's backlog, then settle.
+                // Mutation (model tests only): skip the drain.
+                #[cfg(not(feature = "mut_no_drain"))]
                 a.push(Action::DrainBacklog);
                 a.push(Action::Settle);
                 if kind == RepairKind::Relist {
@@ -418,8 +422,14 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
         Event::RestoreAhead { ahead } => {
             if s.restore == Restore::Ahead {
                 // A restore never moves the fold backward.
+                let ahead = ahead || cfg!(feature = "mut_no_restore_guard");
                 if ahead {
                     s.restore = Restore::Diff;
+                    // Mutation (model tests only): take the cursor before the
+                    // diff, so a crash between leaves a cursor past data the
+                    // store lacks.
+                    #[cfg(feature = "mut_cursor_before_diff")]
+                    a.push(Action::CommitCursor);
                     a.push(Action::RunDiff);
                 } else {
                     s.restore = Restore::Idle;
@@ -444,6 +454,11 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             if s.restore == Restore::Listing {
                 // The listing vouches for every write after the artifact's
                 // cursor only while the log still holds all of them.
+                let window_ok = window_ok
+                    || cfg!(any(
+                        feature = "mut_no_listing_recheck",
+                        feature = "mut_no_restore_guard"
+                    ));
                 if window_ok {
                     s.restore = Restore::Fold;
                     a.push(Action::FoldChunks);
@@ -459,6 +474,7 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                 // Now the fold IS the artifact's (in scope): its cursor
                 // commits with the final chunk's re-queued remainder, and only
                 // then does the watch task hear of it.
+                #[cfg(not(feature = "mut_cursor_before_diff"))]
                 a.push(Action::CommitCursor);
                 a.push(Action::ReplyRestored);
             }
@@ -550,7 +566,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "mut_no_ack_barrier"))]
+    #[cfg(not(any(feature = "mut_no_ack_barrier", feature = "mut_no_drain")))]
     #[test]
     fn a_resync_acks_only_after_its_deletes_are_folded() {
         let (s, a) = step(State::default(), Event::RepairRequested(RepairKind::Relist));
@@ -566,6 +582,12 @@ mod tests {
     }
 
     /// Drive a restore through the kernel: the facts each step reports.
+    #[cfg(not(any(
+        feature = "mut_no_drain",
+        feature = "mut_no_restore_guard",
+        feature = "mut_no_listing_recheck",
+        feature = "mut_cursor_before_diff"
+    )))]
     fn restore(ahead: bool, has_deletes: bool, window_ok: bool) -> Vec<Action> {
         let mut seen = Vec::new();
         let (mut s, a) = step(
@@ -592,6 +614,12 @@ mod tests {
         seen
     }
 
+    #[cfg(not(any(
+        feature = "mut_no_drain",
+        feature = "mut_no_restore_guard",
+        feature = "mut_no_listing_recheck",
+        feature = "mut_cursor_before_diff"
+    )))]
     #[test]
     fn a_restore_commits_the_cursor_after_the_diff_and_replies_last() {
         let seen = restore(true, true, true);
@@ -618,6 +646,12 @@ mod tests {
         );
     }
 
+    #[cfg(not(any(
+        feature = "mut_no_drain",
+        feature = "mut_no_restore_guard",
+        feature = "mut_no_listing_recheck",
+        feature = "mut_cursor_before_diff"
+    )))]
     #[test]
     fn a_restore_refuses_before_it_changes_anything() {
         assert_eq!(

@@ -40,19 +40,71 @@
 //! - **Every maximal run ends with the store and the domain state equal to
 //!   every write minus every real delete.**
 //!
-//! Mutations the checker must catch, one per step: no drain, no pre-repair
-//! flush retry (the bug), cursor committed before the restore diff, no ack
-//! barrier, no restore guard, key-listing diff on an evicting bucket.
+//! THE MODEL RUNS THE PRODUCTION KERNEL. The main loop's every repair decision
+//! (which steps run and in which order, the settle retry, the ahead check and
+//! the listing's window re-check with their refusals, when the cursor commits,
+//! when the reply and the ack go out) comes from
+//! `slipstream::cursor_kernel::step`, the function `repair::fold_in` calls.
+//! The model keeps environment state only (the log, the store, the channel,
+//! crashes) and feeds the kernel the facts the shell would observe:
+//! `RepairRequested`, `SettleCheck { raw_queued }`, `RestoreAhead`,
+//! `RestoreDiffed`, `RestoreListed`, `RestoreFolded`, `RelistFolded`; it runs
+//! the returned actions one for one, each its own step, with every
+//! interleaving of the environment between them. The per-key decisions are
+//! the protocol kernels (`plan_repair`, `restore_allowed`, `restore_ahead`,
+//! `listing_is_truth`, `cursorless_start_needs_repair`, `restore_key`,
+//! `resume_window_ok`).
+//!
+//! Fidelity: a flush inside `Settle`, `RunRelist`, `FoldChunks` and
+//! `CommitCursor` is one model step with its failure outcomes (the flush
+//! protocol itself is `tests/model_applied.rs`'s); `FoldChunks` is one chunk
+//! (the key is one). The listing is skipped when the diff has no delete
+//! candidate, as in `repair::restore_request`. Retention is read in the same
+//! step as the listing (it only moves forward, so a check after the listing
+//! covers it).
+//!
+//! Mutations are cargo features that break the KERNEL (see Cargo.toml), not
+//! the model; each is one test in this file, run with `--features mut_<name>`,
+//! and must turn a property red (the shipped tests step aside): `mut_no_drain`,
+//! `mut_no_settle_retry` (the bug this model found), `mut_cursor_before_diff`,
+//! `mut_no_restore_guard`, `mut_no_listing_recheck`, `mut_relist_on_evicting`,
+//! `mut_unanchored_relist`, `mut_restore_ignores_versions`,
+//! `mut_restore_ignores_listing`, `mut_no_eviction_memo`. `mut_no_ack_barrier`
+//! must stay green here (axiom 6 suffices; the barrier is defense in depth,
+//! load-bearing in `tests/model_resync_order.rs`). Every run terminates by
+//! itself (finite budgets); `run` asserts it stays under `MAX_DEPTH`.
 //!
 //! Axioms: correct exporters (an artifact at `c` holds the truth at `c` —
 //! discharged by `tests/model_fleet.rs`); a full re-list is not overrun by
 //! retention before it delivers what it found (axiom 6 of `tests/model.rs`).
 
+use slipstream::cursor_kernel::{Action, Event, RepairKind, State as K, step};
 use slipstream::protocol::{
     KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
     plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok,
 };
 use stateright::{Checker, Model, Property};
+
+/// Any kernel mutation feature is on: the shipped-kernel tests step aside and
+/// the one test for that feature asserts its counterexample.
+const MUTATED: bool = cfg!(any(
+    feature = "mut_no_drain",
+    feature = "mut_no_settle_retry",
+    feature = "mut_cursor_before_diff",
+    feature = "mut_no_ack_barrier",
+    feature = "mut_no_restore_guard",
+    feature = "mut_no_listing_recheck",
+    feature = "mut_relist_on_evicting",
+    feature = "mut_unanchored_relist",
+    feature = "mut_restore_ignores_versions",
+    feature = "mut_restore_ignores_listing",
+    feature = "mut_no_eviction_memo",
+));
+
+/// Longest run the checker may reach. Every run terminates on its own (the
+/// budgets and revision cap are finite); a run that hit this would be cut
+/// short, and `run` asserts none does.
+const MAX_DEPTH: usize = 120;
 
 /// Capacity of the revision array (bounds are per model: `max_rev`).
 const CAP: usize = 8;
@@ -105,21 +157,6 @@ enum WPhase {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum MPhase {
-    Idle,
-    /// Repair received; next: drain the channel.
-    Drain(Req),
-    /// Pre-repair flush (retried until the store holds everything).
-    PreFlush(Req, bool),
-    /// Key-listing diff: one flush of the synthetic delete, then ack.
-    RelistFlush(bool),
-    /// Restore: one flush of the diff (under the old cursor).
-    RestoreChunk(u8, bool),
-    /// Restore: the cursor commit, then reply.
-    RestoreCommit(u8, bool),
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct St {
     // --- the log
@@ -144,7 +181,16 @@ struct St {
     req: Option<Req>,
     reply: Option<Reply>,
     w: WPhase,
-    m: MPhase,
+    // --- the main loop: the kernel's state and the actions it still owes. The
+    // head action is the one in flight; the model decides none of them.
+    k: K,
+    todo: Vec<Action>,
+    /// The repair `todo` runs (its target).
+    run: Option<Req>,
+    /// A flush has completed under the head action.
+    fl: bool,
+    /// The restore's key operation (`None`: keep the local entry).
+    op: Option<Upd>,
     // --- budgets and latches
     crashes: u8,
     transients: u8,
@@ -185,36 +231,8 @@ enum Act {
     Crash,
     MRecv,
     MStartRepair,
-    MDrain,
     Flush(FlushOutcome),
     MNext,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mutation {
-    None,
-    NoDrain,
-    NoPreFlushRetry,
-    CursorBeforeDiff,
-    NoAckBarrier,
-    NoRestoreGuard,
-    RelistOnEvicting,
-    /// A fold with data but no cursor re-listed blind (the pre-fix start).
-    UnanchoredRelist,
-    /// The restore takes the artifact's value even when the local one is
-    /// newer (the pre-fix diff).
-    RestoreIgnoresVersions,
-    /// The restore deletes keys the bucket lists live (the pre-fix diff).
-    RestoreIgnoresListing,
-    /// The restore trusts its live-key listing without re-checking, after
-    /// taking it, that the log still holds everything past the artifact's
-    /// cursor: a write after the cursor that aged out first is unlisted, and
-    /// deleted.
-    NoListingRecheck,
-    /// The fold forgets that it saw retention evict current values: once the
-    /// operator turns eviction off (`config_forgot`), the planner trusts the
-    /// listing again, and the key-listing diff deletes a key that aged out.
-    NoEvictionMemo,
 }
 
 #[derive(Clone)]
@@ -223,7 +241,6 @@ struct RepairModel {
     /// The repair armed (`ExpiryRepair`'s mode).
     mode: RepairMode,
     fresh: bool,
-    mutation: Mutation,
     /// Let retention evict during a key-listing repair (see `actions`).
     drop_axiom_6: bool,
     /// The bucket evicts (`evicting`), but its config no longer says so: the
@@ -260,13 +277,10 @@ impl RepairModel {
     }
 
     /// The listing as the planner sees it: the shared kernel on the bucket's
-    /// retention. `RelistOnEvicting` forges it as the truth.
+    /// retention and what the fold saw.
     fn listing_truth(&self, s: &St) -> Option<bool> {
-        if self.mutation == Mutation::RelistOnEvicting {
-            return Some(true);
-        }
         let reported = self.evicting && !self.config_forgot;
-        let seen = self.evicting && s.evicted && self.mutation != Mutation::NoEvictionMemo;
+        let seen = self.evicting && s.evicted;
         Some(listing_is_truth(reported, Self::first_revision(s), seen))
     }
 
@@ -307,7 +321,12 @@ impl RepairModel {
         s.req = None;
         s.reply = None;
         s.w = WPhase::Start;
-        s.m = MPhase::Idle;
+        // The fold is rebuilt: a fresh kernel state, nothing owed.
+        s.k = K::default();
+        s.todo.clear();
+        s.run = None;
+        s.fl = false;
+        s.op = None;
     }
 
     fn ingest(s: &mut St, u: Upd) {
@@ -366,7 +385,7 @@ impl RepairModel {
             FlushOutcome::Transient => {
                 s.transients += 1;
                 s.streak += 1;
-                if matches!(s.m, MPhase::PreFlush(..)) {
+                if s.todo.first() == Some(&Action::Settle) {
                     s.requeued_at_repair = true;
                 }
                 if s.streak >= FAILSTOP_STREAK {
@@ -397,23 +416,24 @@ impl RepairModel {
     }
 
     /// `restore_diff` on the key, through the shared kernel: the artifact at
-    /// `target` holds the truth there. `RestoreIgnoresVersions` forges both
-    /// sides revisionless (the pre-fix diff: take anything not identical);
-    /// `RestoreIgnoresListing` forges the key unlisted.
-    fn restore_op(&self, s: &St, target: u8, listed: Option<u8>) -> Option<Upd> {
+    /// `target` holds the truth there. `listed_live`: the bucket lists the key
+    /// live (taken after the diff).
+    fn restore_op(s: &St, target: u8, listed_live: bool) -> KeyRestore {
         let want = Self::truth_at(s, target);
-        let versions = self.mutation != Mutation::RestoreIgnoresVersions;
         let state = |v: Option<u8>| match v {
-            Some(r) => KeyState::At(versions.then_some(r as u64)),
+            Some(r) => KeyState::At(Some(r as u64)),
             None => KeyState::Absent,
         };
-        let listed_live = listed.is_some() && self.mutation != Mutation::RestoreIgnoresListing;
         let identical = s.store_val.is_some() && s.store_val == want;
-        match restore_key(state(s.store_val), state(want), identical, listed_live) {
+        restore_key(state(s.store_val), state(want), identical, listed_live)
+    }
+
+    fn upd(target: u8, s: &St, r: KeyRestore) -> Option<Upd> {
+        match r {
             KeyRestore::Keep => None,
             KeyRestore::TakeArtifact => Some(Upd {
                 pos: None,
-                value: want,
+                value: Self::truth_at(s, target),
             }),
             KeyRestore::Delete => Some(Upd {
                 pos: None,
@@ -434,9 +454,85 @@ impl RepairModel {
         }
     }
 
-    fn restore_ok(&self, s: &St, target: u8, local: u8) -> bool {
-        self.mutation == Mutation::NoRestoreGuard
-            || (target > 0 && restore_allowed(target as u64, local as u64, Self::first_revision(s)))
+    fn restore_ok(s: &St, target: u8, local: u8) -> bool {
+        target > 0 && restore_allowed(target as u64, local as u64, Self::first_revision(s))
+    }
+
+    /// Feed the kernel one event; its actions replace the head of `todo`
+    /// (`pop`: the head just finished), in order, and the new head is entered.
+    fn feed(&self, s: &mut St, pop: bool, e: Event) {
+        let (k, acts) = step(s.k, e);
+        s.k = k;
+        if pop {
+            s.todo.remove(0);
+        }
+        for (i, a) in acts.as_slice().iter().enumerate() {
+            s.todo.insert(i, *a);
+        }
+        s.fl = false;
+        self.enter(s);
+    }
+
+    /// The head action begins: what the shell does the moment it runs it,
+    /// before its flush. The listing diff's synthetic delete, the restore's
+    /// key operation and the cursor take their places in the queue.
+    fn enter(&self, s: &mut St) {
+        match s.todo.first() {
+            None => s.run = None,
+            Some(Action::RunRelist) => {
+                // List, then diff the STORE against the listing.
+                if s.store_val.is_some() && Self::listed(s).is_none() {
+                    let u = Upd {
+                        pos: None,
+                        value: None,
+                    };
+                    s.batch.push(u);
+                    s.raw.push(u);
+                }
+                s.relisted = true;
+            }
+            Some(Action::FoldChunks) => {
+                if let Some(u) = s.op.take() {
+                    s.batch.push(u);
+                    s.raw.push(u);
+                }
+            }
+            Some(Action::CommitCursor) => {
+                if let Some(Req::Restore { target }) = s.run {
+                    s.batch_high = Some(target);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// The head action ran to completion: drop it, enter the next.
+    fn finish(&self, s: &mut St) {
+        s.todo.remove(0);
+        s.fl = false;
+        self.enter(s);
+    }
+
+    /// A repair arrived at the main loop.
+    fn feed_request(&self, s: &mut St, kind: RepairKind) {
+        let (k, acts) = step(s.k, Event::RepairRequested(kind));
+        s.k = k;
+        s.todo = acts.as_slice().to_vec();
+        s.fl = false;
+        self.enter(s);
+    }
+
+    /// The head action needs a flush to settle: the kernel's settle check
+    /// says the store is still behind the queue.
+    fn settle_flushes(s: &St) -> bool {
+        step(
+            s.k,
+            Event::SettleCheck {
+                raw_queued: s.raw.len(),
+            },
+        )
+        .1
+        .contains(Action::Flush)
     }
 }
 
@@ -465,7 +561,11 @@ impl Model for RepairModel {
             req: None,
             reply: None,
             w: WPhase::Start,
-            m: MPhase::Idle,
+            k: K::default(),
+            todo: vec![],
+            run: None,
+            fl: false,
+            op: None,
             crashes: 0,
             transients: 0,
             regressed: false,
@@ -497,12 +597,7 @@ impl Model for RepairModel {
             && (matches!(s.w, WPhase::Watch { f, guarded: false } if f < s.head)
                 || matches!(s.w, WPhase::AwaitAck)
                 || matches!(s.req, Some(Req::Relist))
-                || matches!(
-                    s.m,
-                    MPhase::Drain(Req::Relist)
-                        | MPhase::PreFlush(Req::Relist, _)
-                        | MPhase::RelistFlush(_)
-                ));
+                || matches!(s.run, Some(Req::Relist)));
         let evictable = if self.evicting {
             true
         } else {
@@ -552,8 +647,8 @@ impl Model for RepairModel {
                 acts.push(Act::Flush(FlushOutcome::CrashTorn));
             }
         };
-        match s.m {
-            MPhase::Idle => {
+        match s.todo.first() {
+            None => {
                 // Superset of the biased select: receive is allowed even with
                 // a repair pending (the drain makes either order safe).
                 if !s.chan.is_empty() {
@@ -566,31 +661,27 @@ impl Model for RepairModel {
                     flush_outcomes(acts);
                 }
             }
-            MPhase::Drain(_) => acts.push(Act::MDrain),
-            MPhase::PreFlush(_, attempted) => {
-                let retry = self.mutation != Mutation::NoPreFlushRetry || !attempted;
-                if Self::flushable(s) && retry {
+            // Settle: flush, then again while the kernel says the store is
+            // still behind.
+            Some(Action::Settle) => {
+                if Self::flushable(s) && (!s.fl || Self::settle_flushes(s)) {
                     flush_outcomes(acts);
                 }
-                let done = if self.mutation == Mutation::NoPreFlushRetry {
-                    attempted || !Self::flushable(s)
-                } else {
-                    !Self::flushable(s)
-                };
-                if done {
+                if (s.fl || !Self::flushable(s)) && !(s.fl && Self::settle_flushes(s)) {
                     acts.push(Act::MNext);
                 }
             }
-            MPhase::RelistFlush(attempted)
-            | MPhase::RestoreChunk(_, attempted)
-            | MPhase::RestoreCommit(_, attempted) => {
-                if !attempted && Self::flushable(s) {
+            // One flush attempt, then on (a transient failure leaves the
+            // remainder re-queued for the next flush).
+            Some(Action::RunRelist | Action::FoldChunks | Action::CommitCursor) => {
+                if !s.fl && Self::flushable(s) {
                     flush_outcomes(acts);
                 }
-                if attempted || !Self::flushable(s) {
+                if s.fl || !Self::flushable(s) {
                     acts.push(Act::MNext);
                 }
             }
+            Some(_) => acts.push(Act::MNext),
         }
         if s.crashes < self.max_crashes {
             acts.push(Act::Crash);
@@ -613,8 +704,7 @@ impl Model for RepairModel {
                     // empty fold on a bucket that already evicted current
                     // values: repair like an expiry at 0. `UnanchoredRelist`
                     // forges the fold empty.
-                    let has_data =
-                        s.store_val.is_some() && self.mutation != Mutation::UnanchoredRelist;
+                    let has_data = s.store_val.is_some();
                     if cursorless_start_needs_repair(self.mode, has_data, self.listing_truth(&s)) {
                         WPhase::Expired { local: 0 }
                     } else {
@@ -652,7 +742,7 @@ impl Model for RepairModel {
                         // Peek + fetch collapsed onto the CURRENT pointer
                         // (the code re-checks what it fetched against now).
                         let target = s.pointer;
-                        if self.restore_ok(&s, target, local) && target > 0 {
+                        if Self::restore_ok(&s, target, local) {
                             s.req = Some(Req::Restore { target });
                             s.w = WPhase::AwaitReply;
                         } else {
@@ -661,14 +751,7 @@ impl Model for RepairModel {
                     }
                     RepairPlan::Relist => {
                         s.req = Some(Req::Relist);
-                        s.w = if self.mutation == Mutation::NoAckBarrier {
-                            WPhase::Watch {
-                                f: 0,
-                                guarded: false,
-                            }
-                        } else {
-                            WPhase::AwaitAck
-                        };
+                        s.w = WPhase::AwaitAck;
                     }
                     RepairPlan::RefuseRelist => s.w = WPhase::Failed,
                     RepairPlan::ReListOnly => {
@@ -700,99 +783,78 @@ impl Model for RepairModel {
             }
             Act::MStartRepair => {
                 let req = s.req.take()?;
-                s.m = MPhase::Drain(req);
-            }
-            Act::MDrain => {
-                let MPhase::Drain(req) = s.m else { return None };
-                if self.mutation != Mutation::NoDrain {
-                    if !s.chan.is_empty() {
-                        s.drained_backlog = true;
-                    }
-                    for u in std::mem::take(&mut s.chan) {
-                        Self::ingest(&mut s, u);
-                    }
-                }
-                s.m = MPhase::PreFlush(req, false);
+                s.run = Some(req);
+                let kind = match req {
+                    Req::Relist => RepairKind::Relist,
+                    Req::Restore { .. } => RepairKind::Restore,
+                };
+                s.todo.clear();
+                self.feed_request(&mut s, kind);
             }
             Act::Flush(outcome) => {
-                let before = s.m;
                 if Self::flush(&mut s, outcome) {
-                    s.m = match before {
-                        MPhase::PreFlush(r, _) => MPhase::PreFlush(r, true),
-                        MPhase::RelistFlush(_) => MPhase::RelistFlush(true),
-                        MPhase::RestoreChunk(t, _) => MPhase::RestoreChunk(t, true),
-                        MPhase::RestoreCommit(t, _) => MPhase::RestoreCommit(t, true),
-                        other => other,
-                    };
+                    s.fl = true;
                 }
             }
-            Act::MNext => match s.m {
-                MPhase::PreFlush(Req::Relist, _) => {
-                    // List, then diff the STORE against the listing.
-                    if s.store_val.is_some() && Self::listed(&s).is_none() {
-                        let u = Upd {
-                            pos: None,
-                            value: None,
-                        };
-                        s.batch.push(u);
-                        s.raw.push(u);
-                    }
-                    s.relisted = true;
-                    s.m = MPhase::RelistFlush(false);
-                }
-                MPhase::PreFlush(Req::Restore { target }, _) => {
-                    // The authoritative ahead check.
-                    if self.mutation != Mutation::NoRestoreGuard
-                        && !restore_ahead(target as u64, s.applied as u64)
-                    {
-                        s.reply = Some(Reply::Refused);
-                        s.m = MPhase::Idle;
-                    } else if !matches!(
-                        self.mutation,
-                        Mutation::NoListingRecheck | Mutation::NoRestoreGuard
-                    ) && !resume_window_ok(target as u64, Self::first_revision(&s))
-                    {
-                        // The listing (taken here) can only be trusted for
-                        // writes after the artifact's cursor while the log
-                        // still holds all of them.
-                        s.reply = Some(Reply::Refused);
-                        s.m = MPhase::Idle;
-                    } else if self.mutation == Mutation::CursorBeforeDiff {
-                        s.batch_high = Some(target);
-                        s.m = MPhase::RestoreCommit(target, false);
-                    } else {
-                        if let Some(u) = self.restore_op(&s, target, Self::listed(&s)) {
-                            s.batch.push(u);
-                            s.raw.push(u);
+            Act::MNext => {
+                let head = *s.todo.first()?;
+                let target = match s.run {
+                    Some(Req::Restore { target }) => target,
+                    _ => 0,
+                };
+                match head {
+                    Action::DrainBacklog => {
+                        if !s.chan.is_empty() {
+                            s.drained_backlog = true;
                         }
-                        s.m = MPhase::RestoreChunk(target, false);
+                        for u in std::mem::take(&mut s.chan) {
+                            Self::ingest(&mut s, u);
+                        }
+                        self.finish(&mut s);
                     }
-                }
-                MPhase::RelistFlush(_) => {
-                    s.reply = Some(Reply::Ack);
-                    s.m = MPhase::Idle;
-                }
-                MPhase::RestoreChunk(target, _) => {
-                    s.batch_high = Some(target);
-                    s.m = MPhase::RestoreCommit(target, false);
-                }
-                MPhase::RestoreCommit(target, _) => {
-                    if self.mutation == Mutation::CursorBeforeDiff && !s.restored {
-                        // The diff, after the cursor already moved.
+                    Action::Settle | Action::CommitCursor => self.finish(&mut s),
+                    Action::RunRelist => self.feed(&mut s, true, Event::RelistFolded),
+                    Action::FoldChunks => {
                         s.restored = true;
-                        if let Some(u) = self.restore_op(&s, target, Self::listed(&s)) {
-                            s.batch.push(u);
-                            s.raw.push(u);
-                        }
-                        s.m = MPhase::RestoreChunk(target, false);
-                        return Some(s);
+                        self.feed(&mut s, true, Event::RestoreFolded);
                     }
-                    s.restored = true;
-                    s.reply = Some(Reply::Restored(target));
-                    s.m = MPhase::Idle;
+                    Action::CheckAhead => {
+                        let ahead = restore_ahead(target as u64, s.applied as u64);
+                        self.feed(&mut s, true, Event::RestoreAhead { ahead });
+                    }
+                    Action::RunDiff => {
+                        // The diff, before the listing: a key the artifact
+                        // lacks is a delete candidate.
+                        let r = Self::restore_op(&s, target, false);
+                        s.op = Self::upd(target, &s, r);
+                        let has_deletes = r == KeyRestore::Delete;
+                        self.feed(&mut s, true, Event::RestoreDiffed { has_deletes });
+                    }
+                    Action::ListLive => {
+                        // The listing, then the retention re-read: the live
+                        // key is kept, and the window must still hold every
+                        // write past the artifact's cursor.
+                        let r = Self::restore_op(&s, target, Self::listed(&s).is_some());
+                        s.op = Self::upd(target, &s, r);
+                        let window_ok = resume_window_ok(target as u64, Self::first_revision(&s));
+                        self.feed(&mut s, true, Event::RestoreListed { window_ok });
+                    }
+                    Action::Refuse(_) => {
+                        s.reply = Some(Reply::Refused);
+                        s.todo.clear();
+                        s.run = None;
+                    }
+                    Action::ReplyRestored => {
+                        s.reply = Some(Reply::Restored(target));
+                        self.finish(&mut s);
+                    }
+                    Action::AckResync => {
+                        s.reply = Some(Reply::Ack);
+                        self.finish(&mut s);
+                    }
+                    other => unreachable!("model: {other:?}"),
                 }
-                _ => return None,
-            },
+            }
         }
         Some(s)
     }
@@ -827,7 +889,7 @@ impl Model for RepairModel {
                 },
             ),
         ];
-        if self.mutation == Mutation::None {
+        if !MUTATED {
             // The theorems are earned: the repairs run, the hazards they
             // guard against occur.
             if self.evicting {
@@ -855,11 +917,22 @@ impl Model for RepairModel {
 }
 
 fn run(model: RepairModel, label: &str) -> impl Checker<RepairModel> {
-    let checker = model.checker().spawn_bfs().join();
+    let started = std::time::Instant::now();
+    let checker = model
+        .checker()
+        .target_max_depth(MAX_DEPTH)
+        .spawn_bfs()
+        .join();
     println!(
-        "{label}: {} states, {} unique",
+        "{label}: {} states, {} unique, depth {}, {:?}",
         checker.state_count(),
-        checker.unique_state_count()
+        checker.unique_state_count(),
+        checker.max_depth(),
+        started.elapsed(),
+    );
+    assert!(
+        checker.max_depth() < MAX_DEPTH,
+        "{label}: the run reached the depth bound; raise MAX_DEPTH"
     );
     checker
 }
@@ -875,7 +948,6 @@ fn shipped(evicting: bool, fresh: bool) -> RepairModel {
             RepairMode::Relist
         },
         fresh,
-        mutation: Mutation::None,
         drop_axiom_6: false,
         config_forgot: false,
         max_rev: 4,
@@ -884,8 +956,47 @@ fn shipped(evicting: bool, fresh: bool) -> RepairModel {
     }
 }
 
+const NAMES: [&str; 6] = [
+    "while the store's cursor is resumable, the store plus the tail is the truth",
+    "the store's cursor never moves backward",
+    "the domain never sees the key's revision go backward",
+    "a repair never deletes the key's current value",
+    "while the applied cursor is resumable, the domain plus the tail is the truth",
+    "every maximal run ends with the store and domain equal to every write minus every real delete",
+];
+
+/// A kernel mutation must produce a counterexample to at least one safety or
+/// terminal property, on each bucket kind it applies to.
+fn assert_load_bearing(feature: &str, cases: &[(bool, bool)]) {
+    for &(evicting, fresh) in cases {
+        let label = format!(
+            "{feature}: {}{}",
+            if evicting {
+                "evicting"
+            } else {
+                "keeps-current"
+            },
+            if fresh { ", fresh" } else { "" }
+        );
+        let checker = run(shipped(evicting, fresh), &label);
+        let found: Vec<&str> = NAMES
+            .iter()
+            .copied()
+            .filter(|n| checker.discovery(n).is_some())
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "{label}: the checker found no counterexample"
+        );
+        println!("  caught by: {found:?}");
+    }
+}
+
 #[test]
 fn keeps_current_repair_steps_are_correct() {
+    if MUTATED {
+        return;
+    }
     run(shipped(false, false), "repair steps: keeps-current").assert_properties();
     run(
         RepairModel {
@@ -899,6 +1010,9 @@ fn keeps_current_repair_steps_are_correct() {
 
 #[test]
 fn evicting_repair_steps_are_correct() {
+    if MUTATED {
+        return;
+    }
     run(shipped(true, false), "repair steps: evicting").assert_properties();
 }
 
@@ -907,6 +1021,9 @@ fn evicting_repair_steps_are_correct() {
 /// still restores rather than diffing the listing.
 #[test]
 fn eviction_turned_off_repair_steps_are_correct() {
+    if MUTATED {
+        return;
+    }
     run(
         RepairModel {
             config_forgot: true,
@@ -917,118 +1034,13 @@ fn eviction_turned_off_repair_steps_are_correct() {
     .assert_properties();
 }
 
-/// The key-listing resync stays correct without the ack barrier now that the
-/// main loop takes the listing after its drain (axiom 6 suffices); the
-/// barrier is defense in depth.
-#[test]
-fn relist_holds_without_the_ack_barrier() {
-    run(
-        RepairModel {
-            mutation: Mutation::NoAckBarrier,
-            ..shipped(false, false)
-        },
-        "repair steps: keeps-current, no ack barrier",
-    )
-    .assert_properties();
-}
-
-/// Without the memo, the same run deletes the key that aged out.
-#[test]
-fn eviction_memo_is_load_bearing() {
-    let checker = run(
-        RepairModel {
-            config_forgot: true,
-            mutation: Mutation::NoEvictionMemo,
-            ..shipped(true, false)
-        },
-        "repair steps: eviction turned off, no memo",
-    );
-    assert!(
-        checker
-            .discovery("a repair never deletes the key's current value")
-            .is_some(),
-        "the checker found no deleted aged-out key without the memo"
-    );
-}
-
 #[test]
 fn fresh_start_repair_steps_are_correct() {
+    if MUTATED {
+        return;
+    }
     run(shipped(false, true), "repair steps: keeps-current, fresh").assert_properties();
     run(shipped(true, true), "repair steps: evicting, fresh").assert_properties();
-}
-
-/// Every mutation must produce a counterexample to at least one safety or
-/// terminal property, on the bucket kind it applies to.
-#[test]
-fn every_repair_step_is_load_bearing() {
-    let cases = [
-        (Mutation::NoDrain, true, false),
-        (Mutation::NoDrain, false, false),
-        (Mutation::NoPreFlushRetry, false, false),
-        (Mutation::NoPreFlushRetry, true, false),
-        (Mutation::CursorBeforeDiff, true, false),
-        // Not `NoAckBarrier`: the main loop lists the live keys itself, after
-        // draining the backlog, so a re-list put that races the diff is
-        // followed by its key's delete marker on the same watch; axiom 6
-        // alone keeps the resync correct. The barrier stays as defense in
-        // depth (and is still load-bearing in `tests/model_resync_order.rs`,
-        // which models a listing taken before the handoff).
-        (Mutation::NoRestoreGuard, true, false),
-        (Mutation::RelistOnEvicting, true, false),
-        (Mutation::UnanchoredRelist, false, true),
-        (Mutation::RestoreIgnoresVersions, true, false),
-        (Mutation::RestoreIgnoresListing, true, false),
-        (Mutation::NoListingRecheck, true, false),
-    ];
-    let names = [
-        "while the store's cursor is resumable, the store plus the tail is the truth",
-        "the store's cursor never moves backward",
-        "the domain never sees the key's revision go backward",
-        "a repair never deletes the key's current value",
-        "while the applied cursor is resumable, the domain plus the tail is the truth",
-        "every maximal run ends with the store and domain equal to every write minus every real delete",
-    ];
-    for (mutation, evicting, fresh) in cases {
-        let label = format!(
-            "mutation {}: {}",
-            match mutation {
-                Mutation::None => "none",
-                Mutation::NoDrain => "no drain",
-                Mutation::NoPreFlushRetry => "no pre-repair flush retry",
-                Mutation::CursorBeforeDiff => "cursor before diff",
-                Mutation::NoAckBarrier => "no ack barrier",
-                Mutation::NoRestoreGuard => "no restore guard",
-                Mutation::RelistOnEvicting => "relist on evicting",
-                Mutation::UnanchoredRelist => "unanchored fold re-listed blind",
-                Mutation::RestoreIgnoresVersions => "restore ignores versions",
-                Mutation::RestoreIgnoresListing => "restore ignores the live listing",
-                Mutation::NoListingRecheck => "restore trusts a listing taken after eviction",
-                Mutation::NoEvictionMemo => "no eviction memo",
-            },
-            if evicting {
-                "evicting"
-            } else {
-                "keeps-current"
-            }
-        );
-        let checker = run(
-            RepairModel {
-                mutation,
-                ..shipped(evicting, fresh)
-            },
-            &label,
-        );
-        let found: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|n| checker.discovery(n).is_some())
-            .collect();
-        assert!(
-            !found.is_empty(),
-            "{label}: the checker found no counterexample"
-        );
-        println!("  caught by: {found:?}");
-    }
 }
 
 /// The axiom the key-listing repair rests on, made explicit: drop it and the
@@ -1037,6 +1049,9 @@ fn every_repair_step_is_load_bearing() {
 /// not need it — the evicting configuration holds without the axiom.
 #[test]
 fn relist_window_needs_axiom_6() {
+    if MUTATED {
+        return;
+    }
     let checker = run(
         RepairModel {
             drop_axiom_6: true,
@@ -1045,11 +1060,7 @@ fn relist_window_needs_axiom_6() {
         "repair steps: keeps-current, axiom 6 dropped",
     );
     assert!(
-        checker
-            .discovery(
-                "every maximal run ends with the store and domain equal to every write minus every real delete"
-            )
-            .is_some(),
+        checker.discovery(NAMES[5]).is_some(),
         "without axiom 6 the relist window must be reachable"
     );
     run(
@@ -1067,6 +1078,9 @@ fn relist_window_needs_axiom_6() {
 #[test]
 #[ignore = "deep bounds: run in release"]
 fn deep_repair_steps() {
+    if MUTATED {
+        return;
+    }
     for (evicting, fresh) in [(false, false), (true, false), (false, true), (true, true)] {
         run(
             RepairModel {
@@ -1079,4 +1093,102 @@ fn deep_repair_steps() {
         )
         .assert_properties();
     }
+}
+
+// Kernel mutations: one feature per run (`--features mut_<name>`); the
+// shipped-kernel tests above step aside.
+
+/// The repair does not drain the delivered backlog first.
+#[cfg(feature = "mut_no_drain")]
+#[test]
+fn no_drain_is_caught() {
+    assert_load_bearing("mut_no_drain", &[(true, false), (false, false)]);
+}
+
+/// The pre-repair flush runs once, not until the store holds everything (the
+/// bug this model found).
+#[cfg(feature = "mut_no_settle_retry")]
+#[test]
+fn no_settle_retry_is_caught() {
+    assert_load_bearing("mut_no_settle_retry", &[(false, false), (true, false)]);
+}
+
+/// The restore commits the artifact's cursor before the diff.
+#[cfg(feature = "mut_cursor_before_diff")]
+#[test]
+fn cursor_before_diff_is_caught() {
+    assert_load_bearing("mut_cursor_before_diff", &[(true, false)]);
+}
+
+/// The restore guards (watch task's `restore_allowed`, the main loop's ahead
+/// and window checks) are gone.
+#[cfg(feature = "mut_no_restore_guard")]
+#[test]
+fn no_restore_guard_is_caught() {
+    assert_load_bearing("mut_no_restore_guard", &[(true, false)]);
+}
+
+/// The restore trusts a listing taken after retention evicted writes.
+#[cfg(feature = "mut_no_listing_recheck")]
+#[test]
+fn no_listing_recheck_is_caught() {
+    assert_load_bearing("mut_no_listing_recheck", &[(true, false)]);
+}
+
+/// The key-listing diff on a bucket that evicts current values.
+#[cfg(feature = "mut_relist_on_evicting")]
+#[test]
+fn relist_on_evicting_is_caught() {
+    assert_load_bearing("mut_relist_on_evicting", &[(true, false)]);
+}
+
+/// A fold with data but no cursor is re-listed blind (the pre-fix start).
+#[cfg(feature = "mut_unanchored_relist")]
+#[test]
+fn unanchored_relist_is_caught() {
+    assert_load_bearing("mut_unanchored_relist", &[(false, true)]);
+}
+
+/// The restore takes the artifact's value even when the local one is newer.
+#[cfg(feature = "mut_restore_ignores_versions")]
+#[test]
+fn restore_ignoring_versions_is_caught() {
+    assert_load_bearing("mut_restore_ignores_versions", &[(true, false)]);
+}
+
+/// The restore deletes keys the bucket lists live.
+#[cfg(feature = "mut_restore_ignores_listing")]
+#[test]
+fn restore_ignoring_the_listing_is_caught() {
+    assert_load_bearing("mut_restore_ignores_listing", &[(true, false)]);
+}
+
+/// The fold forgets that it saw retention evict current values: once the
+/// operator turns eviction off, the key-listing diff deletes a key that aged
+/// out.
+#[cfg(feature = "mut_no_eviction_memo")]
+#[test]
+fn eviction_memo_is_load_bearing() {
+    let checker = run(
+        RepairModel {
+            config_forgot: true,
+            ..shipped(true, false)
+        },
+        "mut_no_eviction_memo: eviction turned off",
+    );
+    assert!(
+        checker.discovery(NAMES[3]).is_some(),
+        "the checker found no deleted aged-out key without the memo"
+    );
+}
+
+/// The key-listing resync stays correct without the ack barrier now that the
+/// main loop takes the listing after its drain (axiom 6 suffices); the
+/// barrier is defense in depth (still load-bearing in
+/// `tests/model_resync_order.rs`, which models a listing taken before the
+/// handoff).
+#[cfg(feature = "mut_no_ack_barrier")]
+#[test]
+fn relist_holds_without_the_ack_barrier() {
+    run(shipped(false, false), "mut_no_ack_barrier: keeps-current").assert_properties();
 }
