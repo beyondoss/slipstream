@@ -5,7 +5,7 @@
 //!
 //! # The world
 //!
-//! The object store holds immutable, content-addressed payload objects (`<cursor>-<digest of the manifest>`: [`Payload`]) and one
+//! The object store holds immutable, content-addressed payload objects (`<incarnation>-<cursor>-<digest of the manifest>`: [`Payload`]) and one
 //! pointer object, swapped by compare-and-swap (`transport::swap_pointer`; [`TS::ver`] counts successful swaps, and a CAS only
 //! succeeds against the version the publisher read). An exporter runs `Upload`, then reads the pointer and applies the guard
 //! (`Observe`), then swaps (`Swap`); a refused guard ends its round, a lost CAS re-reads. A pruner reads the pointer once and
@@ -16,17 +16,26 @@
 //!
 //! * **O1** a payload path names its content for ever (content addressing; a hash collision is the only way to break it);
 //! * **O2** the pointer object is written only by [`Act::Swap`] (nothing else deletes or rewrites it);
-//! * **O3** a compare-and-swap succeeds exactly when the object is unchanged since the read (`ver`).
+//! * **O3** a compare-and-swap succeeds exactly when the object is unchanged since the read (`ver`);
+//! * **O4** the stream incarnations of one bucket are ordered by creation time: a recreated stream is created later (the
+//!   incarnation is the creation time in Unix ns; the order of [`Pos`]).
 
 use crate::kernels::protocol::*;
 use vstd::prelude::*;
 
 verus! {
 
-/// A payload object's address: the cursor's rank and the digest of the manifest (which commits to the content).
+/// A payload object's address: the cursor's incarnation and rank (the file name records both) and the digest of the manifest
+/// (which commits to the content).
 pub struct Payload {
+    pub origin: u64,
     pub rank: u64,
     pub digest: nat,
+}
+
+/// The payload's place in the artifact order.
+pub open spec fn pos(p: Payload) -> Pos {
+    Pos { origin: p.origin, rank: p.rank }
 }
 
 /// One actor of the protocol, with what it has read so far.
@@ -36,14 +45,14 @@ pub enum Actor {
     Uploaded { p: Payload },
     /// An exporter that read the pointer (`st`, at swap-version `ver`) and the guard admitted its candidate.
     Observed { p: Payload, st: PointerState, ver: nat },
-    /// A pruner that read the pointer's rank `pr` (and its target `keep`).
-    Pruning { pr: u64, keep: Payload },
+    /// A pruner that read the pointer's position `pr` (and its target `keep`).
+    Pruning { pr: Pos, keep: Payload },
     /// A fetcher that read the pointer's target `t`.
     Fetching { t: Payload },
 }
 
 pub struct TS {
-    /// The pointer's target payload, once one is published. Its rank is the target's rank.
+    /// The pointer's target payload, once one is published. Its position is the target's.
     pub ptr: Option<Payload>,
     /// Successful swaps so far.
     pub ver: nat,
@@ -55,7 +64,7 @@ pub struct TS {
 pub open spec fn pstate(ptr: Option<Payload>) -> PointerState {
     match ptr {
         None => PointerState::Absent,
-        Some(p) => PointerState::Present { rank: Some(p.rank) },
+        Some(p) => PointerState::Present { at: Some(pos(p)) },
     }
 }
 
@@ -95,7 +104,7 @@ pub open spec fn enabled(s: TS, a: Act) -> bool {
         Act::PruneRead(i) => valid(s, i) && actor(s, i) is Idle && s.ptr is Some,
         Act::Delete(i, o) => {
             valid(s, i) && actor(s, i) is Pruning && s.objs.contains(o)
-                && prunable_spec(Some(o.rank), actor(s, i)->Pruning_pr, o == actor(s, i)->Pruning_keep, true)
+                && prunable_spec(Some(pos(o)), actor(s, i)->Pruning_pr, o == actor(s, i)->Pruning_keep, true)
         },
         Act::FetchRead(i) => valid(s, i) && actor(s, i) is Idle && s.ptr is Some,
         Act::FetchGet(i) => valid(s, i) && actor(s, i) is Fetching,
@@ -108,7 +117,7 @@ pub open spec fn step(s: TS, a: Act) -> TS {
         Act::Observe(i) => {
             let p = actor(s, i)->Uploaded_p;
             let st = pstate(s.ptr);
-            if publish_allowed_spec(st, p.rank) {
+            if publish_allowed_spec(st, pos(p)) {
                 TS { actors: s.actors.update(i, Actor::Observed { p, st, ver: s.ver }), ..s }
             } else {
                 // Refused (`SupersededByNewer`): the round ends, nothing changes.
@@ -122,7 +131,7 @@ pub open spec fn step(s: TS, a: Act) -> TS {
         Act::Reread(i) => TS { actors: s.actors.update(i, Actor::Uploaded { p: actor(s, i)->Observed_p }), ..s },
         Act::PruneRead(i) => {
             let t = s.ptr->Some_0;
-            TS { actors: s.actors.update(i, Actor::Pruning { pr: t.rank, keep: t }), ..s }
+            TS { actors: s.actors.update(i, Actor::Pruning { pr: pos(t), keep: t }), ..s }
         },
         Act::Delete(i, o) => TS { objs: s.objs.remove(o), ..s },
         Act::FetchRead(i) => TS { actors: s.actors.update(i, Actor::Fetching { t: s.ptr->Some_0 }), ..s },
@@ -140,17 +149,17 @@ pub open spec fn actor_ok(s: TS, a: Actor) -> bool {
     match a {
         Actor::Idle => true,
         // An uploaded payload exists, or was pruned because the pointer is strictly past it.
-        Actor::Uploaded { p } => s.objs.contains(p) || (s.ptr is Some && p.rank < s.ptr->Some_0.rank),
+        Actor::Uploaded { p } => s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0))),
         Actor::Observed { p, st, ver } => {
-            &&& publish_allowed_spec(st, p.rank)
+            &&& publish_allowed_spec(st, pos(p))
             &&& ver <= s.ver
             // Same as `Uploaded`, whatever the version: a lost CAS goes back to `Uploaded`.
-            &&& (s.objs.contains(p) || (s.ptr is Some && p.rank < s.ptr->Some_0.rank))
+            &&& (s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0))))
             // The read is current while the version is: so the guard's verdict still stands.
             &&& (ver == s.ver ==> st == pstate(s.ptr))
         },
-        Actor::Pruning { pr, keep } => s.ptr is Some && pr <= s.ptr->Some_0.rank,
-        Actor::Fetching { t } => s.objs.contains(t) || (s.ptr is Some && t.rank < s.ptr->Some_0.rank),
+        Actor::Pruning { pr, keep } => s.ptr is Some && !pos_lt(pos(s.ptr->Some_0), pr),
+        Actor::Fetching { t } => s.objs.contains(t) || (s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0))),
     }
 }
 
@@ -192,7 +201,7 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
                 let pp = actor(s, i)->Uploaded_p;
                 if j != i {
                     assert(s1.actors[j] == s.actors[j]);
-                } else if publish_allowed_spec(pstate(s.ptr), pp.rank) {
+                } else if publish_allowed_spec(pstate(s.ptr), pos(pp)) {
                     assert(actor_ok(s, s.actors[i]));
                     // Admitted: the candidate is not below the pointer, so it was not pruned: it exists.
                     assert(s.objs.contains(pp));
@@ -221,9 +230,9 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
                 let pr = actor(s, i)->Pruning_pr;
                 let t = s.ptr->Some_0;
                 assert(actor_ok(s, s.actors[i]));
-                // `o` is strictly below the pruner's read of the pointer, which is at most the pointer's rank now.
-                assert(o.rank < pr);
-                assert(pr <= t.rank);
+                // `o` is strictly below the pruner's read of the pointer, which is at most the pointer's position now.
+                assert(pos_lt(pos(o), pr));
+                assert(!pos_lt(pos(t), pr));
             },
             Act::FetchRead(i) => {
                 if j != i {
@@ -245,7 +254,7 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
             Act::Delete(i, o) => {
                 let pr = actor(s, i)->Pruning_pr;
                 assert(actor_ok(s, s.actors[i]));
-                assert(o.rank < pr);
+                assert(pos_lt(pos(o), pr));
                 assert(o != s.ptr->Some_0);
             },
             _ => {},
@@ -255,7 +264,7 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
 
 
 /// THEOREM (the pointer never regresses, for every interleaving of N exporters): every step either leaves the pointer alone or
-/// moves it to a payload whose rank is at least the old one, and a published pointer is never removed. This is
+/// moves it to a payload whose position (incarnation, then revision) is at least the old one, and a published pointer is never removed. This is
 /// `a_publish_never_regresses_the_pointer` lifted from one decision to the whole protocol: the guard decided on a read, but the
 /// swap succeeds only against that read (O3), so the read is the pointer being replaced.
 pub proof fn the_pointer_never_regresses(s: TS, a: Act)
@@ -263,17 +272,17 @@ pub proof fn the_pointer_never_regresses(s: TS, a: Act)
         inv(s),
         enabled(s, a),
     ensures
-        s.ptr is Some ==> step(s, a).ptr is Some && step(s, a).ptr->Some_0.rank >= s.ptr->Some_0.rank,
+        s.ptr is Some ==> step(s, a).ptr is Some && !pos_lt(pos(step(s, a).ptr->Some_0), pos(s.ptr->Some_0)),
         ({ let ps = pstate(s.ptr); let q = pstate(step(s, a).ptr);
-            (ps is Present && ps->Present_rank is Some) ==> q is Present && q->Present_rank is Some
-                && q->Present_rank->Some_0 >= ps->Present_rank->Some_0 }),
+            (ps is Present && ps->Present_at is Some) ==> q is Present && q->Present_at is Some
+                && !pos_lt(q->Present_at->Some_0, ps->Present_at->Some_0) }),
 {
     match a {
         Act::Swap(i) => {
             assert(actor_ok(s, s.actors[i]));
             let p = actor(s, i)->Observed_p;
             if s.ptr is Some {
-                a_publish_never_regresses_the_pointer(pstate(s.ptr), p.rank);
+                a_publish_never_regresses_the_pointer(pstate(s.ptr), pos(p));
             }
         },
         _ => {},
@@ -281,7 +290,7 @@ pub proof fn the_pointer_never_regresses(s: TS, a: Act)
 }
 
 /// THEOREM (prune never deletes the pointer's target): at any moment, whatever a pruner read earlier, the object it is allowed to
-/// delete is not the pointer's current target. The pruner's read of the pointer is stale, but the pointer's rank only grows, and
+/// delete is not the pointer's current target. The pruner's read of the pointer is stale, but the pointer's position only grows, and
 /// the guard deletes only strictly below the pruner's read (`the_target_and_unknown_objects_are_never_pruned` is the guard's own
 /// half).
 pub proof fn prune_never_deletes_the_pointers_target(s: TS, i: int, o: Payload)
@@ -311,7 +320,7 @@ pub proof fn a_fetch_gets_its_payload_or_a_detected_miss(s: TS, i: int)
             let t = actor(s, i)->Fetching_t;
             match fetched(s, t) {
                 Some(x) => x == t,
-                None => s.ptr is Some && t.rank < s.ptr->Some_0.rank && s.objs.contains(s.ptr->Some_0),
+                None => s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0)) && s.objs.contains(s.ptr->Some_0),
             }
         }),
 {
@@ -319,7 +328,7 @@ pub proof fn a_fetch_gets_its_payload_or_a_detected_miss(s: TS, i: int)
 }
 
 /// THEOREM (liveness: a refused fetch retries): after a miss, a fresh read names the pointer's current target, which exists, so
-/// the get answers it. The only way to miss again is for the pointer to move again, strictly upward. Rank: the pointer's rank
+/// the get answers it. The only way to miss again is for the pointer to move again, strictly upward. Rank: the pointer's position
 /// (monotone), unbounded, but each miss is paid for by one publish, so a fetch retries at most once per publish. Fairness
 /// assumption: the publishers do not publish for ever between a read and its get (the environment, not this code).
 pub proof fn a_fresh_read_never_misses_without_a_publish(s: TS, i: int)

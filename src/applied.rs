@@ -869,6 +869,17 @@ where
         }
     }
 
+    /// The fold's cursor was another incarnation's: its position, its
+    /// incarnation and its eviction memo are the old stream's, so the fold is
+    /// a cursor-less one that holds data until a repair commits the new
+    /// stream's cursor. Run after the repair's settle, so nothing queued under
+    /// the old cursor is lost.
+    pub(crate) fn forget_cursor(&mut self) {
+        // Mutation (model tests only): keep the memo (the pre-fix repair).
+        let seen = self.applied.seen_evicting() && cfg!(feature = "mut_foreign_keeps_memo");
+        self.applied = WatchCursor::none().remembering(seen);
+    }
+
     /// Remember, durably, that the bucket's retention evicts current values:
     /// from now on every cursor this fold commits carries the memo, and so
     /// does every artifact exported from it. Commits at once, even with

@@ -13,6 +13,6 @@ pub mod protocol;
 #[cfg(verus_keep_ghost)]
 mod applied_proofs;
 #[cfg(verus_keep_ghost)]
-mod transport_proofs;
-#[cfg(verus_keep_ghost)]
 mod fleet_proofs;
+#[cfg(verus_keep_ghost)]
+mod transport_proofs;

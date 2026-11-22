@@ -15,25 +15,29 @@
 //!
 //! where "the truth at its cursor `c` on key `k`" is the last write to `k` at or before `c` (a delete is `None`).
 //!
-//! # The statement, exactly (FINDING F3)
+//! # The statement, exactly (F3)
 //!
-//! The Stateright header says "equals the truth at its cursor". On one key with an atomic repair that is the invariant; on many
-//! keys it is not what the code keeps, by design: an artifact at cursor `C` is complete *together with the log after `C`* (see
-//! `restore_key`): a key whose latest write is after `C` may hold an older value in it, and the resume delivers that write. So the
-//! invariant is [`complete`]: the fold equals the truth at its cursor on every key that has not been written after the cursor.
-//! At the head that is every key, so a converged node's fold is exactly the truth at the head ([`a_converged_fold_is_the_truth`]).
-//! [`finding_f3_the_fold_is_not_the_truth_on_a_key_rewritten_after_the_cursor`] is a concrete restore where the fold at cursor `C`
-//! is not the truth at `C`, by the kernel's own `restore_key` table.
+//! The Stateright header used to say "equals the truth at its cursor". On one key with an atomic repair that is the invariant; on
+//! many keys it is not what the code keeps, by design: an artifact at cursor `C` is complete *together with the log after `C`*
+//! (see `restore_key`): a key whose latest write is after `C` may hold an older value in it, and the resume delivers that write.
+//! So the invariant is [`complete`]: the fold equals the truth at its cursor on every key that has not been written after the
+//! cursor. At the head that is every key, so a converged node's fold is exactly the truth at the head
+//! ([`a_converged_fold_is_the_truth`]). [`finding_f3_the_fold_is_not_the_truth_on_a_key_rewritten_after_the_cursor`] is a concrete
+//! restore where the fold at cursor `C` is not the truth at `C`, by the kernel's own `restore_key` table.
 //!
-//! # Findings (each a Verus-checked concrete state of the shipped decisions)
+//! # Findings, and what each one changed (every one is a Verus-checked concrete state of the shipped decisions)
 //!
-//! * **F1** the pointer guard compares ranks only: a dead incarnation's pointer above the new head refuses every publish of the new
-//!   stream while `same_incarnation` refuses to restore from it (`finding_f1_*`). The liveness theorems assume it away explicitly.
-//! * **F2** a restore over a fold of a recreated stream keeps stale entries by revision number (`finding_f2_*`). The fleet's restore
-//!   step requires the local entries be real writes of the log (`real`); a foreign fold is `blocked_by_foreign_fold`.
+//! * **F1** the pointer guard compared ranks only: a dead incarnation's pointer above the new head refused every publish of the
+//!   new stream while `same_incarnation` refused to restore from it. FIXED: the guard orders by (incarnation, rank)
+//!   (`protocol::Pos`), so the new stream's first publish replaces the dead pointer. [`finding_f1_*`] states the fix; the liveness
+//!   theorem no longer assumes the state away.
+//! * **F2** a restore over a fold of a recreated stream kept stale entries by revision number, and refused an artifact below the
+//!   old cursor's rank. FIXED: a fold whose cursor is no position of this stream (none, or another incarnation's, which the repair
+//!   forgets) is replaced by the artifact key for key (`restore_key`'s `local_known`). [`finding_f2_*`] states the fix; a restore
+//!   needs no premise on the local entries.
 //! * **F3** the invariant is `complete`, not exact equality (above).
-//! * **F4** the eviction memo outlives the incarnation: a fleet of foreign nodes blocks on a restore the exact listing could serve
-//!   (`finding_f4_*`).
+//! * **F4** the eviction memo outlived the incarnation: a fleet of foreign nodes blocked on a restore the exact listing could
+//!   serve. FIXED: the repair forgets the old cursor, memo included (`Detect`). [`finding_f4_*`] states the fix.
 //!
 //! # What the shell and the environment must supply
 //!
@@ -42,10 +46,14 @@
 //!   `tests/model_repair.rs` and `tests/resync.rs`); the restore's diff and listing events run inside [`restore_begin_w`], which
 //!   needs the ahead check, the window re-check and no eviction in between (a refusal is a stutter: `blocked_by_artifact`);
 //! * **A1** retention config is constant inside an incarnation (a toggle is what the `seen_evicting` memo guards, so
-//!   `mut_no_eviction_memo` is not observable in this world); `seen` is carried and only ever narrows trust;
-//! * **A2** positions are `u64`; the stream's revision numbers fit (below `2^63`);
+//!   `mut_no_eviction_memo` is not observable in this world); `seen` is carried inside an incarnation and only ever narrows trust;
+//!   the repair of a foreign cursor forgets it (the memo is a fact about the stream that was evicting);
+//! * **A2** positions are `u64`; the stream's revision numbers fit (below `2^63`); incarnations (creation times) fit `u64` and a
+//!   recreation's is larger than the stream it replaces (O4 of `transport_proofs`);
 //! * **A3** the pointer object is written only by publishes (`transport_proofs`, O2);
 //! * a cursor with no recorded origin (written before cursors recorded one) is excluded: `tests/model_incarnation.rs` owns it;
+//! * a fold that holds data and NO cursor (a torn first checkpoint) is taken to be of the current stream: nothing in it names an
+//!   incarnation, so a restore cannot tell it from this stream's, and keeps its newer entries (`model_repair`'s "never backward");
 //! * the liveness fairness axioms below (F-a to F-d).
 
 use crate::kernels::applied::*;
@@ -137,6 +145,7 @@ pub open spec fn live_rev(l: Log, k: nat) -> Option<nat> {
 }
 
 pub open spec fn log_ok(l: Log) -> bool {
+    &&& l.origin <= umax()
     &&& 1 <= l.first
     &&& l.first <= l.ops.len() + 1
     &&& l.ops.len() < 0x8000_0000_0000_0000
@@ -408,19 +417,22 @@ pub open spec fn key_state(o: Option<nat>) -> KeyState {
     }
 }
 
-/// `restore_key` for one key: the local entry, the artifact's, and whether the bucket lists the key live.
-pub open spec fn key_decision(local: Option<nat>, art: Option<nat>, listed_live: bool) -> KeyRestore {
+/// `restore_key` for one key: the local entry, the artifact's, whether the bucket lists the key live, and whether the local fold
+/// is KNOWN to be this stream's (it has a cursor of it).
+pub open spec fn key_decision(local: Option<nat>, art: Option<nat>, listed_live: bool, known: bool) -> KeyRestore {
     restore_key_spec(
         key_state(local),
         key_state(art),
         local == art,
         listed_live && !cfg!(feature = "mut_restore_ignores_listing"),
+        known || cfg!(feature = "mut_restore_trusts_foreign"),
     )
 }
 
-/// What the restore leaves on each key.
-pub open spec fn restore_result(l: Log, art: Fold, old: Fold) -> Fold {
-    |k: nat| match key_decision(old(k), art(k), listed(l, k) is Some) {
+/// What the restore leaves on each key. `known`: the local fold is of THIS stream (the repair saw no foreign cursor); a fold of
+/// another incarnation is replaced by the artifact key for key.
+pub open spec fn restore_result(l: Log, art: Fold, old: Fold, known: bool) -> Fold {
+    |k: nat| match key_decision(old(k), art(k), listed(l, k) is Some, known) {
         KeyRestore::Keep => old(k),
         KeyRestore::TakeArtifact => art(k),
         KeyRestore::Delete => None,
@@ -571,6 +583,8 @@ pub struct Rst {
     pub art: Art,
     pub old: Fold,
     pub result: Fold,
+    /// The old fold was of this stream (its incarnation is the current one) when the restore began: its entries were trusted.
+    pub known: bool,
 }
 
 /// One node: the production kernel's world (`w`, whose `store_cursor` is the persisted cursor), the STORE's content, and
@@ -625,10 +639,16 @@ pub open spec fn valid(f: F, i: int) -> bool {
     0 <= i < f.nodes.len()
 }
 
+/// A position in the artifact order (`protocol::Pos`): the incarnation, then the cursor. A mutation forges the incarnation away
+/// exactly as `mut_pointer_ignores_incarnation` does in the code.
+pub open spec fn art_pos(origin: nat, cursor: nat) -> Pos {
+    Pos { origin: if cfg!(feature = "mut_pointer_ignores_incarnation") { 0 } else { origin as u64 }, rank: cursor as u64 }
+}
+
 pub open spec fn ptr_state(p: Option<Art>) -> PointerState {
     match p {
         None => PointerState::Absent,
-        Some(a) => PointerState::Present { rank: Some(a.cursor as u64) },
+        Some(a) => PointerState::Present { at: Some(art_pos(a.origin, a.cursor)) },
     }
 }
 
@@ -677,7 +697,7 @@ pub open spec fn enabled(f: F, a: Act) -> bool {
             &&& g <= l.ops.len() + 1
             &&& (l.evicts || forall|k: nat| (#[trigger] live_rev(l, k)) is Some ==> live_rev(l, k)->Some_0 >= g)
         },
-        Act::Recreate(e) => true,
+        Act::Recreate(e) => l.origin + 1 <= umax(),
         Act::Advance(i) => {
             valid(f, i) && ({
                 let n = node_at(f, i);
@@ -715,8 +735,6 @@ pub open spec fn enabled(f: F, a: Act) -> bool {
                 // The artifact is of THIS stream (`same_incarnation`) and `restore_allowed` (ahead, inside the window).
                 &&& f.ptr->Some_0.origin == l.origin
                 &&& restore_ok(f.ptr->Some_0.cursor, n.w.store_cursor, l.first)
-                // The local entries are writes of this log (FINDING F2: nothing in the code checks this of a foreign fold).
-                &&& real(n.fold, l.ops)
             })
         },
         Act::FoldChunks(i) => valid(f, i) && node_at(f, i).rst is Some,
@@ -727,7 +745,8 @@ pub open spec fn enabled(f: F, a: Act) -> bool {
         Act::Publish(i) => {
             valid(f, i) && ({
                 let n = node_at(f, i);
-                n.anchored && n.w.store_cursor >= 1 && publish_allowed_spec(ptr_state(f.ptr), n.w.store_cursor as u64)
+                n.anchored && n.w.store_cursor >= 1 && n.origin <= umax()
+                    && publish_allowed_spec(ptr_state(f.ptr), art_pos(n.origin, n.w.store_cursor))
             })
         },
     }
@@ -747,7 +766,8 @@ pub open spec fn crash_node(n: Node) -> Node {
 }
 
 pub open spec fn detect_node(n: Node) -> Node {
-    Node { w: init_world(0, 0), anchored: false, rst: None, ..n }
+    // The cursor is forgotten with its incarnation and its eviction memo: the fold holds data and no cursor.
+    Node { w: init_world(0, 0), anchored: false, rst: None, seen: n.seen && cfg!(feature = "mut_foreign_keeps_memo"), ..n }
 }
 
 pub open spec fn relist_node(l: Log, n: Node) -> Node {
@@ -762,12 +782,11 @@ pub open spec fn relist_node(l: Log, n: Node) -> Node {
 }
 
 pub open spec fn begin_node(l: Log, n: Node, a: Art, hd: bool, pick: spec_fn(nat) -> bool) -> Node {
-    let result = restore_result(l, a.fold, n.fold);
+    let result = restore_result(l, a.fold, n.fold, n.origin == l.origin);
     Node {
         w: restore_begin_w(n.w, a.cursor, hd),
         fold: |k: nat| if pick(k) { result(k) } else { (n.fold)(k) },
-        origin: l.origin,
-        rst: Some(Rst { art: a, old: n.fold, result }),
+        rst: Some(Rst { art: a, old: n.fold, result, known: n.origin == l.origin }),
         ..n
     }
 }
@@ -839,8 +858,11 @@ pub open spec fn node_ok(l: Log, n: Node) -> bool {
     &&& n.w.k.flush is Idle
     &&& (n.w.k.restore is Idle || n.w.k.restore is Fold)
     &&& (n.w.k.restore is Fold <==> n.rst is Some)
-    &&& (n.rst is Some ==> n.w.art == rst_of(n).art.cursor && rst_of(n).art.origin == n.origin
-        && rst_of(n).art.cursor <= umax())
+    &&& (n.rst is Some ==> n.w.art == rst_of(n).art.cursor && rst_of(n).art.cursor <= umax() && art_ok(l, rst_of(n).art))
+    // A restore of a fold of this stream is of this stream's artifact; of a foreign fold, the restore IS the artifact.
+    &&& (n.rst is Some && rst_of(n).known ==> rst_of(n).art.origin == n.origin)
+    &&& (n.rst is Some && !rst_of(n).known ==> forall|k: nat| (#[trigger] (rst_of(n).result)(k)) == (rst_of(n).art.fold)(k))
+    &&& (n.rst is Some && n.origin == l.origin ==> rst_of(n).art.origin == l.origin)
     &&& n.w.delivered <= umax()
     &&& (!n.anchored ==> n.w.store_cursor == 0 && n.w.delivered == 0)
     // A store that holds everything received has no pending position.
@@ -878,11 +900,11 @@ pub proof fn a_restore_leaves_the_fold_complete_at_both_cursors(l: Log, old: Fol
         ok_fold(art, l.ops, c1),
         c0 < c1,
     ensures
-        ok_fold(restore_result(l, art, old), l.ops, c0),
-        ok_fold(restore_result(l, art, old), l.ops, c1),
+        ok_fold(restore_result(l, art, old, true), l.ops, c0),
+        ok_fold(restore_result(l, art, old, true), l.ops, c1),
 {
     let ops = l.ops;
-    let res = restore_result(l, art, old);
+    let res = restore_result(l, art, old, true);
     assert forall|k: nat| (#[trigger] res(k)) is Some implies real_entry(ops, k, res(k)->Some_0) by {
         assert(old(k) is Some ==> real_entry(ops, k, old(k)->Some_0));
         assert(art(k) is Some ==> real_entry(ops, k, art(k)->Some_0));
@@ -929,7 +951,7 @@ pub proof fn a_restore_leaves_the_fold_complete_at_both_cursors(l: Log, old: Fol
 }
 
 /// THEOREM (a restore never moves a key backward, and never deletes a key the bucket lists live): the kernel's `restore_key`
-/// guarantees, over every key of the fleet's fold. Every key of the fold: if the local entry survives or is replaced, its
+/// guarantees for a fold with a cursor, over every key of the fleet's fold. Every key of the fold: if the local entry survives or is replaced, its
 /// revision does not fall; a deleted entry was not listed live.
 pub proof fn a_restore_never_moves_a_key_backward_or_deletes_a_live_one(l: Log, old: Fold, art: Fold, k: nat)
     requires
@@ -938,13 +960,23 @@ pub proof fn a_restore_never_moves_a_key_backward_or_deletes_a_live_one(l: Log, 
         real(art, l.ops),
     ensures
         ({
-            let res = restore_result(l, art, old);
+            let res = restore_result(l, art, old, true);
             &&& (old(k) is Some && res(k) is Some ==> res(k)->Some_0 >= old(k)->Some_0)
             &&& (old(k) is Some && res(k) is None ==> listed(l, k) is None)
         }),
 {
     assert(old(k) is Some ==> real_entry(l.ops, k, old(k)->Some_0));
     assert(art(k) is Some ==> real_entry(l.ops, k, art(k)->Some_0));
+}
+
+/// THEOREM (a restore of a foreign fold is the artifact): the old fold may be anything, entries and revision numbers of another
+/// stream included. The restore leaves exactly the artifact's fold, key for key, so it is real and complete wherever the
+/// artifact is, with no premise on what the old fold held (FINDING F2: the revision-number comparison of `restore_key` is for a
+/// fold of this stream).
+pub proof fn a_restore_over_a_foreign_fold_is_the_artifact(l: Log, old: Fold, art: Fold, k: nat)
+    ensures
+        restore_result(l, art, old, false)(k) == art(k),
+{
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1047,7 +1079,6 @@ proof fn lemma_begin(l: Log, f_ptr: Art, n: Node, hd: bool, pick: spec_fn(nat) -
         settled(n),
         f_ptr.origin == l.origin,
         restore_ok(f_ptr.cursor, n.w.store_cursor, l.first),
-        real(n.fold, l.ops),
     ensures
         node_ok(l, begin_node(l, n, f_ptr, hd, pick)),
 {
@@ -1061,26 +1092,28 @@ proof fn lemma_begin(l: Log, f_ptr: Art, n: Node, hd: bool, pick: spec_fn(nat) -
         assert(c0 as u64 as nat == c0);
     }
     a_restore_runs_from_a_settled_node_to_the_chunk_fold(n.w, c1, hd);
-    // The fold is real, and complete at its cursor: by its claims (anchored), or at cursor 0 (cursor-less).
-    assert(ok_fold(n.fold, l.ops, c0)) by {
-        if n.anchored {
-            assert(n.origin == l.origin);
-        } else {
-            a_real_fold_is_complete_at_zero(n.fold, l.ops);
+    assert(ok_fold(f_ptr.fold, l.ops, c1));
+    assert(c1 <= l.ops.len());
+    let result = restore_result(l, f_ptr.fold, n.fold, n.origin == l.origin);
+    assert(n.w.delivered <= l.ops.len());
+    if n.origin == l.origin {
+        // A fold of this stream: real and complete at its cursor by its claims (at 0, when it has none).
+        assert(ok_fold(n.fold, l.ops, c0));
+        a_restore_leaves_the_fold_complete_at_both_cursors(l, n.fold, f_ptr.fold, c0, c1);
+        assert forall|k: nat| (#[trigger] (n2.fold)(k)) is Some implies real_entry(l.ops, k, (n2.fold)(k)->Some_0) by {
+            assert(result(k) is Some ==> real_entry(l.ops, k, result(k)->Some_0));
+        }
+        assert forall|k: nat| !touched(l.ops, c0, k) implies #[trigger] (n2.fold)(k) == truth(l.ops, c0, k) by {
+            assert(result(k) == truth(l.ops, c0, k));
+            assert((n.fold)(k) == truth(l.ops, c0, k));
+        }
+        assert(rst_ok(l, n2));
+    } else {
+        // A fold of another incarnation, of any content: the result IS the artifact's fold, so nothing is claimed of the mix.
+        assert forall|k: nat| (#[trigger] result(k)) == (f_ptr.fold)(k) by {
+            a_restore_over_a_foreign_fold_is_the_artifact(l, n.fold, f_ptr.fold, k);
         }
     }
-    assert(c1 <= l.ops.len());
-    a_restore_leaves_the_fold_complete_at_both_cursors(l, n.fold, f_ptr.fold, c0, c1);
-    let result = restore_result(l, f_ptr.fold, n.fold);
-    assert(n.w.delivered <= l.ops.len());
-    assert forall|k: nat| (#[trigger] (n2.fold)(k)) is Some implies real_entry(l.ops, k, (n2.fold)(k)->Some_0) by {
-        assert(result(k) is Some ==> real_entry(l.ops, k, result(k)->Some_0));
-    }
-    assert forall|k: nat| !touched(l.ops, c0, k) implies #[trigger] (n2.fold)(k) == truth(l.ops, c0, k) by {
-        assert(result(k) == truth(l.ops, c0, k));
-        assert((n.fold)(k) == truth(l.ops, c0, k));
-    }
-    assert(rst_ok(l, n2));
 }
 
 proof fn lemma_chunks(l: Log, n: Node)
@@ -1102,9 +1135,33 @@ proof fn lemma_end(l: Log, n: Node)
 {
     a_restore_commit_lands_the_store_at_the_artifacts_cursor(n.w);
     let n2 = end_node(n);
+    let art = rst_of(n).art;
     assert(n2.w.store_cursor == n.w.art);
-    if n.origin == l.origin {
-        assert(ok_fold(n2.fold, l.ops, rst_of(n).art.cursor));
+    assert(art_ok(l, art));
+    if art.origin == l.origin {
+        // The node now holds a fold of this stream at the artifact's cursor: complete there.
+        if rst_of(n).known {
+            // Its restore was of a fold of this stream, so its claims hold (the artifact is this stream's): the result is complete
+            // at the artifact's cursor.
+            assert(n.origin == l.origin);
+            assert(ok_fold(n.fold, l.ops, art.cursor));
+        } else {
+            // A foreign fold's restore is the artifact.
+            assert forall|k: nat| (#[trigger] (n.fold)(k)) == (art.fold)(k) by {
+                assert((n.fold)(k) == (rst_of(n).result)(k));
+            }
+            assert(ok_fold(n.fold, l.ops, art.cursor)) by {
+                assert forall|k: nat| (#[trigger] (n.fold)(k)) is Some implies real_entry(l.ops, k, (n.fold)(k)->Some_0) by {
+                    assert((art.fold)(k) == (n.fold)(k));
+                }
+                assert forall|k: nat| !touched(l.ops, art.cursor, k) implies #[trigger] (n.fold)(k) == truth(l.ops, art.cursor, k) by {
+                    assert((art.fold)(k) == (n.fold)(k));
+                }
+            }
+        }
+        assert(n2.fold == n.fold);
+        assert(ok_fold(n2.fold, l.ops, art.cursor));
+        assert(claims(l, n2));
     }
 }
 
@@ -1129,6 +1186,9 @@ proof fn lemma_append_node(l: Log, op: Op, n: Node)
             ok_fold_append(r.result, l.ops, op, r.art.cursor);
         }
         assert(claims(l2, n));
+    }
+    if n.rst is Some {
+        lemma_append_art(l, op, rst_of(n).art);
     }
 }
 
@@ -1204,6 +1264,7 @@ proof fn update_node_keeps(f: F, i: int, n2: Node)
 proof fn lemma_recreate_node(l: Log, e: bool, n: Node)
     requires
         node_ok(l, n),
+        l.origin + 1 <= umax(),
     ensures
         node_ok(Log { origin: l.origin + 1, ops: Seq::empty(), first: 1, evicts: e }, n),
 {
@@ -1410,6 +1471,7 @@ proof fn case_evict(f: F, g: nat)
 proof fn case_recreate(f: F, e: bool)
     requires
         finv(f),
+        enabled(f, Act::Recreate(e)),
     ensures
         finv(step(f, Act::Recreate(e))),
 {
@@ -1437,7 +1499,7 @@ proof fn case_publish(f: F, i: int)
 
 /// THEOREM (every live node's fold is the truth at its cursor): a node of the current incarnation holds, on every key not written
 /// since its cursor, the truth at its cursor; and holds only writes of this log.
-pub proof fn every_live_nodes_fold_is_the_truth_at_its_cursor(f: F, i: int, k: nat)
+pub proof fn every_live_nodes_fold_is_complete_at_its_cursor(f: F, i: int, k: nat)
     requires
         finv(f),
         valid(f, i),
@@ -1452,7 +1514,7 @@ pub proof fn every_live_nodes_fold_is_the_truth_at_its_cursor(f: F, i: int, k: n
 
 /// THEOREM (every published artifact is the truth at its cursor): the same of the pointer's artifact, when it is of the current
 /// incarnation (an artifact of another incarnation is never restored: `same_incarnation`).
-pub proof fn every_published_artifact_is_the_truth_at_its_cursor(f: F, k: nat)
+pub proof fn every_published_artifact_is_complete_at_its_cursor(f: F, k: nat)
     requires
         finv(f),
         f.ptr is Some,
@@ -1512,7 +1574,7 @@ pub proof fn finding_f3_the_fold_is_not_the_truth_on_a_key_rewritten_after_the_c
             let l = Log { origin: 1, ops, first: 1, evicts: true };
             let old: Fold = |k: nat| if k == 0 { Some(1nat) } else { None };
             let art: Fold = |k: nat| None;
-            restore_result(l, art, old)(0) == Some(1nat) && truth(ops, 2, 0) is None && truth(ops, 3, 0) == Some(3nat)
+            restore_result(l, art, old, true)(0) == Some(1nat) && truth(ops, 2, 0) is None && truth(ops, 3, 0) == Some(3nat)
                 && touched(ops, 2, 0)
         }),
 {
@@ -1524,24 +1586,21 @@ pub proof fn finding_f3_the_fold_is_not_the_truth_on_a_key_rewritten_after_the_c
     assert(truth(ops, 2, 0) is None);
 }
 
-/// FINDING F2 (a restore over a foreign fold): when the stream is deleted and recreated, a node's fold holds the OLD stream's
-/// entries and revisions (`Detect`: repaired "like a cursor-less start that holds data"). With the listing untrusted
-/// (an evicting bucket) that repair is a restore, and `restore_key` decides by REVISION NUMBER: an old entry numbered above the
-/// artifact's is "newer" and kept. Here the new stream has put key 0 seven times (artifact cursor 7, key 0 at rev 7), the old
-/// entry is `Some(500)`: the restore keeps it, and the committed fold at cursor 7 holds a value no write of this log made, on a key
-/// no write follows. (Nothing in `check_restore` or `restore_diff` rules a foreign fold out.) The fleet proof therefore requires
-/// the local entries be real writes of this log (`real`) before a restore, and a foreign fold that is not is not restored:
-/// the liveness theorems carry the same premise (`blocked_by_foreign_fold`).
-pub proof fn finding_f2_a_restore_over_a_foreign_fold_keeps_a_stale_entry()
-    requires
-        !cfg!(feature = "mut_restore_ignores_versions"),
+/// FINDING F2 (a restore over a foreign fold), FIXED: when the stream is deleted and recreated, a node's fold holds the OLD
+/// stream's entries and revisions (`Detect`: the cursor is forgotten and the fold repaired "like a cursor-less start that holds
+/// data"). With the listing untrusted (an evicting bucket) that repair is a restore, and `restore_key` used to decide by REVISION
+/// NUMBER: an old entry numbered above the artifact's was "newer" and kept. Here the new stream has put key 0 seven times
+/// (artifact cursor 7, key 0 at rev 7) and the old entry is `Some(500)`. The restore of a fold with no cursor (`known == false`)
+/// takes the artifact's entry: the committed fold at cursor 7 holds the write the log made. The same restore, with the old
+/// fold's entries trusted, is the pre-fix state (`mut_restore_trusts_foreign` forges it: this proof goes red).
+pub proof fn finding_f2_a_restore_over_a_foreign_fold_takes_the_artifacts_entry()
     ensures
         ({
             let ops = Seq::new(7, |i: int| Op { key: 0, put: true });
             let l = Log { origin: 2, ops, first: 1, evicts: true };
             let old: Fold = |k: nat| if k == 0 { Some(500nat) } else { None };
             let art: Fold = |k: nat| if k == 0 { Some(7nat) } else { None };
-            ok_fold(art, ops, 7) && !real(old, ops) && restore_result(l, art, old)(0) == Some(500nat)
+            ok_fold(art, ops, 7) && !real(old, ops) && restore_result(l, art, old, false)(0) == Some(7nat)
                 && truth(ops, 7, 0) == Some(7nat) && !touched(ops, 7, 0)
         }),
 {
@@ -1565,21 +1624,48 @@ pub proof fn finding_f2_a_restore_over_a_foreign_fold_keeps_a_stale_entry()
     assert(!touched(ops, 7, 0));
 }
 
-/// FINDING F1 (a dead incarnation's pointer wedges publishing): the pointer guard compares ranks only
+/// FINDING F1 (a dead incarnation's pointer wedged publishing), FIXED: the pointer guard used to compare ranks only
 /// (`pointer_publish_allowed`, `transport::swap_pointer`), never the incarnation. After the stream is recreated, a pointer whose
-/// artifact is the OLD stream's, ranked above the new stream's head, refuses every publish of the new stream until its head
-/// passes that rank, while `same_incarnation` refuses to restore from it. Between the two, the fleet has no usable artifact: a node
-/// that must restore (an evicting bucket) cannot, though every other node holds the head.
-pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_refuses_every_publish(l: Log, a: Art, c: nat)
+/// artifact is the OLD stream's, ranked above the new stream's head, refused every publish of the new stream until its head
+/// passed that rank, while `same_incarnation` refused to restore from it. Now the guard orders by (incarnation, rank): a publish of
+/// the current incarnation is admitted over any pointer of a dead one, whatever its rank (`mut_pointer_ignores_incarnation`
+/// forges the old guard: this proof goes red), and a publish of a dead incarnation is refused over the current one's.
+pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publish(l: Log, a: Art, c: nat)
     requires
+        log_ok(l),
         a.origin < l.origin,
         a.cursor > c,
         a.cursor <= umax(),
         c <= umax(),
     ensures
-        !publish_allowed_spec(ptr_state(Some(a)), c as u64),
-        !(a.origin == l.origin),
+        publish_allowed_spec(ptr_state(Some(a)), art_pos(l.origin, c)),
+        !publish_allowed_spec(ptr_state(Some(Art { origin: l.origin, cursor: c, fold: a.fold })), art_pos(a.origin, a.cursor)),
 {
+}
+
+/// FINDING F4 (a stale memo blocked a start the listing could serve), FIXED: `seen_evicting` rides the cursor, and a node that
+/// sees its cursor belong to another incarnation used to keep it (`Detect`). On the recreated, un-evicted bucket the listing IS the
+/// truth, but the memo distrusted it, so the plan was a restore; with no artifact of the new stream (a fleet that is all foreign
+/// has no node to publish one) every such node was blocked for ever, though nothing was lost. Now the detected node forgets the
+/// memo with the cursor, and plans the listing wherever the listing is exact.
+pub proof fn finding_f4_a_detected_node_forgets_the_old_streams_eviction_memo(f: F, i: int)
+    requires
+        finv(f),
+        valid(f, i),
+        !f.log.evicts,
+        f.log.first == 1,
+        !cfg!(feature = "mut_no_eviction_memo"),
+        enabled(f, Act::Detect(i)),
+    ensures
+        !step(f, Act::Detect(i)).nodes[i].seen,
+        plan_of(lt_of(f.log, step(f, Act::Detect(i)).nodes[i])) is Relist,
+        forall|k: nat| (#[trigger] listed(f.log, k)) == truth(f.log.ops, f.log.ops.len(), k),
+{
+    let l = f.log;
+    assert(log_ok(l));
+    assert forall|k: nat| (#[trigger] listed(l, k)) == truth(l.ops, l.ops.len(), k) by {
+        the_trusted_listing_is_the_truth(l, false, k);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1618,7 +1704,7 @@ pub open spec fn nrank(l: Log, n: Node) -> int {
         2 * (len - n.w.delivered as int) + (n.w.delivered as int - n.w.store_cursor as int)
     } else if n.rst is Some {
         let fl: int = if folded(n) { 0 } else { 1 };
-        if n.origin != l.origin {
+        if rst_of(n).art.origin != l.origin {
             2 * len + 11 + fl
         } else if win(rst_of(n).art.cursor, l.first) {
             2 * len + 4 + fl
@@ -1644,13 +1730,6 @@ pub open spec fn blocked_by_artifact(f: F, i: int) -> bool {
     repairable(f.log, n) && settled(n) && plan_of(lt_of(f.log, n)) is Restore && !admissible_art(f, n)
 }
 
-/// FINDING F2's liveness face: an artifact could seed the node but its fold holds entries that are no write of this log.
-pub open spec fn blocked_by_foreign_fold(f: F, i: int) -> bool {
-    let n = node_at(f, i);
-    repairable(f.log, n) && settled(n) && plan_of(lt_of(f.log, n)) is Restore && admissible_art(f, n)
-        && !real(n.fold, f.log.ops)
-}
-
 pub open spec fn acts_on(a: Act, i: int) -> bool {
     match a {
         Act::Advance(j) => j == i,
@@ -1674,15 +1753,14 @@ pub open spec fn lowers(f: F, i: int, a: Act) -> bool {
 }
 
 /// THEOREM (progress): from any state satisfying the invariant, every node is converged, or some fair step of its own lowers its
-/// rank, or it is blocked (no artifact can seed it, or, FINDING F2, its fold is foreign). The rank is a natural number, so a node
-/// that is never blocked reaches the head in finitely many steps.
+/// rank, or it is blocked: no artifact can seed it (and the listing is not the truth). The rank is a natural number, so a node
+/// that is never blocked reaches the head in finitely many steps. A foreign fold needs no case of its own: a restore replaces it.
 pub proof fn a_node_is_converged_or_a_fair_step_lowers_its_rank_or_it_is_blocked(f: F, i: int)
     requires
         finv(f),
         valid(f, i),
     ensures
-        converged(f.log, node_at(f, i)) || (exists|a: Act| #[trigger] lowers(f, i, a)) || blocked_by_artifact(f, i)
-            || blocked_by_foreign_fold(f, i),
+        converged(f.log, node_at(f, i)) || (exists|a: Act| #[trigger] lowers(f, i, a)) || blocked_by_artifact(f, i),
 {
     let l = f.log;
     let n = node_at(f, i);
@@ -1776,13 +1854,13 @@ proof fn prog_restore(f: F, i: int)
         assert(enabled(f, a));
         assert(n2.w.delivered == art.cursor && n2.w.store_cursor == art.cursor);
         assert(n2.rst is None && n2.anchored && n2.origin == art.origin);
-        assert(nrank(l, n) == (if n.origin != l.origin { 2 * len + 11 } else if win(art.cursor, l.first) {
+        assert(nrank(l, n) == (if art.origin != l.origin { 2 * len + 11 } else if win(art.cursor, l.first) {
             2 * len + 4
         } else {
             2 * len + 7
         }));
-        if n.origin == l.origin {
-            assert(ok_fold(n.fold, l.ops, art.cursor));
+        if art.origin == l.origin {
+            assert(ok_fold(n2.fold, l.ops, art.cursor));
             if win(art.cursor, l.first) {
                 assert(live(l, n2));
                 assert(nrank(l, n2) <= 2 * len);
@@ -1813,7 +1891,7 @@ proof fn prog_repair(f: F, i: int)
         node_at(f, i).rst is None,
         !(node_at(f, i).anchored && node_at(f, i).origin != f.log.origin),
     ensures
-        (exists|a: Act| #[trigger] lowers(f, i, a)) || blocked_by_artifact(f, i) || blocked_by_foreign_fold(f, i),
+        (exists|a: Act| #[trigger] lowers(f, i, a)) || blocked_by_artifact(f, i),
 {
     let l = f.log;
     let n = node_at(f, i);
@@ -1854,7 +1932,7 @@ proof fn prog_repair(f: F, i: int)
             assert(converged(l, n2));
             assert(enabled(f, a));
             lowers_from(f, i, a, n2);
-        } else if admissible_art(f, n) && real(n.fold, l.ops) {
+        } else if admissible_art(f, n) {
             let pick = |k: nat| true;
             let a = Act::RestoreBegin(i, false, pick);
             assert(enabled(f, a));
@@ -1874,8 +1952,9 @@ proof fn prog_repair(f: F, i: int)
 
 /// THEOREM (a blocked node unblocks): if some node is converged, a publish by it is admitted by the pointer guard, and afterwards
 /// the pointer names an artifact that seeds every blocked node behind the head. The artifact an exporter publishes is its own
-/// store at its own cursor; a converged node's cursor is the head. HYPOTHESIS: the pointer is not a dead incarnation's, ranked above
-/// the head (FINDING F1 is exactly that state: `finding_f1_a_dead_pointer_ahead_of_the_head_refuses_every_publish`).
+/// store at its own cursor; a converged node's cursor is the head. No hypothesis on the pointer: a dead incarnation's, whatever its
+/// rank, is replaced (FINDING F1, fixed: `finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publish`), and an artifact
+/// of this stream is at most the head.
 pub proof fn a_converged_node_unblocks_every_blocked_one(f: F, j: int, i: int)
     requires
         finv(f),
@@ -1884,8 +1963,6 @@ pub proof fn a_converged_node_unblocks_every_blocked_one(f: F, j: int, i: int)
         converged(f.log, node_at(f, j)),
         blocked_by_artifact(f, i),
         node_at(f, i).w.store_cursor < f.log.ops.len(),
-        // No dead incarnation's pointer sits above the head.
-        !(f.ptr is Some && f.ptr->Some_0.origin != f.log.origin && f.ptr->Some_0.cursor > f.log.ops.len()),
     ensures
         enabled(f, Act::Publish(j)),
         finv(step(f, Act::Publish(j))),
@@ -1901,14 +1978,20 @@ pub proof fn a_converged_node_unblocks_every_blocked_one(f: F, j: int, i: int)
     assert(nj.w.store_cursor == len);
     assert(len <= umax());
     assert(len as u64 as nat == len);
-    // The guard: the pointer is absent, or an artifact of this stream (at most the head), or a dead one at most the head.
+    // The guard: the pointer is absent, or an artifact of this stream (at most the head), or a dead incarnation's (older).
     if f.ptr is Some {
         let a = f.ptr->Some_0;
-        assert(a.cursor <= len);
+        assert(a.origin <= l.origin);
         assert(a.cursor <= umax());
         assert(a.cursor as u64 as nat == a.cursor);
+        assert(a.origin as u64 as nat == a.origin);
+        assert(nj.origin == l.origin);
+        assert(l.origin as u64 as nat == l.origin);
+        if a.origin == l.origin {
+            assert(a.cursor <= len);
+        }
     }
-    assert(publish_allowed_spec(ptr_state(f.ptr), len as u64));
+    assert(publish_allowed_spec(ptr_state(f.ptr), art_pos(nj.origin, len)));
     case_publish(f, j);
     let f2 = step(f, Act::Publish(j));
     let a2 = f2.ptr->Some_0;
@@ -1955,29 +2038,6 @@ pub proof fn a_blocked_node_names_the_write_that_aged_out(f: F, i: int)
         assert(!restore_allowed_spec(a.cursor as u64, n.w.store_cursor as u64, l.first as u64)) by {
             assert(!admissible_art(f, n));
         }
-    }
-}
-
-/// FINDING F4 (a stale memo blocks a start the listing could serve): `seen_evicting` rides the cursor, and a node that sees its
-/// cursor belong to another incarnation keeps it (`Detect`). On the recreated, un-evicted bucket the listing IS the truth, but the
-/// memo distrusts it, so the plan is a restore; with no artifact of the new stream (a fleet that is all foreign has no node to
-/// publish one) every such node is blocked for ever, though nothing was lost.
-pub proof fn finding_f4_a_stale_eviction_memo_blocks_a_start_the_listing_could_serve(f: F, i: int)
-    requires
-        finv(f),
-        valid(f, i),
-        !f.log.evicts,
-        f.log.first == 1,
-        node_at(f, i).seen,
-        !cfg!(feature = "mut_no_eviction_memo"),
-    ensures
-        plan_of(lt_of(f.log, node_at(f, i))) is Restore,
-        forall|k: nat| (#[trigger] listed(f.log, k)) == truth(f.log.ops, f.log.ops.len(), k),
-{
-    let l = f.log;
-    assert(log_ok(l));
-    assert forall|k: nat| (#[trigger] listed(l, k)) == truth(l.ops, l.ops.len(), k) by {
-        the_trusted_listing_is_the_truth(l, false, k);
     }
 }
 

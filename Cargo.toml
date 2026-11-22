@@ -8,7 +8,7 @@ rust-version = "1.92"
 
 [package]
 name = "beyond-slipstream"
-version = "0.10.3"
+version = "0.10.4"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -105,6 +105,12 @@ mut_unanchored_relist = []
 mut_restore_ignores_versions = []
 # The restore deletes keys the bucket lists live.
 mut_restore_ignores_listing = []
+# The pointer guard compares revisions across incarnations (a dead incarnation's pointer wedges publishing).
+mut_pointer_ignores_incarnation = []
+# A foreign cursor keeps its eviction memo (the old stream's) through the repair.
+mut_foreign_keeps_memo = []
+# The restore trusts a fold of another incarnation (a recreated bucket's old fold decides keys by its own revision numbers).
+mut_restore_trusts_foreign = []
 # The fold forgets that it saw retention evict current values.
 mut_no_eviction_memo = []
 

@@ -292,6 +292,11 @@ pub(crate) fn disjoint(prefixes: &[String]) -> Vec<String> {
 /// and only these need checking against the listing. Out-of-scope keys are
 /// untouched on both sides.
 ///
+/// `local_known`: the local fold is of THIS stream, so its entries' revisions
+/// are this log's. A fold of another incarnation (its cursor was foreign) is
+/// replaced by the artifact's key for key: revision numbers of another stream
+/// decide nothing ([`restore_key`]).
+///
 /// Memory is the returned set, which holds the keys deleted between the local
 /// fold's cursor and the artifact's: never the fold, the artifact, or the
 /// bucket's listing.
@@ -299,6 +304,7 @@ pub(crate) fn restore_diff<S: SnapshotStore>(
     local: &S,
     artifact: &S,
     prefixes: &[String],
+    local_known: bool,
     mut take: impl FnMut(String) -> Result<(), SnapshotError>,
 ) -> Result<HashSet<String>, SnapshotError> {
     let mut candidates = HashSet::new();
@@ -314,7 +320,7 @@ pub(crate) fn restore_diff<S: SnapshotStore>(
                 ),
                 None => (KeyState::Absent, false),
             };
-            if restore_key(state, at, identical, false) == KeyRestore::TakeArtifact {
+            if restore_key(state, at, identical, false, local_known) == KeyRestore::TakeArtifact {
                 take(entry.key)?;
             }
             Ok(())
@@ -324,7 +330,7 @@ pub(crate) fn restore_diff<S: SnapshotStore>(
         // artifact is read only for keys that could be deleted.
         local.for_each_in_range(&prefix, |entry| {
             let state = KeyState::At(entry.version.as_u64());
-            if restore_key(state, KeyState::Absent, false, false) == KeyRestore::Delete
+            if restore_key(state, KeyState::Absent, false, false, local_known) == KeyRestore::Delete
                 && artifact.get(&entry.key)?.is_none()
             {
                 candidates.insert(entry.key);
@@ -570,6 +576,8 @@ pub(crate) enum RepairRequest<S> {
     Relist {
         reader: Arc<dyn KvReader>,
         scratch: Option<PathBuf>,
+        /// The fold's cursor was another incarnation's ([`KvError::ForeignCursor`]).
+        foreign: bool,
         ack: oneshot::Sender<()>,
     },
     /// The artifact restore: a verified artifact fold, the reader that lists
@@ -581,6 +589,8 @@ pub(crate) enum RepairRequest<S> {
         restored: RestoredFold<S>,
         reader: Arc<dyn KvReader>,
         watcher: Arc<dyn KvWatcher>,
+        /// The fold's cursor was another incarnation's ([`KvError::ForeignCursor`]).
+        foreign: bool,
         reply: oneshot::Sender<Result<WatchCursor, KvError>>,
     },
 }
@@ -842,6 +852,10 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                     );
                     note(health, RepairState::Reseeding);
                     foreign = true;
+                    // The eviction memo is a fact about the stream that was
+                    // evicting: the new one's retention is read afresh.
+                    // Mutation (model tests only): keep it (the pre-fix repair).
+                    memo.seen = memo.seen && cfg!(feature = "mut_foreign_keeps_memo");
                     WatchCursor::none()
                 }
                 Err(KvError::ForeignCursor) => {
@@ -867,7 +881,7 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                     "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
                 );
                 note(health, RepairState::Relisting);
-                resync_stale_keys(reader, scratch, repairs).await?;
+                resync_stale_keys(reader, scratch, foreign, repairs).await?;
                 if let Some(h) = health {
                     h.repair_done();
                 }
@@ -878,21 +892,28 @@ pub(crate) async fn run_watch<S: Send + 'static>(
             Plan::Restore(reader, source, repairs) => {
                 warn!("watch cursor expired; restoring the fold from the latest artifact");
                 note(health, RepairState::Restoring);
-                let restored =
-                    restore_from_artifact(&shared, scope, reader, source, repairs, &cursor, health)
-                        .await
-                        .map_err(|e| match e {
-                            KvError::WatchError(msg) if cursor.is_none() && !foreign => {
-                                KvError::WatchError(format!(
-                                    "{msg}. This node has no cursor, so it can only seed from an \
+                let restored = restore_from_artifact(
+                    &shared,
+                    scope,
+                    reader,
+                    source,
+                    repairs,
+                    (&cursor, foreign),
+                    health,
+                )
+                .await
+                .map_err(|e| match e {
+                    KvError::WatchError(msg) if cursor.is_none() && !foreign => {
+                        KvError::WatchError(format!(
+                            "{msg}. This node has no cursor, so it can only seed from an \
                              artifact. If none exists yet (first deploy onto a bucket that \
                              already evicted values), start one node with ExpiryRepair::None \
                              — accepting that values which already aged out are gone — and \
                              publish an export from it"
-                                ))
-                            }
-                            other => other,
-                        })?;
+                        ))
+                    }
+                    other => other,
+                })?;
                 // An artifact from a fold that saw eviction carries the memo
                 // (the fold took it with the artifact's cursor).
                 memo.seen |= restored.seen_evicting();
@@ -995,7 +1016,9 @@ async fn restore_from_artifact<S: Send + 'static>(
     reader: &Arc<dyn KvReader>,
     source: &Arc<dyn RestoreSource<S>>,
     repairs: &mpsc::Sender<RepairRequest<S>>,
-    local: &WatchCursor,
+    // The fold's cursor (none when foreign), and whether it was another
+    // incarnation's.
+    (local, foreign): (&WatchCursor, bool),
     health: Option<&WatchHealth>,
 ) -> Result<WatchCursor, KvError> {
     let prefixes = scope.prefixes();
@@ -1066,6 +1089,7 @@ async fn restore_from_artifact<S: Send + 'static>(
             restored,
             reader: Arc::clone(reader),
             watcher: Arc::clone(watcher),
+            foreign,
             reply: reply_tx,
         })
         .await
@@ -1107,6 +1131,7 @@ fn note(health: Option<&WatchHealth>, state: RepairState) {
 async fn resync_stale_keys<S>(
     reader: &Arc<dyn KvReader>,
     scratch: Option<PathBuf>,
+    foreign: bool,
     repairs: &mpsc::Sender<RepairRequest<S>>,
 ) -> Result<(), KvError> {
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -1114,6 +1139,7 @@ async fn resync_stale_keys<S>(
         .send(RepairRequest::Relist {
             reader: Arc::clone(reader),
             scratch,
+            foreign,
             ack: ack_tx,
         })
         .await
@@ -1184,11 +1210,15 @@ where
                 let Some(RepairRequest::Relist {
                     reader,
                     scratch,
+                    foreign,
                     ack,
                 }) = req.take()
                 else {
                     unreachable!("RunRelist follows a Relist request")
                 };
+                if foreign {
+                    fold.forget_cursor();
+                }
                 relist(fold, &*reader, scratch, prefixes).await?;
                 // Ack AFTER the deletes are applied: the watch task is holding
                 // the fallback watch until it hears back, which is what orders
@@ -1215,12 +1245,17 @@ where
                     restored,
                     reader,
                     watcher,
+                    foreign,
                     reply,
                 }) = req.take()
                 else {
                     unreachable!("CheckAhead follows a Restore request")
                 };
-                return restore_request(fold, restored, reader, watcher, reply, prefixes).await;
+                if foreign {
+                    fold.forget_cursor();
+                }
+                return restore_request(fold, restored, reader, watcher, foreign, reply, prefixes)
+                    .await;
             }
             other => unreachable!("fold_in: {other:?}"),
         }
@@ -1238,6 +1273,7 @@ async fn restore_request<U, S, P, A, O>(
     restored: RestoredFold<S>,
     reader: Arc<dyn KvReader>,
     watcher: Arc<dyn KvWatcher>,
+    foreign: bool,
     reply: oneshot::Sender<Result<WatchCursor, KvError>>,
     prefixes: &[String],
 ) -> Result<(), KvError>
@@ -1249,6 +1285,10 @@ where
     O: FnMut(WatchCursor) + Send,
 {
     let target = restored.manifest().cursor.clone();
+    // A fold of another incarnation (its cursor was foreign, and forgotten):
+    // the restore replaces it with the artifact's, key for key
+    // ([`restore_key`]).
+    let local_known = !foreign;
     let prefixes = disjoint(prefixes);
     let max = fold.batch_cap();
     let mut restored = Some(restored);
@@ -1296,7 +1336,7 @@ where
                 let Some(r) = restored.take() else {
                     unreachable!("the artifact is held until the reply")
                 };
-                let (r, spill, deletes) = run_diff(fold, r, &prefixes).await?;
+                let (r, spill, deletes) = run_diff(fold, r, &prefixes, local_known).await?;
                 restored = Some(r);
                 let has_deletes = !deletes.is_empty();
                 diff = Some((spill, deletes));
@@ -1310,8 +1350,9 @@ where
                 // current value is a write after the artifact's cursor, which
                 // the resume delivers (`restore_key`'s `listed_live`). A
                 // failed listing fails the watch, like the key-listing
-                // repair's.
-                for prefix in &prefixes {
+                // repair's. A fold that is no position of this stream has no
+                // such entries to keep: every candidate is deleted.
+                for prefix in prefixes.iter().filter(|_| local_known) {
                     reader
                         .for_each_key(prefix, &mut |key| {
                             deletes.remove(&key);
@@ -1384,6 +1425,7 @@ async fn run_diff<U, S, P, A, O>(
     fold: &mut Fold<U, S, P, A, O>,
     restored: RestoredFold<S>,
     prefixes: &[String],
+    local_known: bool,
 ) -> Result<(RestoredFold<S>, KeySpill, HashSet<String>), KvError>
 where
     U: Send,
@@ -1402,7 +1444,7 @@ where
     let (st, owned, diff) = tokio::task::spawn_blocking(move || {
         let diff = (|| {
             let mut spill = KeySpill::new(owned.scratch.as_deref())?;
-            let candidates = restore_diff(&st, owned.fold(), &scope, |key| {
+            let candidates = restore_diff(&st, owned.fold(), &scope, local_known, |key| {
                 spill.push(&key).map_err(SnapshotError::from)
             })?;
             Ok::<_, SnapshotError>((spill, candidates))
@@ -1728,7 +1770,7 @@ mod tests {
         live: &HashSet<String>,
     ) -> Vec<KvUpdate> {
         let mut spill = KeySpill::new(None).unwrap();
-        let candidates = restore_diff(local, artifact, prefixes, |k| {
+        let candidates = restore_diff(local, artifact, prefixes, true, |k| {
             spill.push(&k).map_err(SnapshotError::from)
         })
         .unwrap();
@@ -1779,7 +1821,7 @@ mod tests {
             9,
         );
         let mut rewritten = Vec::new();
-        let candidates = restore_diff(&local, &artifact, &["node.".to_string()], |k| {
+        let candidates = restore_diff(&local, &artifact, &["node.".to_string()], true, |k| {
             rewritten.push(k);
             Ok(())
         })

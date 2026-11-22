@@ -264,7 +264,10 @@ async fn a_dead_incarnations_pointer_does_not_refuse_the_new_streams_publish() {
     wait_applied(&a, 20).await;
     assert_eq!(fleet.publish(&a, "art-a").await, PublishOutcome::Published);
     stop(a).await.expect("clean stop");
-    assert_eq!(fleet.transport.manifest(KEY).await.unwrap().cursor.as_u64(), Some(20));
+    assert_eq!(
+        fleet.transport.manifest(KEY).await.unwrap().cursor.as_u64(),
+        Some(20)
+    );
 
     let (_c, new) = recreate(&fleet.nats, plain()).await;
     let mut head = 0;
@@ -313,7 +316,10 @@ async fn restore_over_a_foreign_fold(new_head: u64) {
     }
     let exporter = spawn_node(&new, fleet.open("x").1, None, ExpiryRepair::None);
     wait_applied(&exporter, head).await;
-    assert_eq!(fleet.publish(&exporter, "art").await, PublishOutcome::Published);
+    assert_eq!(
+        fleet.publish(&exporter, "art").await,
+        PublishOutcome::Published
+    );
     stop(exporter).await.expect("clean stop");
 
     let (cursor, fold) = fleet.open("a");

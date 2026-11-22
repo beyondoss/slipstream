@@ -190,6 +190,16 @@ impl WatchCursor {
     pub(crate) fn rank(&self) -> u64 {
         self.as_u64().unwrap_or(0)
     }
+
+    /// The cursor's place in the artifact order: its stream incarnation (0
+    /// when it records none: older than any recorded one), then its
+    /// [`rank`](Self::rank). The ONE place a cursor becomes a [`Pos`].
+    pub(crate) fn position(&self) -> crate::protocol::Pos {
+        crate::protocol::Pos {
+            origin: self.origin().unwrap_or(0),
+            rank: self.rank(),
+        }
+    }
 }
 
 /// Error type for KV operations.
