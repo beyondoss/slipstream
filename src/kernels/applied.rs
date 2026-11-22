@@ -17,6 +17,13 @@
 //! it holds a store. The data themselves (updates, cursors, the store) stay in
 //! the shell.
 
+// The `verus!` macro rewrites `Storing { advanced }` into `advanced: advanced`.
+#![allow(non_shorthand_field_patterns)]
+
+use vstd::prelude::*;
+
+verus! {
+
 /// Consecutive store-apply failures that fail-stop the watch. A transient
 /// failure re-queues its raw batch (cursor authority: the store's cursor and
 /// contents advance together, always); a persistent streak fail-stops before
@@ -33,8 +40,8 @@ pub enum Flush {
     Storing { advanced: bool },
 }
 
-/// Kernel state of one `watch_applied` fold.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Kernel state of one `watch_applied` fold. `State::default()` is [`State::init`], the state of a fresh run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct State {
     /// A batch opened since the last flush (the window timer is armed).
     pub open: bool,
@@ -51,6 +58,37 @@ pub struct State {
     pub relisting: bool,
     /// Where an artifact restore is.
     pub restore: Restore,
+}
+
+impl State {
+    /// The state of a fresh run (a restart builds one: a crash part-way leaves the whole repair to re-run).
+    pub fn init() -> (r: State)
+        ensures
+            r == init_state(),
+    {
+        State {
+            open: false,
+            high: false,
+            memo_dirty: false,
+            fail_streak: 0,
+            flush: Flush::Idle,
+            relisting: false,
+            restore: Restore::Idle,
+        }
+    }
+}
+
+/// [`State::init`].
+pub open spec fn init_state() -> State {
+    State {
+        open: false,
+        high: false,
+        memo_dirty: false,
+        fail_streak: 0,
+        flush: Flush::Idle,
+        relisting: false,
+        restore: Restore::Idle,
+    }
 }
 
 /// Where an artifact restore is. Every step waits on a fact the shell
@@ -217,7 +255,8 @@ pub enum Action {
 
 const MAX_ACTIONS: usize = 6;
 
-/// A short fixed-capacity action list: the hot path allocates nothing.
+/// A short fixed-capacity action list: the hot path allocates nothing. `view` is the list as a sequence, which is what the
+/// proofs speak of; Verus checks that every `push` fits (no `step` path emits more than `MAX_ACTIONS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Actions {
     len: u8,
@@ -225,45 +264,76 @@ pub struct Actions {
 }
 
 impl Actions {
-    const fn none() -> Self {
-        Self {
-            len: 0,
-            items: [Action::FlushNow; MAX_ACTIONS],
+    pub closed spec fn view(&self) -> Seq<Action> {
+        self.items@.subrange(0, self.len as int)
+    }
+
+    pub closed spec fn wf(&self) -> bool {
+        self.len <= MAX_ACTIONS
+    }
+
+    fn none() -> (r: Self)
+        ensures
+            r@ == Seq::<Action>::empty(),
+            r.wf(),
+    {
+        let r = Self { len: 0, items: [Action::FlushNow; MAX_ACTIONS] };
+        proof {
+            assert(r@ =~= Seq::<Action>::empty());
         }
+        r
     }
 
-    fn push(&mut self, a: Action) {
-        self.items[self.len as usize] = a;
+    fn push(&mut self, a: Action)
+        requires
+            old(self).wf(),
+            old(self)@.len() < MAX_ACTIONS,
+        ensures
+            final(self)@ == old(self)@.push(a),
+            final(self).wf(),
+    {
+        let i = self.len as usize;
+        self.items[i] = a;
         self.len += 1;
-    }
-
-    pub fn as_slice(&self) -> &[Action] {
-        &self.items[..self.len as usize]
-    }
-
-    pub fn contains(&self, a: Action) -> bool {
-        self.as_slice().contains(&a)
-    }
-}
-
-impl<'a> IntoIterator for &'a Actions {
-    type Item = &'a Action;
-    type IntoIter = std::slice::Iter<'a, Action>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.as_slice().iter()
+        proof {
+            assert(self@ =~= old(self)@.push(a));
+        }
     }
 }
 
 /// What follows a flush's store step (or its absence): the consumer hears of
 /// an advance only after the store settled, and the pending position clears.
 #[inline]
-fn finish(s: &mut State, a: &mut Actions, advanced: bool, had_store: bool) {
+fn finish(s: &mut State, a: &mut Actions, advanced: bool, had_store: bool)
+    requires
+        old(a).wf(),
+        old(a)@.len() + 2 <= MAX_ACTIONS,
+    ensures
+        *final(s) == finish_spec(*old(s), advanced, had_store).0,
+        final(a)@ == old(a)@ + finish_spec(*old(s), advanced, had_store).1,
+        final(a).wf(),
+{
     if advanced {
         if !had_store {
             a.push(Action::CommitWithoutStore);
         }
         a.push(Action::NotifyApplied);
         s.high = false;
+    }
+    proof {
+        assert(a@ =~= old(a)@ + finish_spec(*old(s), advanced, had_store).1);
+    }
+}
+
+/// [`finish`]: an advance clears the pending position and tells the consumer (a run without a store commits first).
+pub open spec fn finish_spec(s: State, advanced: bool, had_store: bool) -> (State, Seq<Action>) {
+    if advanced {
+        (
+            State { high: false, ..s },
+            (if !had_store { seq![Action::CommitWithoutStore] } else { seq![] }) + seq![Action::NotifyApplied],
+        )
+    } else {
+        (s, seq![])
     }
 }
 
@@ -282,7 +352,10 @@ pub enum ResumeFrom {
 /// The resume cursor's source at the end of a run. `holds_store`: the fold
 /// still holds its store.
 #[inline]
-pub const fn resume_from(holds_store: bool) -> ResumeFrom {
+pub fn resume_from(holds_store: bool) -> (r: ResumeFrom)
+    ensures
+        r == resume_from_spec(holds_store),
+{
     // Mutation (model tests only): resume from the in-memory cursor even
     // with a store.
     if holds_store && !cfg!(feature = "mut_resume_from_memory") {
@@ -292,16 +365,155 @@ pub const fn resume_from(holds_store: bool) -> ResumeFrom {
     }
 }
 
+/// [`resume_from`]: the store's own cursor whenever a store holds the data.
+pub open spec fn resume_from_spec(holds_store: bool) -> ResumeFrom {
+    if holds_store { ResumeFrom::Store } else { ResumeFrom::Memory }
+}
+
+/// [`step`], as a spec: the whole transition table. `step` is proven equal to it, so the proofs below speak of the code.
+pub open spec fn step_spec(s: State, e: Event) -> (State, Seq<Action>) {
+    match e {
+        Event::Received { positioned, queued, max } => {
+            // Every received update bumps the pending high-water, parsed or not, but only with a real position.
+            let s1 = State { open: true, high: s.high || positioned, ..s };
+            (
+                s1,
+                (if positioned { seq![Action::RecordHigh] } else { seq![] })
+                    + (if queued.batch >= max || queued.raw >= max { seq![Action::FlushNow] } else { seq![] }),
+            )
+        },
+        Event::AdvanceTo => (State { high: true, ..s }, seq![Action::RecordHigh]),
+        Event::FlushRequested { queued, has_store } => {
+            let s0 = State { open: false, ..s };
+            if queued.batch == 0 && queued.raw == 0 && !s.high && !s.memo_dirty {
+                (s0, seq![])
+            } else {
+                let pre = (if queued.batch > 0 { seq![Action::ApplyDomain] } else { seq![] })
+                    + (if s.high { seq![Action::AdvanceApplied] } else { seq![] });
+                if (queued.raw > 0 || s.high || s.memo_dirty) && has_store {
+                    (State { flush: Flush::Storing { advanced: s.high }, ..s0 }, pre + seq![Action::FoldStore])
+                } else {
+                    let (s2, f) = finish_spec(s0, s.high, has_store);
+                    (s2, pre + f)
+                }
+            }
+        },
+        Event::StoreDone(outcome) => match s.flush {
+            Flush::Idle => (s, seq![]),
+            Flush::Storing { advanced } => {
+                let s0 = State { flush: Flush::Idle, ..s };
+                match outcome {
+                    StoreOutcome::Ok => {
+                        let s1 = State { fail_streak: 0, memo_dirty: false, ..s0 };
+                        let (s2, f) = finish_spec(s1, advanced, true);
+                        (s2, seq![Action::StoreCommitted] + f)
+                    },
+                    StoreOutcome::Failed => {
+                        let n = streak_after_failure(s.fail_streak);
+                        let s1 = State { fail_streak: n, ..s0 };
+                        if n >= MAX_STORE_APPLY_FAILURES {
+                            (s1, seq![Action::Fail(Fatal::StoreFailStreak)])
+                        } else {
+                            // The failed range goes back to the FRONT of the queue.
+                            let (s2, f) = finish_spec(s1, advanced, true);
+                            (s2, seq![Action::Requeue] + f)
+                        }
+                    },
+                    StoreOutcome::Panicked => (s0, seq![Action::Fail(Fatal::StorePanicked)]),
+                }
+            },
+        },
+        Event::RememberEvicting { already_seen, has_store } => {
+            if !already_seen {
+                (State { memo_dirty: has_store, ..s }, seq![Action::SetMemo, Action::Flush])
+            } else {
+                (s, seq![])
+            }
+        },
+        Event::SettleCheck { raw_queued } => (s, if raw_queued > 0 { seq![Action::Flush] } else { seq![] }),
+        Event::ExportRequested { has_store } => (
+            s,
+            seq![Action::Flush, if has_store { Action::ExportStore } else { Action::ReplyNoStore }],
+        ),
+        Event::RepairRequested(kind) => match kind {
+            RepairKind::Evicting => (s, seq![Action::RememberEvicting]),
+            RepairKind::Relist => (
+                State { relisting: true, ..s },
+                seq![Action::DrainBacklog, Action::Settle, Action::RunRelist],
+            ),
+            RepairKind::Restore => (
+                State { restore: Restore::Ahead, ..s },
+                seq![Action::DrainBacklog, Action::Settle, Action::CheckAhead],
+            ),
+        },
+        Event::RestoreAhead { ahead } => {
+            if matches!(s.restore, Restore::Ahead) {
+                if ahead {
+                    (State { restore: Restore::Diff, ..s }, seq![Action::RunDiff])
+                } else {
+                    (State { restore: Restore::Idle, ..s }, seq![Action::Refuse(Refusal::NotAhead)])
+                }
+            } else {
+                (s, seq![])
+            }
+        },
+        Event::RestoreDiffed { has_deletes } => {
+            if matches!(s.restore, Restore::Diff) {
+                if has_deletes {
+                    (State { restore: Restore::Listing, ..s }, seq![Action::ListLive])
+                } else {
+                    (State { restore: Restore::Fold, ..s }, seq![Action::FoldChunks])
+                }
+            } else {
+                (s, seq![])
+            }
+        },
+        Event::RestoreListed { window_ok } => {
+            if matches!(s.restore, Restore::Listing) {
+                if window_ok {
+                    (State { restore: Restore::Fold, ..s }, seq![Action::FoldChunks])
+                } else {
+                    (State { restore: Restore::Idle, ..s }, seq![Action::Refuse(Refusal::WindowAged)])
+                }
+            } else {
+                (s, seq![])
+            }
+        },
+        Event::RestoreFolded => {
+            if matches!(s.restore, Restore::Fold) {
+                (State { restore: Restore::Idle, ..s }, seq![Action::CommitCursor, Action::ReplyRestored])
+            } else {
+                (s, seq![])
+            }
+        },
+        Event::RelistFolded => {
+            if s.relisting {
+                (State { relisting: false, ..s }, seq![Action::AckResync])
+            } else {
+                (s, seq![])
+            }
+        },
+    }
+}
+
+/// The failure streak after one more failed store fold. Saturates at the bound, which has already fail-stopped the run, so
+/// `step` is total.
+pub open spec fn streak_after_failure(n: u32) -> u32 {
+    if n >= MAX_STORE_APPLY_FAILURES { MAX_STORE_APPLY_FAILURES } else { (n + 1) as u32 }
+}
+
 /// The one transition function.
 #[inline]
-pub fn step(mut s: State, e: Event) -> (State, Actions) {
+pub fn step(s0: State, e: Event) -> (out: (State, Actions))
+    ensures
+        out.0 == step_spec(s0, e).0,
+        out.1@ == step_spec(s0, e).1,
+        out.1.wf(),
+{
+    let mut s = s0;
     let mut a = Actions::none();
     match e {
-        Event::Received {
-            positioned,
-            queued,
-            max,
-        } => {
+        Event::Received { positioned, queued, max } => {
             // Every received update bumps the pending high-water, parsed or
             // not — but only with a real position: an unknown version neither
             // mints a fake cursor nor clobbers the real high from earlier in
@@ -314,11 +526,11 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             if queued.batch >= max || queued.raw >= max {
                 a.push(Action::FlushNow);
             }
-        }
+        },
         Event::AdvanceTo => {
             s.high = true;
             a.push(Action::RecordHigh);
-        }
+        },
         Event::FlushRequested { queued, has_store } => {
             s.open = false;
             // Nothing received since the last flush: nothing to do at all.
@@ -340,7 +552,7 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
             } else {
                 finish(&mut s, &mut a, advanced, has_store);
             }
-        }
+        },
         Event::StoreDone(outcome) => {
             let Flush::Storing { advanced } = s.flush else {
                 return (s, a);
@@ -352,9 +564,13 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                     s.memo_dirty = false;
                     a.push(Action::StoreCommitted);
                     finish(&mut s, &mut a, advanced, true);
-                }
+                },
                 StoreOutcome::Failed => {
-                    s.fail_streak += 1;
+                    s.fail_streak = if s.fail_streak < MAX_STORE_APPLY_FAILURES {
+                        s.fail_streak + 1
+                    } else {
+                        MAX_STORE_APPLY_FAILURES
+                    };
                     if s.fail_streak >= MAX_STORE_APPLY_FAILURES {
                         a.push(Action::Fail(Fatal::StoreFailStreak));
                     } else {
@@ -365,62 +581,57 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                         a.push(Action::Requeue);
                         finish(&mut s, &mut a, advanced, true);
                     }
-                }
+                },
                 StoreOutcome::Panicked => a.push(Action::Fail(Fatal::StorePanicked)),
             }
-        }
-        Event::RememberEvicting {
-            already_seen,
-            has_store,
-        } => {
+        },
+        Event::RememberEvicting { already_seen, has_store } => {
             if !already_seen {
                 s.memo_dirty = has_store;
                 a.push(Action::SetMemo);
                 a.push(Action::Flush);
             }
-        }
+        },
         Event::SettleCheck { raw_queued } => {
             // Mutation (model tests only): settle with one flush, not until
             // the store holds everything.
             if raw_queued > 0 && !cfg!(feature = "mut_no_settle_retry") {
                 a.push(Action::Flush);
             }
-        }
+        },
         Event::ExportRequested { has_store } => {
             // The pending batch is flushed first, so the exported cursor is
             // the applied cursor (or, across a transiently failed store
             // flush, the store's own lagging, self-consistent one).
             a.push(Action::Flush);
-            a.push(if has_store {
-                Action::ExportStore
-            } else {
-                Action::ReplyNoStore
-            });
-        }
+            a.push(if has_store { Action::ExportStore } else { Action::ReplyNoStore });
+        },
         Event::RepairRequested(kind) => match kind {
             RepairKind::Evicting => a.push(Action::RememberEvicting),
-            RepairKind::Relist | RepairKind::Restore => {
+            RepairKind::Relist => {
                 // The repair diffs the STORE, so it sees everything delivered:
                 // drain the watch task's backlog, then settle.
                 // Mutation (model tests only): skip the drain.
                 #[cfg(not(feature = "mut_no_drain"))]
                 a.push(Action::DrainBacklog);
                 a.push(Action::Settle);
-                if kind == RepairKind::Relist {
-                    s.relisting = true;
-                    // Mutation (model tests only): ack the parked watch task
-                    // before the deletes are folded.
-                    #[cfg(feature = "mut_no_ack_barrier")]
-                    a.push(Action::AckResync);
-                    a.push(Action::RunRelist);
-                } else {
-                    s.restore = Restore::Ahead;
-                    a.push(Action::CheckAhead);
-                }
-            }
+                s.relisting = true;
+                // Mutation (model tests only): ack the parked watch task
+                // before the deletes are folded.
+                #[cfg(feature = "mut_no_ack_barrier")]
+                a.push(Action::AckResync);
+                a.push(Action::RunRelist);
+            },
+            RepairKind::Restore => {
+                #[cfg(not(feature = "mut_no_drain"))]
+                a.push(Action::DrainBacklog);
+                a.push(Action::Settle);
+                s.restore = Restore::Ahead;
+                a.push(Action::CheckAhead);
+            },
         },
         Event::RestoreAhead { ahead } => {
-            if s.restore == Restore::Ahead {
+            if matches!(s.restore, Restore::Ahead) {
                 // A restore never moves the fold backward.
                 let ahead = ahead || cfg!(feature = "mut_no_restore_guard");
                 if ahead {
@@ -436,9 +647,9 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                     a.push(Action::Refuse(Refusal::NotAhead));
                 }
             }
-        }
+        },
         Event::RestoreDiffed { has_deletes } => {
-            if s.restore == Restore::Diff {
+            if matches!(s.restore, Restore::Diff) {
                 // Nothing to delete: no listing to vouch for, so nothing to
                 // re-check.
                 if has_deletes {
@@ -449,16 +660,13 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                     a.push(Action::FoldChunks);
                 }
             }
-        }
+        },
         Event::RestoreListed { window_ok } => {
-            if s.restore == Restore::Listing {
+            if matches!(s.restore, Restore::Listing) {
                 // The listing vouches for every write after the artifact's
                 // cursor only while the log still holds all of them.
                 let window_ok = window_ok
-                    || cfg!(any(
-                        feature = "mut_no_listing_recheck",
-                        feature = "mut_no_restore_guard"
-                    ));
+                    || cfg!(any(feature = "mut_no_listing_recheck", feature = "mut_no_restore_guard"));
                 if window_ok {
                     s.restore = Restore::Fold;
                     a.push(Action::FoldChunks);
@@ -467,9 +675,9 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                     a.push(Action::Refuse(Refusal::WindowAged));
                 }
             }
-        }
+        },
         Event::RestoreFolded => {
-            if s.restore == Restore::Fold {
+            if matches!(s.restore, Restore::Fold) {
                 s.restore = Restore::Idle;
                 // Now the fold IS the artifact's (in scope): its cursor
                 // commits with the final chunk's re-queued remainder, and only
@@ -478,7 +686,7 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                 a.push(Action::CommitCursor);
                 a.push(Action::ReplyRestored);
             }
-        }
+        },
         Event::RelistFolded => {
             // The ack barrier: the fallback watch starts only after the
             // synthetic deletes are folded, so a delete-then-recreate during
@@ -488,9 +696,38 @@ pub fn step(mut s: State, e: Event) -> (State, Actions) {
                 #[cfg(not(feature = "mut_no_ack_barrier"))]
                 a.push(Action::AckResync);
             }
-        }
+        },
+    }
+    proof {
+        assert(a@ =~= step_spec(s0, e).1);
     }
     (s, a)
+}
+
+} // verus!
+
+impl Default for State {
+    fn default() -> Self {
+        Self::init()
+    }
+}
+
+impl Actions {
+    pub fn as_slice(&self) -> &[Action] {
+        &self.items[..self.len as usize]
+    }
+
+    pub fn contains(&self, a: Action) -> bool {
+        self.as_slice().contains(&a)
+    }
+}
+
+impl<'a> IntoIterator for &'a Actions {
+    type Item = &'a Action;
+    type IntoIter = std::slice::Iter<'a, Action>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
 }
 
 #[cfg(test)]

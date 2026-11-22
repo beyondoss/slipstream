@@ -446,6 +446,38 @@ The kernels are checked twice: Stateright finds counterexamples in a bounded wor
 
 Proving `gap_holds_no_eviction` found a real overflow: with `max_age = cursor_age = u64::MAX` the saturating multiply made the check pass for a cursor older than the retention. It now compares `age <= max / 2`.
 
+`src/kernels/applied.rs` (`step` is proven equal to `step_spec`, its whole transition table; no path emits more than the action list holds) and `src/kernels/applied_proofs.rs`. The cursor-authority invariant is stated over the kernel state plus ghost positions the shell keeps (`World`: delivered, applied, store cursor, raw queue start, store contents, the running fold, the restore's artifact), with `w_step` giving what the shell does with each action. It is inductive over every event and unbounded in positions and queue lengths:
+
+| Theorem | Where | Says |
+| --- | --- | --- |
+| `a_fresh_run_satisfies_the_invariant` | `applied_proofs.rs:169` | `inv(init)` |
+| `every_event_preserves_the_invariant` | `applied_proofs.rs:179` | `inv(w) && pre(w, e) ==> inv(w_step(w, e))` for ALL events |
+| `a_restart_preserves_the_invariant` | `applied_proofs.rs:190` | a crash or fail-stop at any point resumes from a cursor the store holds |
+| `the_store_cursor_never_names_data_the_store_lacks` | `applied_proofs.rs:199` | `inv ==> store cursor <= the contents the store holds` |
+| `only_a_landed_fold_moves_the_store_cursor` | `applied_proofs.rs:209` | only `StoreCommitted` moves what a restart resumes from |
+| `the_cursor_commits_only_after_the_chunks_fold` | `applied_proofs.rs:225` | `CommitCursor` only from the `Fold` phase, reply next; the restore's phase chain and guards |
+| `a_refusal_changes_nothing` | `applied_proofs.rs:255` | a refused restore emits only the error and leaves the state but for the phase |
+| `the_resync_acks_only_after_its_deletes_are_folded` | `applied_proofs.rs:266` | the ack barrier |
+| `a_repair_drains_then_settles_and_an_export_flushes_first` | `applied_proofs.rs:276` | repair and export order |
+| `a_flush_applies_then_advances_then_folds` | `applied_proofs.rs:288` | flush order |
+| `a_failed_fold_requeues_its_batch` | `applied_proofs.rs:303` | a non-fatal failure re-queues |
+| `an_event_out_of_phase_is_ignored` | `applied_proofs.rs:317` | out-of-phase answers do nothing; an unpositioned update never records a cursor |
+| `a_failed_fold_is_retried_until_it_lands_or_the_run_fail_stops` | `applied_proofs.rs:345` | liveness, rank `16 - fail_streak`: each failure lowers it or fail-stops |
+| `a_flush_with_anything_owed_always_folds` | `applied_proofs.rs:366` | liveness: the retry always starts a fold |
+| `a_landed_fold_brings_the_store_to_the_head` | `applied_proofs.rs:380` | liveness: one landed fold after any failures brings the store to the head |
+| `a_failed_fold_leaves_the_store_behind_and_retryable` | `applied_proofs.rs:401` | liveness: after a failure the batch is still owed, the invariant holds, the rank fell |
+| `every_restore_answer_lowers_the_rank` | `applied_proofs.rs:435` | liveness: restore phases rank 4..0; every answer lowers it |
+| `a_restore_with_a_fresh_artifact_always_completes` | `applied_proofs.rs:446` | liveness: after a refusal the same request restores a fresh artifact to its reply |
+| `a_resync_is_always_released` | `applied_proofs.rs:468` | liveness: the resync's ack is always released |
+
+What the shell must supply (explicit preconditions, `pre` in `applied_proofs.rs`, not assumptions about the kernel): its loop is sequential (only `StoreDone` while a fold runs); no update is received while a restore runs; `ahead` is honest and the pre-repair settle has run; the run has a store; `AdvanceTo` follows only `CommitCursor`; restore chunks carry no stream position.
+
+**Environment axioms** (the progress theorems rest on these and on nothing in slipstream's own code): *A1*, every store fold is answered (the disk and the blocking task return; whether the answer is `Ok` is not assumed, a fold that always fails ends the run through the failure streak); *A2*, the environment answers each repair action the restore asks of it (NATS answers the listing and retention reads; the disk returns the chunk folds).
+
+Proving `step` equal to its spec found that a failure streak above the bound (unreachable: the run has fail-stopped) was left as it was; `step` is now total, the streak saturates at `MAX_STORE_APPLY_FAILURES`.
+
+Each `mut_*` feature turns an obligation red (`mise run verify -- --features mut_x`): `mut_drop_failed_batch`, `mut_no_ack_barrier`, `mut_no_drain`, `mut_no_settle_retry`, `mut_cursor_before_diff`, `mut_no_listing_recheck` (and `mut_no_restore_guard`) fail `step`'s proof of equality with `step_spec`, whose theorems above are the properties those mutations break; `mut_resume_from_memory` fails `resume_from`'s postcondition; the protocol ones fail their `ensures`.
+
 ### Export Round State Machine
 
 ```
