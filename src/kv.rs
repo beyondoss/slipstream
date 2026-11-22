@@ -191,6 +191,13 @@ impl WatchCursor {
         self.as_u64().unwrap_or(0)
     }
 
+    /// A cursor with no position that records only which stream incarnation a
+    /// fold's data is of: what a fold persists BEFORE its first data, so a
+    /// first checkpoint that tears still names its stream.
+    pub(crate) fn origin_only(origin: u64) -> Self {
+        Self::from_version(VersionToken::unknown().with_origin(origin))
+    }
+
     /// The cursor's place in the artifact order: its stream incarnation (0
     /// when it records none: older than any recorded one), then its
     /// [`rank`](Self::rank). The ONE place a cursor becomes a [`Pos`].

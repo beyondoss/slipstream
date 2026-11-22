@@ -218,6 +218,46 @@ fn check_has_entries<S: SnapshotStore>(open: impl Fn(&Path) -> (WatchCursor, S))
 /// Cursor-resume after a reconnect: fold a first segment, reopen (cursor reflects
 /// it), fold the post-cursor delta, reopen again (cursor advanced). Models a
 /// service restarting and resuming the watch from the persisted position.
+/// A cursor at `rev` that records the stream incarnation `origin` it was taken
+/// from (the cursor encoding: the version padded to 10 bytes, its length, the
+/// origin flag, then the origin, u64 LE).
+fn cursor_of(rev: u64, origin: u64) -> WatchCursor {
+    let mut bytes = vec![0u8; 12];
+    bytes[..8].copy_from_slice(&rev.to_be_bytes());
+    bytes[10] = 8;
+    bytes[11] = 0b100;
+    bytes.extend_from_slice(&origin.to_le_bytes());
+    WatchCursor::from_bytes(&bytes).expect("a cursor with an origin")
+}
+
+/// A fold's data and the incarnation it is of are persisted together: a fold
+/// reopened holds the cursor it committed, incarnation included, and data
+/// committed under no cursor (a restore's chunks, which mix streams) names no
+/// incarnation. A fold whose data names none is foreign to every stream.
+fn check_incarnation_is_persisted_with_the_data<S: SnapshotStore>(
+    open: impl Fn(&Path) -> (WatchCursor, S),
+) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let c = cursor_of(1, 77);
+    {
+        let (_r, mut s) = open(&path);
+        s.apply(&[put("a", b"1", 1)], &c).unwrap();
+    }
+    {
+        let (r, mut s) = open(&path);
+        assert_eq!(r.to_bytes(), c.to_bytes(), "the incarnation is persisted");
+        assert_eq!(r.as_u64(), Some(1));
+        s.apply(&[put("b", b"2", 2)], &WatchCursor::none()).unwrap();
+    }
+    let (r, s) = open(&path);
+    assert!(
+        r.to_bytes().is_empty(),
+        "data under no cursor names no stream"
+    );
+    assert!(s.get("b").unwrap().is_some());
+}
+
 fn check_cursor_resume<S: SnapshotStore>(open: impl Fn(&Path) -> (WatchCursor, S)) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
@@ -747,6 +787,11 @@ fn append_log_cursor_resume() {
 }
 
 #[test]
+fn append_log_incarnation_is_persisted_with_the_data() {
+    check_incarnation_is_persisted_with_the_data(open_append_log);
+}
+
+#[test]
 fn append_log_pure_fold_property() {
     check_property_pure_fold(open_append_log);
 }
@@ -903,6 +948,11 @@ mod fjall_backend {
     #[test]
     fn fjall_cursor_resume() {
         check_cursor_resume(open_no_sync);
+    }
+
+    #[test]
+    fn fjall_incarnation_is_persisted_with_the_data() {
+        check_incarnation_is_persisted_with_the_data(open_no_sync);
     }
 
     #[test]
@@ -1126,6 +1176,11 @@ mod rocksdb_backend {
     #[test]
     fn rocksdb_cursor_resume() {
         check_cursor_resume(open_no_sync);
+    }
+
+    #[test]
+    fn rocksdb_incarnation_is_persisted_with_the_data() {
+        check_incarnation_is_persisted_with_the_data(open_no_sync);
     }
 
     #[test]

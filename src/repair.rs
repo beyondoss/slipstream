@@ -42,8 +42,9 @@ use crate::health::{RepairState, WatchHealth};
 use crate::kernels::applied::{Action, Event, Refusal, RepairKind};
 use crate::kv::{KvError, KvReader, KvUpdate, KvWatcher, Retention, VersionToken, WatchCursor};
 use crate::protocol::{
-    KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_truth,
-    plan_repair, restore_ahead, restore_allowed, restore_key, resume_window_ok, same_incarnation,
+    KeyRestore, KeyState, RepairMode, RepairPlan, cursorless_fold_is_this_stream,
+    cursorless_start_needs_repair, listing_truth, plan_repair, restore_ahead, restore_allowed,
+    restore_key, resume_window_ok, same_incarnation,
 };
 use crate::snapshot::{SnapshotError, SnapshotStore};
 
@@ -578,6 +579,9 @@ pub(crate) enum RepairRequest<S> {
         scratch: Option<PathBuf>,
         /// The fold's cursor was another incarnation's ([`KvError::ForeignCursor`]).
         foreign: bool,
+        /// A fold with data and no cursor that is this stream's: the incarnation
+        /// its commits keep recording, so the repair's own commits don't erase it.
+        stamp: Option<u64>,
         ack: oneshot::Sender<()>,
     },
     /// The artifact restore: a verified artifact fold, the reader that lists
@@ -765,7 +769,10 @@ pub(crate) async fn run_watch<S: Send + 'static>(
     watcher: Arc<dyn KvWatcher>,
     scope: WatchScope,
     resume: Option<WatchCursor>,
-    unanchored: bool,
+    // `Some(recorded)`: the fold holds data but no cursor, and `recorded` is
+    // the incarnation it records as its data's (see
+    // [`cursorless_fold_is_this_stream`]).
+    unanchored: Option<Option<u64>>,
     repair: Option<RepairHandle<S>>,
     tx: mpsc::Sender<KvUpdate>,
     health: Option<WatchHealth>,
@@ -788,14 +795,37 @@ pub(crate) async fn run_watch<S: Send + 'static>(
     // decision, or the warning, depends on it.
     let mode = repair.as_ref().map_or(RepairMode::None, |h| h.mode.mode());
     let mut repair_first = false;
+    // Data and no cursor whose recorded stream is not the one that exists now
+    // (or records none): foreign, repaired like a foreign cursor's fold.
+    let mut foreign_start = false;
+    let mut own_stream = None;
+    let unanchored_data = unanchored.is_some();
     if resume.is_none() {
+        if let Some(provenance) = unanchored
+            && mode != RepairMode::None
+        {
+            let stream = watcher.retention().await?.and_then(|r| r.incarnation);
+            foreign_start = !cursorless_fold_is_this_stream(provenance, stream);
+            if !foreign_start {
+                own_stream = stream;
+            }
+            if foreign_start {
+                warn!(
+                    ?provenance,
+                    ?stream,
+                    "the fold holds data and no cursor, and its recorded stream is not the \
+                     one that exists now (or it records none): treating it as another \
+                     incarnation's"
+                );
+            }
+        }
         let truth = match mode {
             RepairMode::Relist => None,
-            RepairMode::Restore | RepairMode::Auto if unanchored => None,
+            RepairMode::Restore | RepairMode::Auto if unanchored_data => None,
             _ => memo.listing_truth(watcher).await?,
         };
-        repair_first = cursorless_start_needs_repair(mode, unanchored, truth);
-        if repair_first && unanchored {
+        repair_first = cursorless_start_needs_repair(mode, unanchored_data, truth);
+        if repair_first && unanchored_data {
             warn!(
                 "the fold holds data but no cursor; repairing it like an expired cursor \
                  before watching (a re-list alone never removes what it doesn't deliver)"
@@ -822,7 +852,8 @@ pub(crate) async fn run_watch<S: Send + 'static>(
 
     loop {
         // The cursor belongs to another incarnation of the stream.
-        let mut foreign = false;
+        let mut foreign = std::mem::take(&mut foreign_start);
+        let stamp = std::mem::take(&mut own_stream);
         let cursor = if std::mem::take(&mut repair_first) {
             WatchCursor::none()
         } else {
@@ -881,7 +912,7 @@ pub(crate) async fn run_watch<S: Send + 'static>(
                     "watch cursor expired; resyncing stale keys, then falling back to the full re-list"
                 );
                 note(health, RepairState::Relisting);
-                resync_stale_keys(reader, scratch, foreign, repairs).await?;
+                resync_stale_keys(reader, scratch, (foreign, stamp), repairs).await?;
                 if let Some(h) = health {
                     h.repair_done();
                 }
@@ -1131,7 +1162,7 @@ fn note(health: Option<&WatchHealth>, state: RepairState) {
 async fn resync_stale_keys<S>(
     reader: &Arc<dyn KvReader>,
     scratch: Option<PathBuf>,
-    foreign: bool,
+    (foreign, stamp): (bool, Option<u64>),
     repairs: &mpsc::Sender<RepairRequest<S>>,
 ) -> Result<(), KvError> {
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -1140,6 +1171,7 @@ async fn resync_stale_keys<S>(
             reader: Arc::clone(reader),
             scratch,
             foreign,
+            stamp,
             ack: ack_tx,
         })
         .await
@@ -1211,6 +1243,7 @@ where
                     reader,
                     scratch,
                     foreign,
+                    stamp,
                     ack,
                 }) = req.take()
                 else {
@@ -1219,6 +1252,7 @@ where
                 if foreign {
                     fold.forget_cursor();
                 }
+                fold.stamp_incarnation(stamp);
                 relist(fold, &*reader, scratch, prefixes).await?;
                 // Ack AFTER the deletes are applied: the watch task is holding
                 // the fallback watch until it hears back, which is what orders
@@ -1389,6 +1423,12 @@ where
                 let Some(r) = restored.take() else {
                     unreachable!("the artifact is held until the reply")
                 };
+                // A fold of this stream with no cursor keeps recording the
+                // stream its chunks are of (the artifact's), so a crash between
+                // chunks leaves data that still names it.
+                if local_known {
+                    fold.stamp_incarnation(target.origin());
+                }
                 restored = Some(fold_chunks(fold, r, spill, deletes, max).await?);
                 fold.decide(Event::RestoreFolded)
             }

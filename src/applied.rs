@@ -378,13 +378,15 @@ where
     // `repair::run_watch`).
     let unanchored = match &store {
         Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => match st.has_entries() {
-            Ok(has) => has,
+            // The incarnation the store's data records as its own: what a fold
+            // with data and no cursor is judged by (`repair::run_watch`).
+            Ok(has) => has.then(|| st.cursor().origin()),
             Err(e) => {
                 let e = KvError::WatchError(format!("reading the fold at start failed: {e}"));
                 return early(e, store);
             }
         },
-        _ => false,
+        _ => None,
     };
 
     // The cursor we'll return. Initialized from the resume position so that a
@@ -878,6 +880,16 @@ where
         // Mutation (model tests only): keep the memo (the pre-fix repair).
         let seen = self.applied.seen_evicting() && cfg!(feature = "mut_foreign_keeps_memo");
         self.applied = WatchCursor::none().remembering(seen);
+    }
+
+    /// A fold of this stream that has no cursor records the stream's incarnation
+    /// on the commits a repair makes under it, so they do not erase the record
+    /// that says whose its data is (a position-less, origin-only cursor).
+    pub(crate) fn stamp_incarnation(&mut self, origin: Option<u64>) {
+        if let (true, Some(o)) = (self.applied.is_none(), origin) {
+            let seen = self.applied.seen_evicting();
+            self.applied = WatchCursor::origin_only(o).remembering(seen);
+        }
     }
 
     /// Remember, durably, that the bucket's retention evicts current values:

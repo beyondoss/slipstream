@@ -28,8 +28,9 @@
 //! # Findings, and what each one changed (every one is a Verus-checked concrete state of the shipped decisions)
 //!
 //! * **F1** the pointer guard compared ranks only: a dead incarnation's pointer above the new head refused every publish of the
-//!   new stream while `same_incarnation` refused to restore from it. FIXED: the guard orders by (incarnation, rank)
-//!   (`protocol::Pos`), so the new stream's first publish replaces the dead pointer. [`finding_f1_*`] states the fix; the liveness
+//!   new stream while `same_incarnation` refused to restore from it. FIXED: a pointer of another incarnation is replaceable
+//!   (`protocol::Pos`: ranks are ordered only within an incarnation, no clock is assumed), so the new stream's first publish
+//!   replaces the dead pointer; the price is F1b below. [`finding_f1_*`] states the fix; the liveness
 //!   theorem no longer assumes the state away.
 //! * **F2** a restore over a fold of a recreated stream kept stale entries by revision number, and refused an artifact below the
 //!   old cursor's rank. FIXED: a fold whose cursor is no position of this stream (none, or another incarnation's, which the repair
@@ -48,12 +49,15 @@
 //! * **A1** retention config is constant inside an incarnation (a toggle is what the `seen_evicting` memo guards, so
 //!   `mut_no_eviction_memo` is not observable in this world); `seen` is carried inside an incarnation and only ever narrows trust;
 //!   the repair of a foreign cursor forgets it (the memo is a fact about the stream that was evicting);
-//! * **A2** positions are `u64`; the stream's revision numbers fit (below `2^63`); incarnations (creation times) fit `u64` and a
-//!   recreation's is larger than the stream it replaces (O4 of `transport_proofs`);
+//! * **A2** positions are `u64`; the stream's revision numbers fit (below `2^63`); incarnations (creation times) fit `u64` (no
+//!   order between incarnations is assumed);
 //! * **A3** the pointer object is written only by publishes (`transport_proofs`, O2);
 //! * a cursor with no recorded origin (written before cursors recorded one) is excluded: `tests/model_incarnation.rs` owns it;
-//! * a fold that holds data and NO cursor (a torn first checkpoint) is taken to be of the current stream: nothing in it names an
-//!   incarnation, so a restore cannot tell it from this stream's, and keeps its newer entries (`model_repair`'s "never backward");
+//! * a fold that holds data and NO cursor (a torn first checkpoint) names its stream: `Node::origin` is the fold's durable record
+//!   of its incarnation (written before its first data record: `AppendLogSnapshot::apply`; with the data in one atomic batch in
+//!   the other backends), and the shell judges it against the stream that exists now (`cursorless_fold_is_this_stream`, proven
+//!   in `protocol.rs`: an exact match is this stream's; another incarnation, or no record, is foreign: one origin is
+//!   `Node::origin != l.origin`, the foreign path of every theorem below);
 //! * the liveness fairness axioms below (F-a to F-d).
 
 use crate::kernels::applied::*;
@@ -1627,9 +1631,9 @@ pub proof fn finding_f2_a_restore_over_a_foreign_fold_takes_the_artifacts_entry(
 /// FINDING F1 (a dead incarnation's pointer wedged publishing), FIXED: the pointer guard used to compare ranks only
 /// (`pointer_publish_allowed`, `transport::swap_pointer`), never the incarnation. After the stream is recreated, a pointer whose
 /// artifact is the OLD stream's, ranked above the new stream's head, refused every publish of the new stream until its head
-/// passed that rank, while `same_incarnation` refused to restore from it. Now the guard orders by (incarnation, rank): a publish of
+/// passed that rank, while `same_incarnation` refused to restore from it. Now a pointer of another incarnation is replaceable (ranks are ordered only within one; no clock is assumed): a publish of
 /// the current incarnation is admitted over any pointer of a dead one, whatever its rank (`mut_pointer_ignores_incarnation`
-/// forges the old guard: this proof goes red), and a publish of a dead incarnation is refused over the current one's.
+/// forges the old guard: this proof goes red).
 pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publish(l: Log, a: Art, c: nat)
     requires
         log_ok(l),
@@ -1639,7 +1643,23 @@ pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publi
         c <= umax(),
     ensures
         publish_allowed_spec(ptr_state(Some(a)), art_pos(l.origin, c)),
-        !publish_allowed_spec(ptr_state(Some(Art { origin: l.origin, cursor: c, fold: a.fold })), art_pos(a.origin, a.cursor)),
+{
+}
+
+/// FINDING F1b (the price of F1's fix, reported, not assumed away): with no order between incarnations, a slow exporter of a dead
+/// incarnation `b` may replace the live pointer (admitted: another incarnation's), and a STALE live exporter may then replace
+/// that (admitted likewise) with a payload the prune guard has already deleted (it was strictly below the live pointer `(a, R)`
+/// when pruned). Every step is a guard verdict below: the pointer then names a payload that does not exist, until the next live
+/// publish replaces it. `transport_proofs` proves the protocol within one incarnation, where this cannot happen. Closing it
+/// needs either an order between incarnations (the creation-time axiom, refused) or the swap to check its payload still exists.
+pub proof fn finding_f1b_a_dead_exporter_lets_a_pruned_payload_be_published(a: u64, b: u64, r: u64, big: u64)
+    requires
+        a != b,
+        r < big,
+    ensures
+        prunable_spec(Some(Pos { origin: a, rank: r }), Pos { origin: a, rank: big }, false, true),
+        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: a, rank: big }) }, Pos { origin: b, rank: 1 }),
+        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: b, rank: 1 }) }, Pos { origin: a, rank: r }),
 {
 }
 

@@ -14,6 +14,7 @@
 //! | [`listing_is_truth`] / [`listing_truth`] | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention; repair-steps `ConfigForgot` |
 //! | [`plan_repair`]            | `repair::plan`, `Snapshot::stale_keys` | expiry dispatch in every model |
 //! | [`cursorless_start_needs_repair`] | `repair::run_watch`          | repair-steps `WStart`, fleet `Start` |
+//! | [`cursorless_fold_is_this_stream`] | `repair::run_watch` (a fold with data and no cursor) | `tests/recreated_fleet.rs` (live) |
 //! | [`restore_key`]            | `repair::restore_diff`              | repair-steps restore op |
 //! | [`gap_holds_no_eviction`]  | `nats` resume (`NatsKvWatcher::resume_point`) | — (unit-tested; `tests/eviction.rs` live) |
 //!
@@ -36,22 +37,20 @@ use vstd::prelude::*;
 // decides, the lemmas are the safety arguments the doc comments make in prose. A normal build erases all of it.
 verus! {
 
-/// A position in the artifact order: the stream incarnation a cursor was taken from, then its revision. Incarnations are
-/// ordered by the stream's creation time ([`same_incarnation`]'s `origin`; 0 for a cursor that records none, older than
-/// every recorded one), revisions within one. Environment axiom **O4**: a bucket recreated under its name is created later
-/// than the stream it replaces (NATS stamps `created` from the server's clock); a clock that steps back across a recreation
-/// leaves the old pointer standing until the new stream's head passes it: loud as a refused publish, never a regression.
+/// A position in the artifact order: the stream incarnation a cursor was taken from (its creation time in Unix ns; 0 for a cursor
+/// that records none) and its revision. Revisions are ordered only WITHIN an incarnation: nothing orders two incarnations (no
+/// clock is assumed), and only one is live at a time. A position of another incarnation is replaceable, not older or newer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pos {
-    /// The stream incarnation (creation time in Unix ns; 0 when the cursor records none).
+    /// The stream incarnation (0 when the cursor records none).
     pub origin: u64,
     /// The cursor's revision.
     pub rank: u64,
 }
 
-/// `a` is strictly before `b`: an older incarnation, or the same one at a lower revision.
+/// `a` is strictly below `b`: the same incarnation at a lower revision. Positions of different incarnations are incomparable.
 pub open spec fn pos_lt(a: Pos, b: Pos) -> bool {
-    a.origin < b.origin || (a.origin == b.origin && a.rank < b.rank)
+    a.origin == b.origin && a.rank < b.rank
 }
 
 /// What the publisher observed at the pointer key before deciding.
@@ -72,20 +71,18 @@ pub enum PointerState {
 /// THE monotonic pointer guard: may `candidate` be published over the
 /// observed `current` pointer?
 ///
-/// `true` for an open slot, a corrupt pointer, or a candidate at or above
-/// the existing cursor in ([`Pos`]) order; `false` exactly when the existing
-/// pointer is parseable and STRICTLY newer — the refusal that makes a slow
-/// exporter's stale publish a no-op instead of a regression. The order is the
-/// incarnation first: a pointer of a dead incarnation, whatever its revision,
-/// is replaced by the first publish of the stream that replaced it, and never
-/// replaces it back. (Ranks alone left such a pointer, ranked above the new
-/// head, refusing every publish of the new stream.)
+/// `true` for an open slot, a corrupt pointer, a pointer of ANOTHER incarnation than the candidate's, or a candidate at or above
+/// the existing cursor in its own incarnation; `false` exactly when the existing pointer is parseable, of the candidate's
+/// incarnation, and STRICTLY higher — the refusal that makes a slow exporter's stale publish a no-op instead of a regression.
+/// A pointer of a dead incarnation, whatever its revision, never refuses a publish of the incarnation that replaced it (ranks
+/// alone left such a pointer, ranked above the new head, refusing every publish of the new stream): it is foreign, like a corrupt
+/// one, and replaceable. A slow exporter of the dead stream can replace the live pointer once; the next live publish replaces it
+/// (restorers refuse it meanwhile: `same_incarnation`).
 ///
-/// Soundness of deciding on a read (before the conditional put): every
-/// writer uses this guard with a compare-and-swap, so the pointer's position is
-/// monotone non-decreasing — once "strictly newer" is observed, it can never
-/// become false, so refusal needs no CAS. Machine-checked as `published
-/// cursor never regresses` in `tests/model.rs`.
+/// Soundness of deciding on a read (before the conditional put): every writer uses this guard with a compare-and-swap, so while
+/// the pointer stays in one incarnation its rank is monotone non-decreasing — once "strictly higher" is observed, it stays so
+/// until the pointer leaves that incarnation, so refusal needs no CAS. Machine-checked as `published cursor never regresses` in
+/// `tests/model.rs` (one incarnation).
 pub fn pointer_publish_allowed(current: &PointerState, candidate: Pos) -> (r: bool)
     ensures
         r == publish_allowed_spec(*current, candidate),
@@ -105,13 +102,12 @@ pub fn pointer_publish_allowed(current: &PointerState, candidate: Pos) -> (r: bo
             } else {
                 *existing
             };
-            candidate.origin > existing.origin
-                || (candidate.origin == existing.origin && candidate.rank >= existing.rank)
+            candidate.origin != existing.origin || candidate.rank >= existing.rank
         },
     }
 }
 
-/// [`pointer_publish_allowed`]: refused exactly when the existing pointer is parseable and strictly newer.
+/// [`pointer_publish_allowed`]: refused exactly when the existing pointer is parseable, of the candidate's incarnation, and higher.
 pub open spec fn publish_allowed_spec(current: PointerState, candidate: Pos) -> bool {
     !(current is Present && current->Present_at is Some && pos_lt(candidate, current->Present_at->Some_0))
 }
@@ -121,31 +117,31 @@ pub open spec fn published(candidate: Pos) -> PointerState {
     PointerState::Present { at: Some(candidate) }
 }
 
-/// THEOREM (monotone pointer): an admitted publish never lowers a parseable pointer, so the pointer's position is monotone
-/// non-decreasing under every interleaving of admitted publishes: across incarnations by creation time (O4), within one by
-/// revision. This is what lets a refusal be decided on a read.
-pub proof fn a_publish_never_regresses_the_pointer(current: PointerState, candidate: Pos)
+/// THEOREM (monotone within an incarnation): an admitted publish over a parseable pointer of its own incarnation never lowers it,
+/// so while the pointer stays in an incarnation its rank is monotone non-decreasing under every interleaving of admitted
+/// publishes. This is what lets a refusal be decided on a read.
+pub proof fn a_publish_never_regresses_the_pointer_within_an_incarnation(current: PointerState, candidate: Pos)
     requires
         publish_allowed_spec(current, candidate),
+        current is Present && current->Present_at is Some && current->Present_at->Some_0.origin == candidate.origin,
     ensures
-        (current is Present && current->Present_at is Some)
-            ==> !pos_lt(published(candidate)->Present_at->Some_0, current->Present_at->Some_0),
+        candidate.rank >= current->Present_at->Some_0.rank,
 {
 }
 
-/// THEOREM (a dead incarnation's pointer never refuses a newer incarnation): whatever revision the pointer holds, a candidate
-/// of a later incarnation is admitted. The pointer of a deleted and recreated bucket is replaced by the new stream's first
-/// publish, even when ranked above the new head.
-pub proof fn a_newer_incarnation_replaces_any_pointer(current: PointerState, candidate: Pos)
+/// THEOREM (liveness: a dead incarnation's pointer never refuses a live exporter): whatever revision the pointer holds, a candidate
+/// of another incarnation is admitted, with no assumption about time or about which incarnation is newer. The pointer of a deleted
+/// and recreated bucket is replaced by the new stream's first publish, even when ranked above the new head.
+pub proof fn a_pointer_of_another_incarnation_never_refuses_a_publish(current: PointerState, candidate: Pos)
     requires
-        current is Present && current->Present_at is Some ==> candidate.origin > current->Present_at->Some_0.origin,
+        current is Present && current->Present_at is Some ==> candidate.origin != current->Present_at->Some_0.origin,
     ensures
         publish_allowed_spec(current, candidate),
 {
 }
 
-/// THEOREM (liveness of the publish guard): the refusal clears. An open slot, a corrupt pointer, and any candidate at or above
-/// the pointer are always admitted, so an exporter that retries with a cursor at or above the pointer's succeeds. A stale
+/// THEOREM (liveness of the publish guard): the refusal clears. An open slot, a corrupt pointer, a pointer of another
+/// incarnation, and any candidate at or above the pointer in its incarnation are always admitted, so an exporter that retries with a cursor at or above the pointer's succeeds. A stale
 /// publish is refused only while the pointer is strictly newer, and the pointer never regresses, so it stays refused: the
 /// exporter's exit is a fresher export, never a retry of the stale one. Rank: none needed, the guard is stateless.
 pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState, candidate: Pos)
@@ -166,13 +162,18 @@ pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState
 /// - its age has cleared the grace period (`aged_out`; the model passes
 ///   `true`, checking the harshest zero-grace timing).
 ///
-/// Strictly-below is what makes a dangling pointer impossible regardless of
-/// timing: [`pointer_publish_allowed`] refuses any candidate below the
-/// pointer, and the pointer is monotone — so anything this guard deletes
-/// (position < pointer-at-prune ≤ pointer-at-any-later-swap) can never be
-/// successfully published afterward. The payload's name carries its
-/// incarnation as well as its revision for that reason: a revision alone
-/// cannot say whether a payload of another incarnation is below the pointer.
+/// Strictly-below, in the pointer's own incarnation, is what makes a dangling
+/// pointer impossible regardless of timing, WHILE THE POINTER STAYS IN THAT
+/// INCARNATION: [`pointer_publish_allowed`] refuses any candidate below the
+/// pointer in its incarnation, and the pointer's rank is monotone there — so
+/// anything this guard deletes (rank < pointer-at-prune ≤ pointer-at-any-later
+/// -swap) can never be successfully published afterward. The payload's name
+/// carries its incarnation as well as its revision so that a payload of another
+/// incarnation is never judged by a revision that means nothing to it (it is
+/// never pruned here). The bound is real: a slow exporter of a dead
+/// incarnation can move the pointer out of the live one, and a stale live
+/// exporter can then publish a payload this guard already deleted (fleet
+/// finding F1b, `fleet_proofs`); the next live publish replaces that pointer.
 /// The model checker FOUND the dangling
 /// counterexample under the earlier age-only rule (a same-cursor payload
 /// collected mid-publish, then published by the `>=` swap guard); this rule
@@ -191,7 +192,7 @@ pub fn payload_prunable(
         return false;
     }
     match payload {
-        Some(p) => p.origin < pointer.origin || (p.origin == pointer.origin && p.rank < pointer.rank),
+        Some(p) => p.origin == pointer.origin && p.rank < pointer.rank,
         None => false,
     }
 }
@@ -206,9 +207,10 @@ pub open spec fn prunable_spec(
     !is_pointer_target && aged_out && payload is Some && pos_lt(payload->Some_0, pointer)
 }
 
-/// THEOREM (no dangling pointer): a payload the prune guard deletes can never be published afterwards. The pointer's position is
-/// monotone ([`a_publish_never_regresses_the_pointer`]), so at any later swap it is `later >= pointer > payload` in [`Pos`] order,
-/// and the publish guard refuses that candidate. Holds for every timing, including zero grace (`aged_out` is a free input).
+/// THEOREM (no dangling pointer, within an incarnation): a payload the prune guard deletes can never be published afterwards while
+/// the pointer stays in its incarnation. The rank is monotone there ([`a_publish_never_regresses_the_pointer_within_an_incarnation`]),
+/// so at any later swap it is `later >= pointer > payload`, and the publish guard refuses that candidate. Holds for every timing,
+/// including zero grace (`aged_out` is a free input). Across incarnations it does not hold: see F1b.
 pub proof fn a_pruned_payload_is_never_published_after(
     payload: Pos,
     pointer: Pos,
@@ -218,7 +220,8 @@ pub proof fn a_pruned_payload_is_never_published_after(
 )
     requires
         prunable_spec(Some(payload), pointer, is_pointer_target, aged_out),
-        !pos_lt(later_pointer, pointer),
+        later_pointer.origin == pointer.origin,
+        later_pointer.rank >= pointer.rank,
     ensures
         !publish_allowed_spec(PointerState::Present { at: Some(later_pointer) }, payload),
 {
@@ -324,6 +327,33 @@ pub open spec fn same_incarnation_spec(
         Some(origin) => origin == stream_origin,
         None => revision <= last_sequence,
     }
+}
+
+/// THE provenance guard for a fold that holds data and NO cursor (a torn first checkpoint, or a restore cut short): is its data of
+/// the stream that exists now? The fold persists its stream's incarnation (`recorded`) before any data; the stream's own is
+/// `stream` (`Retention::incarnation`). Only an exact match is this stream's. A fold that names another incarnation is foreign, and
+/// so is one that names none (a file written before folds recorded one: a one-time re-seed on upgrade) or a stream that cannot say:
+/// what cannot be proven to be this stream's is treated as foreign, and the repair replaces it key for key.
+pub fn cursorless_fold_is_this_stream(recorded: Option<u64>, stream: Option<u64>) -> (r: bool)
+    ensures
+        r == cursorless_fold_spec(recorded, stream),
+        recorded is None ==> !r,
+        stream is None ==> !r,
+        (recorded is Some && stream is Some && recorded->Some_0 != stream->Some_0) ==> !r,
+{
+    // Mutation (model tests only): trust any fold with data and no cursor (the pre-provenance restore).
+    if cfg!(feature = "mut_cursorless_fold_trusted") {
+        return true;
+    }
+    match (recorded, stream) {
+        (Some(r), Some(s)) => r == s,
+        _ => false,
+    }
+}
+
+/// [`cursorless_fold_is_this_stream`]'s table.
+pub open spec fn cursorless_fold_spec(recorded: Option<u64>, stream: Option<u64>) -> bool {
+    recorded is Some && stream is Some && recorded->Some_0 == stream->Some_0
 }
 
 /// THE restore guard: may a fold whose cursor (`local_revision`) fell out of
@@ -760,11 +790,11 @@ mod tests {
         );
         // A dead incarnation's pointer, ranked above the new head, is replaced...
         assert!(pointer_publish_allowed(&at(1, 500), pos(2, 3)));
-        // ...and never replaces the newer incarnation's.
-        assert!(!pointer_publish_allowed(&at(2, 3), pos(1, 500)));
-        // A pointer that records no incarnation is older than every recorded one.
+        // ...and nothing orders incarnations: no clock is assumed, a pointer of another incarnation is replaceable either way.
+        assert!(pointer_publish_allowed(&at(2, 3), pos(1, 500)));
+        // A pointer that records no incarnation is another incarnation to every recorded one.
         assert!(pointer_publish_allowed(&at(0, 500), pos(2, 3)));
-        assert!(!pointer_publish_allowed(&at(2, 3), pos(0, 500)));
+        assert!(pointer_publish_allowed(&at(2, 3), pos(0, 500)));
     }
 
     #[test]
@@ -776,8 +806,8 @@ mod tests {
         // Equal position is NOT prunable: it is still publishable (>= guard).
         assert!(!payload_prunable(pos(2, 5), ptr, false, true));
         assert!(!payload_prunable(pos(2, 6), ptr, false, true));
-        // An older incarnation is below, whatever its revision; a newer one is above.
-        assert!(payload_prunable(pos(1, 500), ptr, false, true));
+        // A payload of another incarnation is never judged by a revision that means nothing to it.
+        assert!(!payload_prunable(pos(1, 4), ptr, false, true));
         assert!(!payload_prunable(pos(3, 1), ptr, false, true));
         // The pointer's own target and unparseable names are never prunable.
         assert!(!payload_prunable(pos(2, 4), ptr, true, true));

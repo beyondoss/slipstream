@@ -17,8 +17,11 @@
 //! * **O1** a payload path names its content for ever (content addressing; a hash collision is the only way to break it);
 //! * **O2** the pointer object is written only by [`Act::Swap`] (nothing else deletes or rewrites it);
 //! * **O3** a compare-and-swap succeeds exactly when the object is unchanged since the read (`ver`);
-//! * **O4** the stream incarnations of one bucket are ordered by creation time: a recreated stream is created later (the
-//!   incarnation is the creation time in Unix ns; the order of [`Pos`]).
+//! * **O4** (scope) the pointer stays in one incarnation: every payload and the pointer are of [`TS::inc`]. Across incarnations
+//!   nothing orders them (no clock is assumed): a pointer of another incarnation is replaceable (`a_pointer_of_another_incarnation_
+//!   never_refuses_a_publish`, proven on the guard), and what that costs is FINDING F1b in `fleet_proofs`: a slow exporter of a dead
+//!   incarnation moves the pointer out, and a stale live exporter can then publish a payload a prune already deleted. The
+//!   invariants below are therefore the within-incarnation protocol, which is what every pointer swap of a live fleet runs.
 
 use crate::kernels::protocol::*;
 use vstd::prelude::*;
@@ -52,6 +55,8 @@ pub enum Actor {
 }
 
 pub struct TS {
+    /// The incarnation every payload and the pointer belong to (the scope of this proof).
+    pub inc: u64,
     /// The pointer's target payload, once one is published. Its position is the target's.
     pub ptr: Option<Payload>,
     /// Successful swaps so far.
@@ -97,7 +102,7 @@ pub open spec fn valid(s: TS, i: int) -> bool {
 
 pub open spec fn enabled(s: TS, a: Act) -> bool {
     match a {
-        Act::Upload(i, p) => valid(s, i) && actor(s, i) is Idle,
+        Act::Upload(i, p) => valid(s, i) && actor(s, i) is Idle && p.origin == s.inc,
         Act::Observe(i) => valid(s, i) && actor(s, i) is Uploaded,
         Act::Swap(i) => valid(s, i) && actor(s, i) is Observed && actor(s, i)->Observed_ver == s.ver,
         Act::Reread(i) => valid(s, i) && actor(s, i) is Observed && actor(s, i)->Observed_ver != s.ver,
@@ -149,8 +154,9 @@ pub open spec fn actor_ok(s: TS, a: Actor) -> bool {
     match a {
         Actor::Idle => true,
         // An uploaded payload exists, or was pruned because the pointer is strictly past it.
-        Actor::Uploaded { p } => s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0))),
+        Actor::Uploaded { p } => p.origin == s.inc && (s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0)))),
         Actor::Observed { p, st, ver } => {
+            &&& p.origin == s.inc
             &&& publish_allowed_spec(st, pos(p))
             &&& ver <= s.ver
             // Same as `Uploaded`, whatever the version: a lost CAS goes back to `Uploaded`.
@@ -158,23 +164,23 @@ pub open spec fn actor_ok(s: TS, a: Actor) -> bool {
             // The read is current while the version is: so the guard's verdict still stands.
             &&& (ver == s.ver ==> st == pstate(s.ptr))
         },
-        Actor::Pruning { pr, keep } => s.ptr is Some && !pos_lt(pos(s.ptr->Some_0), pr),
-        Actor::Fetching { t } => s.objs.contains(t) || (s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0))),
+        Actor::Pruning { pr, keep } => s.ptr is Some && pr.origin == s.inc && pr.rank <= s.ptr->Some_0.rank,
+        Actor::Fetching { t } => t.origin == s.inc && (s.objs.contains(t) || (s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0)))),
     }
 }
 
 /// THE invariant: the pointer's target exists, and every actor's reads are consistent.
 pub open spec fn inv(s: TS) -> bool {
-    &&& s.ptr is Some ==> s.objs.contains(s.ptr->Some_0)
+    &&& s.ptr is Some ==> s.objs.contains(s.ptr->Some_0) && s.ptr->Some_0.origin == s.inc
     &&& forall|i: int| 0 <= i < s.actors.len() ==> actor_ok(s, #[trigger] s.actors[i])
 }
 
 /// THEOREM: the empty store with `n` idle actors satisfies the invariant, for any `n`.
-pub proof fn a_fresh_store_satisfies_the_invariant(actors: Seq<Actor>)
+pub proof fn a_fresh_store_satisfies_the_invariant(inc: u64, actors: Seq<Actor>)
     requires
         forall|i: int| 0 <= i < actors.len() ==> #[trigger] actors[i] is Idle,
     ensures
-        inv(TS { ptr: None, ver: 0, objs: Set::empty(), actors }),
+        inv(TS { inc, ptr: None, ver: 0, objs: Set::empty(), actors }),
 {
 }
 
@@ -232,7 +238,7 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
                 assert(actor_ok(s, s.actors[i]));
                 // `o` is strictly below the pruner's read of the pointer, which is at most the pointer's position now.
                 assert(pos_lt(pos(o), pr));
-                assert(!pos_lt(pos(t), pr));
+                assert(pr.rank <= t.rank);
             },
             Act::FetchRead(i) => {
                 if j != i {
@@ -272,17 +278,15 @@ pub proof fn the_pointer_never_regresses(s: TS, a: Act)
         inv(s),
         enabled(s, a),
     ensures
-        s.ptr is Some ==> step(s, a).ptr is Some && !pos_lt(pos(step(s, a).ptr->Some_0), pos(s.ptr->Some_0)),
-        ({ let ps = pstate(s.ptr); let q = pstate(step(s, a).ptr);
-            (ps is Present && ps->Present_at is Some) ==> q is Present && q->Present_at is Some
-                && !pos_lt(q->Present_at->Some_0, ps->Present_at->Some_0) }),
+        s.ptr is Some ==> step(s, a).ptr is Some && step(s, a).ptr->Some_0.rank >= s.ptr->Some_0.rank
+            && step(s, a).ptr->Some_0.origin == s.inc,
 {
     match a {
         Act::Swap(i) => {
             assert(actor_ok(s, s.actors[i]));
             let p = actor(s, i)->Observed_p;
             if s.ptr is Some {
-                a_publish_never_regresses_the_pointer(pstate(s.ptr), pos(p));
+                a_publish_never_regresses_the_pointer_within_an_incarnation(pstate(s.ptr), pos(p));
             }
         },
         _ => {},

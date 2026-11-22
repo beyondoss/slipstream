@@ -107,6 +107,8 @@ mut_restore_ignores_versions = []
 mut_restore_ignores_listing = []
 # The pointer guard compares revisions across incarnations (a dead incarnation's pointer wedges publishing).
 mut_pointer_ignores_incarnation = []
+# A fold with data and no cursor is trusted whatever stream it records.
+mut_cursorless_fold_trusted = []
 # A foreign cursor keeps its eviction memo (the old stream's) through the repair.
 mut_foreign_keeps_memo = []
 # The restore trusts a fold of another incarnation (a recreated bucket's old fold decides keys by its own revision numbers).
