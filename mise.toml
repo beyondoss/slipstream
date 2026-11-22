@@ -25,3 +25,7 @@ run = "dprint fmt"
 [tasks."format:check"]
 description = "Verify code formatting without making changes (CI-friendly)"
 run = "dprint check"
+
+[tasks.verify]
+description = "Prove the kernels (src/kernels) with the pinned Verus (dev/verus/VERSION.env): `cargo verus verify`, no axioms. Installs Verus under ~/.cache/verus on first use. Pass `-- --features mut_x` to watch a mutation turn the proof red."
+run = "dev/scripts/verify.sh"

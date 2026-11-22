@@ -9,3 +9,6 @@
 // `tests/model_resync_order.rs` (re-exported as `cursor_kernel`).
 pub mod applied;
 pub mod protocol;
+// The invariant and progress proofs over `applied::step`: spec and proof code only, so a normal build has nothing to compile.
+#[cfg(verus_keep_ghost)]
+mod applied_proofs;

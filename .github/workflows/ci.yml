@@ -39,3 +39,16 @@ jobs:
       # The default-features surface consumers without the optional backends
       # actually compile against.
       - run: cargo test --lib --tests
+  # The kernels' proofs (src/kernels, `verus!` blocks): Verus pinned in dev/verus/VERSION.env, a fresh target dir, no
+  # errors. A normal build erases the proofs, so no other job needs Verus.
+  verify:
+    name: Verify (Verus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/verus
+          key: verus-${{ hashFiles('dev/verus/VERSION.env') }}
+      - run: dev/scripts/verify.sh

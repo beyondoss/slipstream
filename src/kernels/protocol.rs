@@ -30,6 +30,11 @@
 //! free of I/O types and usable from the checker's `u8`-bounded state space.
 
 use crate::kv::Retention;
+use vstd::prelude::*;
+
+// Every function below is proven against its spec by Verus (`mise run verify`): the specs say exactly what each
+// decides, the lemmas are the safety arguments the doc comments make in prose. A normal build erases all of it.
+verus! {
 
 /// What the publisher observed at the pointer key before deciding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,14 +64,49 @@ pub enum PointerState {
 /// monotone non-decreasing — once "strictly newer" is observed, it can never
 /// become false, so refusal needs no CAS. Machine-checked as `published
 /// cursor never regresses` in `tests/model.rs`.
-pub fn pointer_publish_allowed(current: &PointerState, candidate_rank: u64) -> bool {
+pub fn pointer_publish_allowed(current: &PointerState, candidate_rank: u64) -> (r: bool)
+    ensures
+        r == publish_allowed_spec(*current, candidate_rank),
+{
     match current {
         PointerState::Absent => true,
         PointerState::Present { rank: None } => true,
-        PointerState::Present {
-            rank: Some(existing),
-        } => candidate_rank >= *existing,
+        PointerState::Present { rank: Some(existing) } => candidate_rank >= *existing,
     }
+}
+
+/// [`pointer_publish_allowed`]: refused exactly when the existing pointer is parseable and strictly newer.
+pub open spec fn publish_allowed_spec(current: PointerState, candidate_rank: u64) -> bool {
+    !(current is Present && current->Present_rank is Some
+        && current->Present_rank->Some_0 > candidate_rank)
+}
+
+/// The pointer after a publish that [`pointer_publish_allowed`] admitted: the candidate's cursor.
+pub open spec fn published(candidate_rank: u64) -> PointerState {
+    PointerState::Present { rank: Some(candidate_rank) }
+}
+
+/// THEOREM (monotone pointer): an admitted publish never lowers a parseable pointer, so the pointer's rank is monotone
+/// non-decreasing under every interleaving of admitted publishes. This is what lets a refusal be decided on a read.
+pub proof fn a_publish_never_regresses_the_pointer(current: PointerState, candidate_rank: u64)
+    requires
+        publish_allowed_spec(current, candidate_rank),
+    ensures
+        (current is Present && current->Present_rank is Some)
+            ==> published(candidate_rank)->Present_rank->Some_0 >= current->Present_rank->Some_0,
+{
+}
+
+/// THEOREM (liveness of the publish guard): the refusal clears. An open slot, a corrupt pointer, and any candidate at or above
+/// the pointer are always admitted, so an exporter that retries with a cursor at or above the pointer's succeeds. A stale
+/// publish is refused only while the pointer is strictly newer, and the pointer never regresses, so it stays refused: the
+/// exporter's exit is a fresher export, never a retry of the stale one. Rank: none needed, the guard is stateless.
+pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState, candidate_rank: u64)
+    requires
+        current is Present && current->Present_rank is Some ==> candidate_rank >= current->Present_rank->Some_0,
+    ensures
+        publish_allowed_spec(current, candidate_rank),
+{
 }
 
 /// THE prune guard: may this payload object be deleted, given the current
@@ -93,8 +133,57 @@ pub fn payload_prunable(
     pointer_rank: u64,
     is_pointer_target: bool,
     aged_out: bool,
+) -> (r: bool)
+    ensures
+        r == prunable_spec(payload_rank, pointer_rank, is_pointer_target, aged_out),
+{
+    if is_pointer_target || !aged_out {
+        return false;
+    }
+    match payload_rank {
+        Some(rank) => rank < pointer_rank,
+        None => false,
+    }
+}
+
+/// [`payload_prunable`]: not the target, aged out, and parseable strictly below the pointer.
+pub open spec fn prunable_spec(
+    payload_rank: Option<u64>,
+    pointer_rank: u64,
+    is_pointer_target: bool,
+    aged_out: bool,
 ) -> bool {
-    !is_pointer_target && aged_out && payload_rank.is_some_and(|rank| rank < pointer_rank)
+    !is_pointer_target && aged_out && payload_rank is Some && payload_rank->Some_0 < pointer_rank
+}
+
+/// THEOREM (no dangling pointer): a payload the prune guard deletes can never be published afterwards. The pointer's rank is
+/// monotone ([`a_publish_never_regresses_the_pointer`]), so at any later swap it is `later >= pointer_rank > payload`, and the
+/// publish guard refuses that candidate. Holds for every timing, including zero grace (`aged_out` is a free input).
+pub proof fn a_pruned_payload_is_never_published_after(
+    payload_rank: u64,
+    pointer_rank: u64,
+    later_pointer_rank: u64,
+    is_pointer_target: bool,
+    aged_out: bool,
+)
+    requires
+        prunable_spec(Some(payload_rank), pointer_rank, is_pointer_target, aged_out),
+        later_pointer_rank >= pointer_rank,
+    ensures
+        !publish_allowed_spec(PointerState::Present { rank: Some(later_pointer_rank) }, payload_rank),
+{
+}
+
+/// THEOREM: the pointer's own target and an unparseable payload are never pruned, whatever the ranks and ages.
+pub proof fn the_target_and_unknown_objects_are_never_pruned(
+    payload_rank: Option<u64>,
+    pointer_rank: u64,
+    aged_out: bool,
+)
+    ensures
+        !prunable_spec(payload_rank, pointer_rank, true, aged_out),
+        !prunable_spec(None, pointer_rank, false, aged_out),
+{
 }
 
 /// THE cursor-expiry guard: is resuming from `revision` sound, given the
@@ -123,8 +212,17 @@ pub fn payload_prunable(
 /// This answers only whether the window is intact; it holds at
 /// `revision == u64::MAX`. The sequence to start at must come from
 /// [`resume_start_sequence`], which refuses to wrap there.
-pub fn resume_window_ok(revision: u64, first_sequence: u64) -> bool {
-    first_sequence <= revision.saturating_add(1)
+pub fn resume_window_ok(revision: u64, first_sequence: u64) -> (r: bool)
+    ensures
+        r == resume_window_spec(revision, first_sequence),
+{
+    // `saturating_add(1)` in plain terms: at `u64::MAX` every first sequence is in the window.
+    revision == u64::MAX || first_sequence <= revision + 1
+}
+
+/// [`resume_window_ok`], in unbounded integers: nothing below `revision + 1` has been head-evicted.
+pub open spec fn resume_window_spec(revision: u64, first_sequence: u64) -> bool {
+    first_sequence as int <= revision as int + 1
 }
 
 /// THE incarnation guard: is a cursor's position the CURRENT stream's?
@@ -152,7 +250,16 @@ pub fn same_incarnation(
     revision: u64,
     stream_origin: u64,
     last_sequence: u64,
-) -> bool {
+) -> (r: bool)
+    ensures
+        r == match cursor_origin {
+            Some(origin) => origin == stream_origin,
+            None => revision <= last_sequence,
+        },
+        // A recorded origin decides alone: the position is never consulted, so a recreated stream refuses an old cursor
+        // wherever it falls.
+        cursor_origin is Some ==> (r <==> cursor_origin->Some_0 == stream_origin),
+{
     match cursor_origin {
         Some(origin) => origin == stream_origin,
         None => revision <= last_sequence,
@@ -177,7 +284,12 @@ pub fn same_incarnation(
 /// (or was read before a stream was recreated). Machine-checked in
 /// `tests/model.rs` (`RestoreRead`) and `tests/model_live_watch.rs`
 /// (`GuardRepair`).
-pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
+pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> (r: bool)
+    ensures
+        r == (artifact_revision > local_revision && resume_window_spec(artifact_revision, first_sequence)),
+        // Never backward, never stale: an admitted restore is strictly ahead of the fold and resumable from its cursor.
+        r ==> artifact_revision > local_revision && first_sequence as int <= artifact_revision as int + 1,
+{
     // Mutation (model tests only): no guard.
     if cfg!(feature = "mut_no_restore_guard") {
         return true;
@@ -189,8 +301,28 @@ pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequen
 /// The "ahead" half of [`restore_allowed`], on its own: what the main loop
 /// re-checks against its own applied cursor (a mid-watch expiry delivered
 /// past the resume cursor the watch task checked against).
-pub fn restore_ahead(artifact_revision: u64, local_revision: u64) -> bool {
+pub fn restore_ahead(artifact_revision: u64, local_revision: u64) -> (r: bool)
+    ensures
+        r == (artifact_revision > local_revision),
+{
     artifact_revision > local_revision
+}
+
+/// THEOREM (liveness of the restore guard): a restore is refused only for a cause that is the artifact's own: it is not ahead
+/// of the fold, or its cursor is already below the log's first retained revision. A fresh export (a cursor above the local
+/// one, inside the retention window) is always admitted, so the refusal clears when the exporter publishes one: the fairness
+/// assumption is the environment's (the exporter keeps exporting; NATS keeps its window while it does).
+pub proof fn a_fresh_artifact_is_always_restorable(
+    artifact_revision: u64,
+    local_revision: u64,
+    first_sequence: u64,
+)
+    requires
+        artifact_revision > local_revision,
+        first_sequence as int <= artifact_revision as int + 1,
+    ensures
+        resume_window_spec(artifact_revision, first_sequence) && artifact_revision > local_revision,
+{
 }
 
 /// Is the bucket's key listing the truth — does "not listed" mean
@@ -205,7 +337,12 @@ pub fn listing_is_truth(
     evicts_current_values: bool,
     first_revision: u64,
     seen_evicting: bool,
-) -> bool {
+) -> (r: bool)
+    ensures
+        r == listing_is_truth_spec(evicts_current_values, first_revision, seen_evicting),
+        // Once the fold has seen eviction in force, the listing is never the truth again, whatever the config says now.
+        seen_evicting ==> !r,
+{
     // Mutations (model tests only): trust the listing on an evicting bucket;
     // forget what the fold saw.
     if cfg!(feature = "mut_relist_on_evicting") {
@@ -215,18 +352,34 @@ pub fn listing_is_truth(
     !seen_evicting && (!evicts_current_values || resume_window_ok(0, first_revision))
 }
 
-/// [`listing_is_truth`] for retention as a watcher reports it: `None` when
-/// the backend can't say and the fold never saw it evict — then the caller's
-/// chosen repair decides ([`plan_repair`]).
-pub fn listing_truth(retention: Option<Retention>, seen_evicting: bool) -> Option<bool> {
+/// [`listing_is_truth`]: never seen evicting, and either retention keeps current values or nothing has been evicted yet.
+pub open spec fn listing_is_truth_spec(
+    evicts_current_values: bool,
+    first_revision: u64,
+    seen_evicting: bool,
+) -> bool {
+    !seen_evicting && (!evicts_current_values || resume_window_spec(0, first_revision))
+}
+
+/// [`listing_truth`] on the two fields of [`Retention`] it reads: `(evicts_current_values, first_revision)`.
+pub fn listing_truth_of(retention: Option<(bool, u64)>, seen_evicting: bool) -> (r: Option<bool>)
+    ensures
+        r == listing_truth_spec(retention, seen_evicting),
+        // Never vouches for a listing the fold has seen evict, and says nothing only when it knows nothing.
+        seen_evicting ==> r == Some(false),
+        r is None <==> (retention is None && !seen_evicting),
+{
     match retention {
-        Some(r) => Some(listing_is_truth(
-            r.evicts_current_values,
-            r.first_revision,
-            seen_evicting,
-        )),
-        None if seen_evicting => Some(false),
-        None => None,
+        Some((evicts, first)) => Some(listing_is_truth(evicts, first, seen_evicting)),
+        None => if seen_evicting { Some(false) } else { None },
+    }
+}
+
+/// [`listing_truth_of`]'s decision.
+pub open spec fn listing_truth_spec(retention: Option<(bool, u64)>, seen_evicting: bool) -> Option<bool> {
+    match retention {
+        Some((evicts, first)) => Some(listing_is_truth_spec(evicts, first, seen_evicting)),
+        None => if seen_evicting { Some(false) } else { None },
     }
 }
 
@@ -261,7 +414,17 @@ pub enum RepairPlan {
 /// THE repair planner. `listing_truth` is [`listing_is_truth`] when the
 /// backend reports retention, `None` when it can't say — then `Relist`
 /// (chosen explicitly) is trusted as the caller's word, and `Auto` restores.
-pub fn plan_repair(mode: RepairMode, listing_truth: Option<bool>) -> RepairPlan {
+pub fn plan_repair(mode: RepairMode, listing_truth: Option<bool>) -> (r: RepairPlan)
+    ensures
+        r == plan_repair_spec(mode, listing_truth),
+        // The only refusal: an explicit re-list on a listing that is known not to be the truth.
+        r is RefuseRelist <==> (mode is Relist && listing_truth == Some(false)),
+        // Nothing armed re-lists alone; an armed restore restores; `Auto` never refuses.
+        mode is None ==> r is ReListOnly,
+        mode is Restore ==> r is Restore,
+        mode is Auto ==> (r is Relist <==> listing_truth == Some(true)),
+        mode is Auto ==> (r is Relist || r is Restore),
+{
     match mode {
         RepairMode::None => RepairPlan::ReListOnly,
         RepairMode::Relist if listing_truth == Some(false) => RepairPlan::RefuseRelist,
@@ -272,6 +435,27 @@ pub fn plan_repair(mode: RepairMode, listing_truth: Option<bool>) -> RepairPlan 
     }
 }
 
+/// [`plan_repair`]'s table.
+pub open spec fn plan_repair_spec(mode: RepairMode, listing_truth: Option<bool>) -> RepairPlan {
+    match mode {
+        RepairMode::None => RepairPlan::ReListOnly,
+        RepairMode::Relist => if listing_truth == Some(false) { RepairPlan::RefuseRelist } else { RepairPlan::Relist },
+        RepairMode::Restore => RepairPlan::Restore,
+        RepairMode::Auto => if listing_truth == Some(true) { RepairPlan::Relist } else { RepairPlan::Restore },
+    }
+}
+
+/// THEOREM (liveness of the planner): a refusal is the caller's configuration, and only an explicit `Relist` refuses; the
+/// same expiry planned as `Auto` or `Restore` is never refused. The `RefuseRelist` is also never planned over a listing
+/// that is the truth, so the refusal clears with the listing (retention restored and not previously seen evicting).
+pub proof fn only_an_explicit_relist_can_be_refused(mode: RepairMode, listing_truth: Option<bool>)
+    ensures
+        plan_repair_spec(mode, listing_truth) is RefuseRelist ==> mode is Relist && listing_truth == Some(false),
+        (mode is Auto || mode is Restore || mode is None) ==> !(plan_repair_spec(mode, listing_truth) is RefuseRelist),
+        listing_truth != Some(false) ==> !(plan_repair_spec(mode, listing_truth) is RefuseRelist),
+{
+}
+
 /// A start with no cursor: must the fold be repaired before watching? Yes
 /// when it holds data anyway (a torn first checkpoint — a re-list never
 /// removes what it doesn't deliver), and, with a restore armed, when the
@@ -280,9 +464,25 @@ pub fn cursorless_start_needs_repair(
     mode: RepairMode,
     fold_has_data: bool,
     listing_truth: Option<bool>,
-) -> bool {
+) -> (r: bool)
+    ensures
+        r == cursorless_spec(mode, fold_has_data, listing_truth),
+        // Nothing armed never repairs; a fold with data always does once anything is armed.
+        mode is None ==> !r,
+        (!(mode is None) && fold_has_data) ==> r,
+{
     // Mutation (model tests only): a fold with data is taken as empty.
     let fold_has_data = fold_has_data && !cfg!(feature = "mut_unanchored_relist");
+    match mode {
+        RepairMode::None => false,
+        _ if fold_has_data => true,
+        RepairMode::Restore | RepairMode::Auto => listing_truth == Some(false),
+        RepairMode::Relist => false,
+    }
+}
+
+/// [`cursorless_start_needs_repair`]'s table.
+pub open spec fn cursorless_spec(mode: RepairMode, fold_has_data: bool, listing_truth: Option<bool>) -> bool {
     match mode {
         RepairMode::None => false,
         _ if fold_has_data => true,
@@ -328,14 +528,28 @@ pub fn restore_key(
     artifact: KeyState,
     identical: bool,
     listed_live: bool,
-) -> KeyRestore {
+) -> (r: KeyRestore)
+    ensures
+        r == restore_key_spec(local, artifact, identical, listed_live),
+        // Never a move backward: a local entry strictly newer than the artifact's is kept.
+        (local is At && artifact is At && local->At_0 is Some && artifact->At_0 is Some
+            && local->At_0->Some_0 > artifact->At_0->Some_0) ==> r is Keep,
+        // Never a phantom delete: a key the bucket lists live is not deleted.
+        listed_live ==> !(r is Delete),
+        // A delete needs a local entry the artifact lacks.
+        r is Delete ==> (local is At && artifact is Absent && !listed_live),
+        // The artifact's entry is taken only if it has one.
+        r is TakeArtifact ==> artifact is At,
+        // Nothing on either side: nothing to do.
+        (local is Absent && artifact is Absent) ==> r is Keep,
+{
     // Mutations (model tests only): forge both sides revisionless (the
     // pre-fix diff: take anything not identical); forge the key unlisted.
-    let strip = |k: KeyState| match k {
-        KeyState::At(_) if cfg!(feature = "mut_restore_ignores_versions") => KeyState::At(None),
-        k => k,
+    let (local, artifact) = if cfg!(feature = "mut_restore_ignores_versions") {
+        (strip_revision(local), strip_revision(artifact))
+    } else {
+        (local, artifact)
     };
-    let (local, artifact) = (strip(local), strip(artifact));
     let listed_live = listed_live && !cfg!(feature = "mut_restore_ignores_listing");
     match (local, artifact) {
         (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
@@ -344,11 +558,43 @@ pub fn restore_key(
             } else {
                 KeyRestore::TakeArtifact
             }
-        }
+        },
         (KeyState::At(_), KeyState::At(_)) if identical => KeyRestore::Keep,
         (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
         (KeyState::At(_), KeyState::Absent) if listed_live => KeyRestore::Keep,
         (KeyState::At(_), KeyState::Absent) => KeyRestore::Delete,
+        (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
+    }
+}
+
+/// A key's side with its revision forgotten (the mutation's input forgery).
+fn strip_revision(k: KeyState) -> (r: KeyState)
+    ensures
+        r == match k {
+            KeyState::At(_) => KeyState::At(None),
+            KeyState::Absent => KeyState::Absent,
+        },
+{
+    match k {
+        KeyState::At(_) => KeyState::At(None),
+        KeyState::Absent => KeyState::Absent,
+    }
+}
+
+/// [`restore_key`]'s table.
+pub open spec fn restore_key_spec(
+    local: KeyState,
+    artifact: KeyState,
+    identical: bool,
+    listed_live: bool,
+) -> KeyRestore {
+    match (local, artifact) {
+        (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
+            if l > a { KeyRestore::Keep } else { KeyRestore::TakeArtifact }
+        },
+        (KeyState::At(_), KeyState::At(_)) if identical => KeyRestore::Keep,
+        (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
+        (KeyState::At(_), KeyState::Absent) => if listed_live { KeyRestore::Keep } else { KeyRestore::Delete },
         (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
     }
 }
@@ -363,16 +609,38 @@ pub fn restore_key(
 /// clock steps and leader changes between the server that stamped the
 /// message and the one reporting the time. `cursor_age_ms` is 0 when the
 /// stamp is ahead of the clock.
-pub fn gap_holds_no_eviction(age_only: bool, max_age_ms: u64, cursor_age_ms: u64) -> bool {
-    age_only && max_age_ms > 0 && cursor_age_ms.saturating_mul(2) <= max_age_ms
+pub fn gap_holds_no_eviction(age_only: bool, max_age_ms: u64, cursor_age_ms: u64) -> (r: bool)
+    ensures
+        r == (age_only && max_age_ms > 0 && 2 * (cursor_age_ms as int) <= max_age_ms as int),
+{
+    // `2 * age <= max` without the saturating multiply: at `age == max == u64::MAX` the saturated product equals `max`
+    // and the check passed for a cursor older than the retention.
+    age_only && max_age_ms > 0 && cursor_age_ms <= max_age_ms / 2
 }
 
 /// Sequence the watch should start at after applying `revision`.
 ///
 /// `None` at `u64::MAX`: wrapping to 0 would silently replay the bucket
 /// from the beginning. Callers must fail the watch rather than wrap.
-pub fn resume_start_sequence(revision: u64) -> Option<u64> {
-    revision.checked_add(1)
+pub fn resume_start_sequence(revision: u64) -> (r: Option<u64>)
+    ensures
+        r is Some <==> revision < u64::MAX,
+        r is Some ==> r->Some_0 as int == revision as int + 1,
+{
+    if revision == u64::MAX { None } else { Some(revision + 1) }
+}
+
+} // verus!
+
+/// [`listing_is_truth`] for retention as a watcher reports it: `None` when
+/// the backend can't say and the fold never saw it evict — then the caller's
+/// chosen repair decides ([`plan_repair`]).
+pub fn listing_truth(retention: Option<Retention>, seen_evicting: bool) -> Option<bool> {
+    // The adapter only reads two fields; the decision is `listing_truth_of`.
+    listing_truth_of(
+        retention.map(|r| (r.evicts_current_values, r.first_revision)),
+        seen_evicting,
+    )
 }
 
 #[cfg(test)]
