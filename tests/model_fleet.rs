@@ -10,10 +10,11 @@
 //! propagate through artifacts to every node that restores. Here the nodes
 //! ARE the exporters, and the checker proves the induction:
 //!
-//! - **Every published artifact is the truth at its cursor** (on this model's
-//!   one key: see the bounds below; what the code keeps on many keys is the
-//!   weaker "complete" statement).
-//! - **Every live node's fold is the truth at its cursor** (same).
+//! - **Every published artifact is complete at its cursor**: a real write of
+//!   the log, equal to the truth at its cursor on every key not written after
+//!   it (exact at the head). This is the statement the code keeps and the
+//!   Verus fleet proof proves (`Fleet::complete_at`).
+//! - **Every live node's fold is complete at its cursor** (same).
 //! - **Every maximal run ends with every live node converged** to every
 //!   write minus every real delete. A node may instead be fail-stopped — and
 //!   then only because a write aged out before ANY node folded it: no fold
@@ -44,10 +45,9 @@
 //! - on MANY keys the invariant is "complete together with the log after the cursor",
 //!   not "equals the truth at the cursor": a restore keeps a stale entry of a key the
 //!   bucket lists live (`restore_key`), and the resume delivers the later write
-//!   (`fleet_proofs::finding_f3_*`). The two `always` properties below state the
-//!   stronger "equals the truth at its cursor" and PASS ONLY BECAUSE of this model's
-//!   bounds: one key, and an atomic repair. With a second key the stronger statement
-//!   is false of the shipped code (F3), so this model proves the one-key instance, and
+//!   (`fleet_proofs::finding_f3_*`). The two `always` properties below state exactly
+//!   that "complete" statement (`Fleet::complete_at`), not the stronger "equals the
+//!   truth at its cursor", which is false of the shipped code on a second key (F3); and
 //!   `fleet_proofs::every_live_nodes_fold_is_complete_at_its_cursor` (despite its
 //!   name: complete, exact at the head) proves the statement the code keeps;
 //! - recreated streams, which this model does not have (one incarnation): a restore
@@ -125,6 +125,16 @@ impl Fleet {
     fn truth_at(s: &St, c: u8) -> Option<u8> {
         let r = c.min(s.head);
         (r >= 1 && s.ops[r as usize]).then_some(r)
+    }
+    /// The statement the code keeps and the Verus fleet proof proves
+    /// (`fleet_proofs.rs`, "complete"): the value is a real write of the log
+    /// (or absent), and it equals the truth at `c` on every key not written
+    /// after `c`. With one key, every revision writes it, so "not written
+    /// after `c`" is `c >= head`; below the head only realness is required,
+    /// because the resume delivers the later write.
+    fn complete_at(s: &St, v: Option<u8>, c: u8) -> bool {
+        let real = v.is_none_or(|r| r >= 1 && r <= s.head && s.ops[r as usize]);
+        real && (c < s.head || v == Self::truth_at(s, c))
     }
     fn truth(s: &St) -> Option<u8> {
         Self::truth_at(s, s.head)
@@ -323,16 +333,16 @@ impl Model for Fleet {
     fn properties(&self) -> Vec<Property<Self>> {
         let mut props = vec![
             Property::<Self>::always(
-                "every published artifact is the truth at its cursor",
-                |_, s| !s.bad_publish && s.pointer.is_none_or(|(c, v)| v == Fleet::truth_at(s, c)),
+                "every published artifact is complete at its cursor",
+                |_, s| !s.bad_publish && s.pointer.is_none_or(|(c, v)| Fleet::complete_at(s, v, c)),
             ),
             Property::<Self>::always(
-                "every live node's fold is the truth at its cursor",
+                "every live node's fold is complete at its cursor",
                 |_, s| {
                     s.nodes
                         .iter()
                         .filter(|n| !n.fresh && !n.expired)
-                        .all(|n| n.fold == Fleet::truth_at(s, n.cursor))
+                        .all(|n| Fleet::complete_at(s, n.fold, n.cursor))
                 },
             ),
             Property::<Self>::always(
@@ -440,17 +450,17 @@ fn mutations_poison_the_fleet_and_are_caught() {
         );
         assert!(
             checker
-                .discovery("every published artifact is the truth at its cursor")
+                .discovery("every published artifact is complete at its cursor")
                 .is_some()
                 || checker
-                    .discovery("every live node's fold is the truth at its cursor")
+                    .discovery("every live node's fold is complete at its cursor")
                     .is_some(),
             "{label}: the checker must find a wrong fold or a poisoned artifact"
         );
         println!(
             "  poisoned artifact reachable: {}",
             checker
-                .discovery("every published artifact is the truth at its cursor")
+                .discovery("every published artifact is complete at its cursor")
                 .is_some()
         );
     }
