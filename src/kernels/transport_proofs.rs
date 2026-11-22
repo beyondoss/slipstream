@@ -1,27 +1,44 @@
-//! The artifact transport protocol, proven for every interleaving of any number of exporters, pruners and fetchers, with no
-//! bound on how many objects, actors or steps there are. `tests/model.rs` checks the same protocol in a bounded world (Stateright);
-//! this is its unbounded twin. The decisions are the production kernels, not copies: [`pointer_publish_allowed`]'s spec
-//! (`publish_allowed_spec`) decides every publish and [`payload_prunable`]'s spec (`prunable_spec`) decides every delete.
+//! The artifact transport protocol, proven for every interleaving of any number of exporters, pruners and fetchers, over ALL stream
+//! incarnations, with no bound on how many objects, actors or steps there are. `tests/model.rs` checks the same protocol in a
+//! bounded world (Stateright); this is its unbounded twin. The decisions are the production kernels, not copies:
+//! [`pointer_publish_allowed`]'s spec (`publish_allowed_spec`) decides every publish and [`payload_prunable`]'s spec
+//! (`prunable_spec`) decides every delete.
 //!
 //! # The world
 //!
-//! The object store holds immutable, content-addressed payload objects (`<incarnation>-<cursor>-<digest of the manifest>`: [`Payload`]) and one
-//! pointer object, swapped by compare-and-swap (`transport::swap_pointer`; [`TS::ver`] counts successful swaps, and a CAS only
-//! succeeds against the version the publisher read). An exporter runs `Upload`, then reads the pointer and applies the guard
-//! (`Observe`), then swaps (`Swap`); a refused guard ends its round, a lost CAS re-reads. A pruner reads the pointer once and
-//! then deletes any number of objects against that (possibly stale) read. A fetcher reads the pointer and later gets the object.
-//! Every actor's read can be arbitrarily stale: that is what the interleaving quantifies over.
+//! The object store holds immutable, content-addressed payload objects (`<incarnation>-<cursor>-<digest of the manifest>`:
+//! [`Payload`]) and one pointer object, swapped by compare-and-swap (`transport::swap_pointer`; [`TS::ver`] counts successful
+//! swaps, and a CAS only succeeds against the version the publisher read). An exporter runs `Upload`, then reads the pointer and
+//! applies the guard (`Observe`), then swaps (`Swap`); a refused guard ends its round, a lost CAS re-reads. A pruner reads the
+//! pointer once and then deletes any number of objects against that (possibly stale) read. A fetcher reads the pointer and later
+//! gets the object. Every actor's read can be arbitrarily stale: that is what the interleaving quantifies over.
+//!
+//! # What is proven, and what the pointer of another incarnation costs (FINDING F1b)
+//!
+//! No order between incarnations is assumed (no clock), so a pointer of another incarnation is replaceable: a slow exporter of a
+//! dead incarnation can replace the live pointer, and a stale live exporter can then replace THAT with a payload a prune already
+//! deleted. The pointer then DANGLES: it names a payload that does not exist. So "the pointer's target exists" is not an
+//! invariant of this world, and is not claimed. What holds, for every incarnation:
+//!
+//! * **(a) safety**: a fetch gets the payload its read named or a detected miss, never another payload
+//!   ([`a_fetch_gets_its_payload_or_a_detected_miss`]), also in the state where the pointer dangles
+//!   ([`finding_f1b_a_dangling_pointer_is_a_detected_miss`]); the pointer never regresses within an incarnation
+//!   ([`the_pointer_never_regresses`]); a restore never takes a foreign artifact (`fleet_proofs`);
+//! * **(b) liveness**: the window of a dangling pointer is bounded by the live exporter's round
+//!   ([`a_live_round_ends_the_dangling_window`], ranking function [`rho`]): its round replaces the pointer with a payload that
+//!   exists, in at most one round plus one re-read per dead round still in flight.
 //!
 //! # Environment axioms
 //!
 //! * **O1** a payload path names its content for ever (content addressing; a hash collision is the only way to break it);
 //! * **O2** the pointer object is written only by [`Act::Swap`] (nothing else deletes or rewrites it);
 //! * **O3** a compare-and-swap succeeds exactly when the object is unchanged since the read (`ver`);
-//! * **O4** (scope) the pointer stays in one incarnation: every payload and the pointer are of [`TS::inc`]. Across incarnations
-//!   nothing orders them (no clock is assumed): a pointer of another incarnation is replaceable (`a_pointer_of_another_incarnation_
-//!   never_refuses_a_publish`, proven on the guard), and what that costs is FINDING F1b in `fleet_proofs`: a slow exporter of a dead
-//!   incarnation moves the pointer out, and a stale live exporter can then publish a payload a prune already deleted. The
-//!   invariants below are therefore the within-incarnation protocol, which is what every pointer swap of a live fleet runs.
+//! * **F-e** (liveness only) while the live exporter's round runs, no round starts: the export lease admits one live round at a
+//!   time, and a node of a dead stream starts no new round after the recreation (it re-seeds as a live one first), so the dead
+//!   rounds in flight are finitely many ([`credits`]);
+//! * **F-h** (liveness only) the live exporter exports at the live head, which is at least every live rank the pointer or a pruner's
+//!   read holds (nothing of the live incarnation is published above the head), and its own payload exists when the round starts;
+//! * **F-c** the object store answers (the existing fairness axiom: a round's steps run).
 
 use crate::kernels::protocol::*;
 use vstd::prelude::*;
@@ -55,8 +72,8 @@ pub enum Actor {
 }
 
 pub struct TS {
-    /// The incarnation every payload and the pointer belong to (the scope of this proof).
-    pub inc: u64,
+    /// The live stream incarnation (what the liveness theorem calls live; no safety statement mentions it).
+    pub live: u64,
     /// The pointer's target payload, once one is published. Its position is the target's.
     pub ptr: Option<Payload>,
     /// Successful swaps so far.
@@ -102,7 +119,7 @@ pub open spec fn valid(s: TS, i: int) -> bool {
 
 pub open spec fn enabled(s: TS, a: Act) -> bool {
     match a {
-        Act::Upload(i, p) => valid(s, i) && actor(s, i) is Idle && p.origin == s.inc,
+        Act::Upload(i, p) => valid(s, i) && actor(s, i) is Idle,
         Act::Observe(i) => valid(s, i) && actor(s, i) is Uploaded,
         Act::Swap(i) => valid(s, i) && actor(s, i) is Observed && actor(s, i)->Observed_ver == s.ver,
         Act::Reread(i) => valid(s, i) && actor(s, i) is Observed && actor(s, i)->Observed_ver != s.ver,
@@ -149,38 +166,31 @@ pub open spec fn fetched(s: TS, t: Payload) -> Option<Payload> {
     if s.objs.contains(t) { Some(t) } else { None }
 }
 
-/// An actor's reads are consistent with the store (whatever the interleaving).
+/// An actor's reads are consistent with the store (whatever the interleaving): an exporter that read the pointer holds the guard's
+/// verdict, at a version no later than the pointer's, and still current while the version is.
 pub open spec fn actor_ok(s: TS, a: Actor) -> bool {
     match a {
-        Actor::Idle => true,
-        // An uploaded payload exists, or was pruned because the pointer is strictly past it.
-        Actor::Uploaded { p } => p.origin == s.inc && (s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0)))),
         Actor::Observed { p, st, ver } => {
-            &&& p.origin == s.inc
             &&& publish_allowed_spec(st, pos(p))
             &&& ver <= s.ver
-            // Same as `Uploaded`, whatever the version: a lost CAS goes back to `Uploaded`.
-            &&& (s.objs.contains(p) || (s.ptr is Some && pos_lt(pos(p), pos(s.ptr->Some_0))))
-            // The read is current while the version is: so the guard's verdict still stands.
             &&& (ver == s.ver ==> st == pstate(s.ptr))
         },
-        Actor::Pruning { pr, keep } => s.ptr is Some && pr.origin == s.inc && pr.rank <= s.ptr->Some_0.rank,
-        Actor::Fetching { t } => t.origin == s.inc && (s.objs.contains(t) || (s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0)))),
+        _ => true,
     }
 }
 
-/// THE invariant: the pointer's target exists, and every actor's reads are consistent.
+/// THE invariant, over every incarnation: every actor's reads are consistent. (That the pointer's target exists is NOT part of it:
+/// see FINDING F1b.)
 pub open spec fn inv(s: TS) -> bool {
-    &&& s.ptr is Some ==> s.objs.contains(s.ptr->Some_0) && s.ptr->Some_0.origin == s.inc
-    &&& forall|i: int| 0 <= i < s.actors.len() ==> actor_ok(s, #[trigger] s.actors[i])
+    forall|i: int| 0 <= i < s.actors.len() ==> actor_ok(s, #[trigger] s.actors[i])
 }
 
 /// THEOREM: the empty store with `n` idle actors satisfies the invariant, for any `n`.
-pub proof fn a_fresh_store_satisfies_the_invariant(inc: u64, actors: Seq<Actor>)
+pub proof fn a_fresh_store_satisfies_the_invariant(live: u64, actors: Seq<Actor>)
     requires
         forall|i: int| 0 <= i < actors.len() ==> #[trigger] actors[i] is Idle,
     ensures
-        inv(TS { inc, ptr: None, ver: 0, objs: Set::empty(), actors }),
+        inv(TS { live, ptr: None, ver: 0, objs: Set::empty(), actors }),
 {
 }
 
@@ -208,21 +218,20 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
                 if j != i {
                     assert(s1.actors[j] == s.actors[j]);
                 } else if publish_allowed_spec(pstate(s.ptr), pos(pp)) {
-                    assert(actor_ok(s, s.actors[i]));
-                    // Admitted: the candidate is not below the pointer, so it was not pruned: it exists.
-                    assert(s.objs.contains(pp));
+                    assert(s1.actors[j] == (Actor::Observed { p: pp, st: pstate(s.ptr), ver: s.ver }));
+                } else {
+                    assert(s1.actors[j] == Actor::Idle);
                 }
             },
             Act::Swap(i) => {
                 if j != i {
                     assert(s1.actors[j] == s.actors[j]);
+                } else {
+                    assert(s1.actors[j] == Actor::Idle);
                 }
             },
             Act::Reread(i) => {
-                let pp = actor(s, i)->Observed_p;
-                if j == i {
-                    assert(actor_ok(s, s.actors[i]));
-                } else {
+                if j != i {
                     assert(s1.actors[j] == s.actors[j]);
                 }
             },
@@ -233,12 +242,6 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
             },
             Act::Delete(i, o) => {
                 assert(s1.actors[j] == s.actors[j]);
-                let pr = actor(s, i)->Pruning_pr;
-                let t = s.ptr->Some_0;
-                assert(actor_ok(s, s.actors[i]));
-                // `o` is strictly below the pruner's read of the pointer, which is at most the pointer's position now.
-                assert(pos_lt(pos(o), pr));
-                assert(pr.rank <= t.rank);
             },
             Act::FetchRead(i) => {
                 if j != i {
@@ -252,69 +255,44 @@ pub proof fn every_step_preserves_the_invariant(s: TS, a: Act)
             },
         }
     }
-    if s1.ptr is Some {
-        match a {
-            Act::Swap(i) => {
-                assert(actor_ok(s, s.actors[i]));
-            },
-            Act::Delete(i, o) => {
-                let pr = actor(s, i)->Pruning_pr;
-                assert(actor_ok(s, s.actors[i]));
-                assert(pos_lt(pos(o), pr));
-                assert(o != s.ptr->Some_0);
-            },
-            _ => {},
-        }
-    }
 }
 
-
-/// THEOREM (the pointer never regresses, for every interleaving of N exporters): every step either leaves the pointer alone or
-/// moves it to a payload whose position (incarnation, then revision) is at least the old one, and a published pointer is never removed. This is
-/// `a_publish_never_regresses_the_pointer` lifted from one decision to the whole protocol: the guard decided on a read, but the
-/// swap succeeds only against that read (O3), so the read is the pointer being replaced.
+/// THEOREM (the pointer never regresses within an incarnation, for every interleaving of N exporters): every step either leaves the
+/// pointer alone or moves it to a payload that is not strictly below the old one in its incarnation ([`pos_lt`]: a pointer of
+/// another incarnation is replaceable, so nothing orders it), and a published pointer is never removed. This is
+/// `a_publish_never_regresses_the_pointer_within_an_incarnation` lifted from one decision to the whole protocol: the guard decided
+/// on a read, but the swap succeeds only against that read (O3), so the read is the pointer being replaced.
 pub proof fn the_pointer_never_regresses(s: TS, a: Act)
     requires
         inv(s),
         enabled(s, a),
     ensures
-        s.ptr is Some ==> step(s, a).ptr is Some && step(s, a).ptr->Some_0.rank >= s.ptr->Some_0.rank
-            && step(s, a).ptr->Some_0.origin == s.inc,
+        s.ptr is Some ==> step(s, a).ptr is Some && !pos_lt(pos(step(s, a).ptr->Some_0), pos(s.ptr->Some_0)),
 {
     match a {
         Act::Swap(i) => {
             assert(actor_ok(s, s.actors[i]));
-            let p = actor(s, i)->Observed_p;
-            if s.ptr is Some {
-                a_publish_never_regresses_the_pointer_within_an_incarnation(pstate(s.ptr), pos(p));
-            }
         },
         _ => {},
     }
 }
 
-/// THEOREM (prune never deletes the pointer's target): at any moment, whatever a pruner read earlier, the object it is allowed to
-/// delete is not the pointer's current target. The pruner's read of the pointer is stale, but the pointer's position only grows, and
-/// the guard deletes only strictly below the pruner's read (`the_target_and_unknown_objects_are_never_pruned` is the guard's own
-/// half).
-pub proof fn prune_never_deletes_the_pointers_target(s: TS, i: int, o: Payload)
+/// THEOREM (a prune deletes only below its own read): whatever the pruner read, and however long ago, what it may delete is
+/// strictly below that read in the read pointer's incarnation. (That the object is not the pointer's CURRENT target is true within
+/// an incarnation and not across them: FINDING F1b.)
+pub proof fn a_prune_deletes_only_below_what_it_read(s: TS, i: int, o: Payload)
     requires
         inv(s),
         enabled(s, Act::Delete(i, o)),
     ensures
-        s.ptr is Some,
-        s.ptr->Some_0 != o,
-        inv(step(s, Act::Delete(i, o))),
-        step(s, Act::Delete(i, o)).objs.contains(step(s, Act::Delete(i, o)).ptr->Some_0),
+        pos_lt(pos(o), actor(s, i)->Pruning_pr),
+        o != actor(s, i)->Pruning_keep,
 {
-    assert(actor_ok(s, s.actors[i]));
-    every_step_preserves_the_invariant(s, Act::Delete(i, o));
 }
 
-/// THEOREM (a fetch races a prune: the object it named, or a detected miss, never another payload): a get answers the payload
-/// its read named (a path names its content, O1) or a miss; and a miss means the pointer has strictly moved on since the read, so
-/// a re-read names a payload that exists and, by `prune_never_deletes_the_pointers_target`, stays until the pointer moves again.
-/// (A fetch that does not race a prune never misses: the target exists.)
+/// THEOREM (a) (a fetch gets its payload or a detected miss, never another payload): a get answers the payload its read named (a
+/// path names its content, O1) or a miss. A miss means the object is gone: it was pruned. This holds in every state, the one where
+/// the pointer dangles included.
 pub proof fn a_fetch_gets_its_payload_or_a_detected_miss(s: TS, i: int)
     requires
         inv(s),
@@ -324,29 +302,14 @@ pub proof fn a_fetch_gets_its_payload_or_a_detected_miss(s: TS, i: int)
             let t = actor(s, i)->Fetching_t;
             match fetched(s, t) {
                 Some(x) => x == t,
-                None => s.ptr is Some && pos_lt(pos(t), pos(s.ptr->Some_0)) && s.objs.contains(s.ptr->Some_0),
+                None => !s.objs.contains(t),
             }
         }),
 {
-    assert(actor_ok(s, s.actors[i]));
 }
 
-/// THEOREM (liveness: a refused fetch retries): after a miss, a fresh read names the pointer's current target, which exists, so
-/// the get answers it. The only way to miss again is for the pointer to move again, strictly upward. Rank: the pointer's position
-/// (monotone), unbounded, but each miss is paid for by one publish, so a fetch retries at most once per publish. Fairness
-/// assumption: the publishers do not publish for ever between a read and its get (the environment, not this code).
-pub proof fn a_fresh_read_never_misses_without_a_publish(s: TS, i: int)
-    requires
-        inv(s),
-        s.ptr is Some,
-    ensures
-        s.objs.contains(s.ptr->Some_0),
-{
-}
-
-/// THEOREM (a publisher's refusal clears): an exporter refused by the guard (the pointer strictly newer) is refused for as long as
-/// the pointer stays newer, and the pointer never regresses, so its exit is a fresher export (`a_publish_at_or_above_the_pointer_is_admitted`).
-/// A lost CAS is never final: the exporter re-reads, and the version it lost to is a publish that raised the pointer.
+/// THEOREM (a publisher's refusal clears): a lost CAS is never final: the exporter re-reads, and the version it lost to is a
+/// publish that moved the pointer.
 pub proof fn a_lost_cas_means_a_publish_happened(s: TS, i: int)
     requires
         inv(s),
@@ -355,6 +318,248 @@ pub proof fn a_lost_cas_means_a_publish_happened(s: TS, i: int)
         actor(s, i)->Observed_ver < s.ver,
 {
     assert(actor_ok(s, s.actors[i]));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FINDING F1b: the pointer can dangle. (a) holds there; (b) is the theorem below.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The pointer names a payload that does not exist.
+pub open spec fn dangling(s: TS) -> bool {
+    s.ptr is Some && !s.objs.contains(s.ptr->Some_0)
+}
+
+/// FINDING F1b, the state: with no order between incarnations, a slow exporter of a dead incarnation `b` may replace the live
+/// pointer `(a, big)` (admitted: another incarnation's), and a STALE live exporter may then replace that (admitted likewise) with a
+/// payload `(a, r)` the prune guard had already deleted (it was strictly below the live pointer when pruned). Every step is a guard
+/// verdict below.
+pub proof fn finding_f1b_a_dead_exporter_lets_a_pruned_payload_be_published(a: u64, b: u64, r: u64, big: u64)
+    requires
+        a != b,
+        r < big,
+    ensures
+        prunable_spec(Some(Pos { origin: a, rank: r }), Pos { origin: a, rank: big }, false, true),
+        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: a, rank: big }) }, Pos { origin: b, rank: 1 }),
+        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: b, rank: 1 }) }, Pos { origin: a, rank: r }),
+{
+}
+
+/// THEOREM (a) in the F1b state: when the pointer dangles, a fetch of its target is a DETECTED miss (the object is gone), never
+/// another payload: the window is loud, and a restore of it is refused by `same_incarnation` or fails to fetch, never takes wrong data.
+pub proof fn finding_f1b_a_dangling_pointer_is_a_detected_miss(s: TS)
+    requires
+        dangling(s),
+    ensures
+        fetched(s, s.ptr->Some_0) is None,
+{
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// (b) LIVENESS: the window of a dangling pointer ends with the live exporter's round.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// An exporter mid-round whose payload is of another incarnation than the live one.
+pub open spec fn dead_flight(live: u64, a: Actor) -> bool {
+    match a {
+        Actor::Uploaded { p } => p.origin != live,
+        Actor::Observed { p, st, ver } => p.origin != live,
+        _ => false,
+    }
+}
+
+/// An exporter mid-round whose payload is of the live incarnation.
+pub open spec fn live_flight(live: u64, a: Actor) -> bool {
+    match a {
+        Actor::Uploaded { p } => p.origin == live,
+        Actor::Observed { p, st, ver } => p.origin == live,
+        _ => false,
+    }
+}
+
+pub open spec fn flight(live: u64, a: Actor) -> nat {
+    if dead_flight(live, a) { 1 } else { 0 }
+}
+
+/// The dead rounds in flight among the first `n` actors.
+pub open spec fn credits_upto(actors: Seq<Actor>, live: u64, n: nat) -> nat
+    decreases n,
+{
+    if n == 0 {
+        0
+    } else if n > actors.len() {
+        credits_upto(actors, live, actors.len())
+    } else {
+        credits_upto(actors, live, (n - 1) as nat) + flight(live, actors[(n - 1) as int])
+    }
+}
+
+/// The dead rounds in flight: finitely many (F-e), and each ends with a swap or a refused guard.
+pub open spec fn credits(s: TS) -> nat {
+    credits_upto(s.actors, s.live, s.actors.len())
+}
+
+/// The live exporter `i`'s distance to the end of its round: Uploaded 2, Observed 1, Observed on a stale read (it lost its CAS) 3,
+/// otherwise 0.
+pub open spec fn phase(s: TS, a: Actor) -> int {
+    match a {
+        Actor::Uploaded { p } => 2,
+        Actor::Observed { p, st, ver } => if ver == s.ver { 1 } else { 3 },
+        _ => 0,
+    }
+}
+
+/// THE RANK of the live exporter `i`'s round: four per dead round still in flight, plus its own phase. A dead round's swap or
+/// refusal lowers it by four and can make `i`'s read stale (up by two); `i`'s own steps lower it.
+pub open spec fn rho(s: TS, i: int) -> int {
+    4 * credits(s) + phase(s, actor(s, i))
+}
+
+pub open spec fn payload_of(a: Actor) -> Payload {
+    match a {
+        Actor::Uploaded { p } => p,
+        Actor::Observed { p, st, ver } => p,
+        _ => Payload { origin: 0, rank: 0, digest: 0 },
+    }
+}
+
+/// The live exporter `i` is mid-round (F-e: the lease admits one live round, so no other actor is in a live round), its payload
+/// exists, and it exports at the live head (F-h): no live rank in the pointer or in a pruner's read exceeds its own.
+pub open spec fn round_ok(s: TS, i: int) -> bool {
+    &&& valid(s, i)
+    &&& live_flight(s.live, actor(s, i))
+    &&& s.objs.contains(payload_of(actor(s, i)))
+    &&& (s.ptr is Some && s.ptr->Some_0.origin == s.live ==> s.ptr->Some_0.rank <= payload_of(actor(s, i)).rank)
+    &&& forall|j: int| 0 <= j < s.actors.len() && j != i ==> !live_flight(s.live, #[trigger] s.actors[j])
+    &&& forall|j: int|
+        0 <= j < s.actors.len() && #[trigger] s.actors[j] is Pruning && s.actors[j]->Pruning_pr.origin == s.live
+            ==> s.actors[j]->Pruning_pr.rank <= payload_of(actor(s, i)).rank
+}
+
+/// Updating one actor changes the credits by the difference of the two actors' flights.
+proof fn credits_update(actors: Seq<Actor>, live: u64, i: int, a2: Actor, n: nat)
+    requires
+        0 <= i < actors.len(),
+    ensures
+        credits_upto(actors.update(i, a2), live, n) as int == credits_upto(actors, live, n) as int
+            + (if i < n { flight(live, a2) as int - flight(live, actors[i]) as int } else { 0int }),
+    decreases n,
+{
+    broadcast use vstd::seq_lib::group_seq_properties;
+    if n == 0 {
+    } else if n > actors.len() {
+        credits_update(actors, live, i, a2, actors.len());
+    } else {
+        credits_update(actors, live, i, a2, (n - 1) as nat);
+        assert(actors.update(i, a2).len() == actors.len());
+        if (n - 1) as int == i {
+            assert(actors.update(i, a2)[(n - 1) as int] == a2);
+        } else {
+            assert(actors.update(i, a2)[(n - 1) as int] == actors[(n - 1) as int]);
+        }
+    }
+}
+
+/// THEOREM (b) (the dangling window ends with the live exporter's round): while the live exporter `i` runs its round (no round
+/// starts meanwhile: F-e), every step of the world either leaves its rank [`rho`] where it was or lowers it, and every step of `i`
+/// itself lowers it: its read of the pointer is admitted (the pointer is not above its payload, so the guard cannot refuse it:
+/// the refusal clears), its swap succeeds against a fresh read, a lost CAS (a dead round's swap, which lowered the credits) takes
+/// it back to a re-read. Its payload exists throughout (a prune never deletes it: every live read is at most its rank), so the
+/// swap that ends the round leaves a pointer whose target EXISTS: the pointer no longer dangles. The window is therefore at most
+/// one round plus one re-read per dead round in flight, and in it a fetch is a detected miss (a), never wrong data.
+pub proof fn a_live_round_ends_the_dangling_window(s: TS, i: int, a: Act)
+    requires
+        inv(s),
+        round_ok(s, i),
+        enabled(s, a),
+        !(a is Upload),
+    ensures
+        inv(step(s, a)),
+        // `i`'s own steps lower the rank; every other step does not raise it.
+        (a is Observe && a->Observe_0 == i) ==> actor(step(s, a), i) is Observed && rho(step(s, a), i) < rho(s, i),
+        (a is Reread && a->Reread_0 == i) ==> live_flight(s.live, actor(step(s, a), i)) && rho(step(s, a), i) < rho(s, i),
+        (a is Swap && a->Swap_0 == i) ==> !dangling(step(s, a)) && step(s, a).ptr == Some(payload_of(actor(s, i))),
+        !(a is Observe && a->Observe_0 == i) && !(a is Reread && a->Reread_0 == i) && !(a is Swap && a->Swap_0 == i)
+            ==> round_ok(step(s, a), i) && rho(step(s, a), i) <= rho(s, i),
+{
+    broadcast use vstd::seq_lib::group_seq_properties;
+    every_step_preserves_the_invariant(s, a);
+    let ai = actor(s, i);
+    let p = payload_of(ai);
+    let s1 = step(s, a);
+    assert(actor_ok(s, ai));
+    match a {
+        Act::Observe(j) => {
+            let pj = actor(s, j)->Uploaded_p;
+            if j == i {
+                // The pointer is not above `p` in its own incarnation, so the guard admits the candidate.
+                assert(publish_allowed_spec(pstate(s.ptr), pos(p)));
+                assert(s1.actors[i] == (Actor::Observed { p, st: pstate(s.ptr), ver: s.ver }));
+                credits_update(s.actors, s.live, i, s1.actors[i], s.actors.len());
+            } else {
+                // A dead exporter reads the pointer: it stays in flight or ends its round.
+                assert(!live_flight(s.live, actor(s, j)));
+                assert(s1.actors[i] == s.actors[i]);
+                let a2 = s1.actors[j];
+                credits_update(s.actors, s.live, j, a2, s.actors.len());
+                assert(flight(s.live, a2) <= flight(s.live, actor(s, j)));
+                assert(s1.ptr == s.ptr && s1.objs == s.objs && s1.ver == s.ver);
+            }
+        },
+        Act::Swap(j) => {
+            if j == i {
+                assert(s1.ptr == Some(p));
+                assert(s1.objs == s.objs);
+            } else {
+                // A dead round ends: the pointer is dead, the credits fall by one, `i`'s read goes stale.
+                assert(!live_flight(s.live, actor(s, j)));
+                let pj = payload_of(actor(s, j));
+                assert(pj.origin != s.live);
+                assert(dead_flight(s.live, actor(s, j)));
+                assert(s1.actors[j] == Actor::Idle);
+                credits_update(s.actors, s.live, j, Actor::Idle, s.actors.len());
+                assert(s1.actors[i] == s.actors[i]);
+                assert(s1.ver == s.ver + 1);
+                assert(s1.objs == s.objs);
+                assert(s1.ptr == Some(pj));
+            }
+        },
+        Act::Reread(j) => {
+            if j == i {
+                assert(ai is Observed);
+                assert(actor(s1, i) == (Actor::Uploaded { p }));
+                credits_update(s.actors, s.live, i, s1.actors[i], s.actors.len());
+            } else {
+                assert(s1.actors[i] == s.actors[i]);
+                credits_update(s.actors, s.live, j, s1.actors[j], s.actors.len());
+            }
+        },
+        Act::PruneRead(j) => {
+            assert(s1.actors[i] == s.actors[i]);
+            credits_update(s.actors, s.live, j, s1.actors[j], s.actors.len());
+            if s.ptr->Some_0.origin == s.live {
+                assert(s.ptr->Some_0.rank <= p.rank);
+            }
+        },
+        Act::Delete(j, o) => {
+            assert(actor_ok(s, s.actors[j]));
+            // `o` is strictly below the pruner's read in its incarnation; every live read is at most `p`'s rank, so `o` is not `p`.
+            assert(s.actors[j] is Pruning);
+            if o == p {
+                assert(pos_lt(pos(o), s.actors[j]->Pruning_pr));
+                assert(p.origin == s.live);
+            }
+            assert(s1.actors == s.actors);
+        },
+        Act::FetchRead(j) => {
+            assert(s1.actors[i] == s.actors[i]);
+            credits_update(s.actors, s.live, j, s1.actors[j], s.actors.len());
+        },
+        Act::FetchGet(j) => {
+            assert(s1.actors[i] == s.actors[i]);
+            credits_update(s.actors, s.live, j, s1.actors[j], s.actors.len());
+        },
+        Act::Upload(j, q) => {},
+    }
 }
 
 } // verus!

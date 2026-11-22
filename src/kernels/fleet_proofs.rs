@@ -30,7 +30,8 @@
 //! * **F1** the pointer guard compared ranks only: a dead incarnation's pointer above the new head refused every publish of the
 //!   new stream while `same_incarnation` refused to restore from it. FIXED: a pointer of another incarnation is replaceable
 //!   (`protocol::Pos`: ranks are ordered only within an incarnation, no clock is assumed), so the new stream's first publish
-//!   replaces the dead pointer; the price is F1b below. [`finding_f1_*`] states the fix; the liveness
+//!   replaces the dead pointer; the price is F1b: a window in which the pointer can dangle, a detected miss ended by the live
+//!   exporter's round (`transport_proofs`). [`finding_f1_*`] states the fix; the liveness
 //!   theorem no longer assumes the state away.
 //! * **F2** a restore over a fold of a recreated stream kept stale entries by revision number, and refused an artifact below the
 //!   old cursor's rank. FIXED: a fold whose cursor is no position of this stream (none, or another incarnation's, which the repair
@@ -1646,46 +1647,16 @@ pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publi
 {
 }
 
-/// FINDING F1b (the price of F1's fix, reported, not assumed away): with no order between incarnations, a slow exporter of a dead
-/// incarnation `b` may replace the live pointer (admitted: another incarnation's), and a STALE live exporter may then replace
-/// that (admitted likewise) with a payload the prune guard has already deleted (it was strictly below the live pointer `(a, R)`
-/// when pruned). Every step is a guard verdict below: the pointer then names a payload that does not exist, until the next live
-/// publish replaces it. `transport_proofs` proves the protocol within one incarnation, where this cannot happen. Closing it
-/// needs either an order between incarnations (the creation-time axiom, refused) or the swap to check its payload still exists.
-pub proof fn finding_f1b_a_dead_exporter_lets_a_pruned_payload_be_published(a: u64, b: u64, r: u64, big: u64)
+/// FINDING F1b (the price of F1's fix) lives in `transport_proofs`, where the pointer and the prune are: a dead exporter can leave
+/// the pointer dangling; (a) a fetch of it is a detected miss, never another payload, and (b) the live exporter's round replaces it
+/// (`a_live_round_ends_the_dangling_window`). What the FLEET adds: a restore never takes a foreign artifact, so a dangling or dead
+/// pointer is never restored from, whatever it names.
+pub proof fn a_restore_never_takes_a_foreign_artifact(f: F, i: int, hd: bool, pick: spec_fn(nat) -> bool)
     requires
-        a != b,
-        r < big,
+        enabled(f, Act::RestoreBegin(i, hd, pick)),
     ensures
-        prunable_spec(Some(Pos { origin: a, rank: r }), Pos { origin: a, rank: big }, false, true),
-        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: a, rank: big }) }, Pos { origin: b, rank: 1 }),
-        publish_allowed_spec(PointerState::Present { at: Some(Pos { origin: b, rank: 1 }) }, Pos { origin: a, rank: r }),
+        f.ptr is Some && f.ptr->Some_0.origin == f.log.origin,
 {
-}
-
-/// FINDING F4 (a stale memo blocked a start the listing could serve), FIXED: `seen_evicting` rides the cursor, and a node that
-/// sees its cursor belong to another incarnation used to keep it (`Detect`). On the recreated, un-evicted bucket the listing IS the
-/// truth, but the memo distrusted it, so the plan was a restore; with no artifact of the new stream (a fleet that is all foreign
-/// has no node to publish one) every such node was blocked for ever, though nothing was lost. Now the detected node forgets the
-/// memo with the cursor, and plans the listing wherever the listing is exact.
-pub proof fn finding_f4_a_detected_node_forgets_the_old_streams_eviction_memo(f: F, i: int)
-    requires
-        finv(f),
-        valid(f, i),
-        !f.log.evicts,
-        f.log.first == 1,
-        !cfg!(feature = "mut_no_eviction_memo"),
-        enabled(f, Act::Detect(i)),
-    ensures
-        !step(f, Act::Detect(i)).nodes[i].seen,
-        plan_of(lt_of(f.log, step(f, Act::Detect(i)).nodes[i])) is Relist,
-        forall|k: nat| (#[trigger] listed(f.log, k)) == truth(f.log.ops, f.log.ops.len(), k),
-{
-    let l = f.log;
-    assert(log_ok(l));
-    assert forall|k: nat| (#[trigger] listed(l, k)) == truth(l.ops, l.ops.len(), k) by {
-        the_trusted_listing_is_the_truth(l, false, k);
-    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

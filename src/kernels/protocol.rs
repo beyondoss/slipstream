@@ -173,7 +173,7 @@ pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState
 /// never pruned here). The bound is real: a slow exporter of a dead
 /// incarnation can move the pointer out of the live one, and a stale live
 /// exporter can then publish a payload this guard already deleted (fleet
-/// finding F1b, `fleet_proofs`); the next live publish replaces that pointer.
+/// finding F1b, `transport_proofs`: a detected miss, ended by the live exporter's next round).
 /// The model checker FOUND the dangling
 /// counterexample under the earlier age-only rule (a same-cursor payload
 /// collected mid-publish, then published by the `>=` swap guard); this rule
