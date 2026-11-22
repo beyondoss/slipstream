@@ -1649,7 +1649,8 @@ pub proof fn finding_f1_a_dead_pointer_ahead_of_the_head_does_not_refuse_a_publi
 
 /// FINDING F1b (the price of F1's fix) lives in `transport_proofs`, where the pointer and the prune are: a dead exporter can leave
 /// the pointer dangling; (a) a fetch of it is a detected miss, never another payload, and (b) the live exporter's round replaces it
-/// (`a_live_round_ends_the_dangling_window`). What the FLEET adds: a restore never takes a foreign artifact, so a dangling or dead
+/// (`a_live_round_ends_the_dangling_window`, whose premises are theorems: `protocol::export_allowed`,
+/// `protocol::a_held_lease_is_never_taken`, `a_converged_exporter_is_at_the_live_head`). What the FLEET adds: a restore never takes a foreign artifact, so a dangling or dead
 /// pointer is never restored from, whatever it names.
 pub proof fn a_restore_never_takes_a_foreign_artifact(f: F, i: int, hd: bool, pick: spec_fn(nat) -> bool)
     requires
@@ -1679,6 +1680,23 @@ pub open spec fn live(l: Log, n: Node) -> bool {
 
 pub open spec fn converged(l: Log, n: Node) -> bool {
     live(l, n) && n.w.delivered == l.ops.len() && n.w.store_cursor == n.w.delivered
+}
+
+/// THEOREM (a converged exporter is at the live head): every artifact of the current incarnation has a cursor at most the log's
+/// head, and a converged node's cursor IS the head. So the exporter of a converged node is at least every live rank the pointer
+/// holds, and a pruner's read (a past pointer) holds: the head premise of the transport liveness
+/// (`transport_proofs::a_live_round_ends_the_dangling_window`), once the fleet liveness has brought a live node to the head.
+pub proof fn a_converged_exporter_is_at_the_live_head(f: F, j: int, a: Art)
+    requires
+        valid(f, j),
+        node_ok(f.log, node_at(f, j)),
+        converged(f.log, node_at(f, j)),
+        art_ok(f.log, a),
+        a.origin == f.log.origin,
+    ensures
+        a.cursor <= node_at(f, j).w.store_cursor,
+{
+    assert(ok_fold(a.fold, f.log.ops, a.cursor));
 }
 
 pub open spec fn folded(n: Node) -> bool {

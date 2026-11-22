@@ -14,6 +14,8 @@
 //! | [`listing_is_truth`] / [`listing_truth`] | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention; repair-steps `ConfigForgot` |
 //! | [`plan_repair`]            | `repair::plan`, `Snapshot::stale_keys` | expiry dispatch in every model |
 //! | [`cursorless_start_needs_repair`] | `repair::run_watch`          | repair-steps `WStart`, fleet `Start` |
+//! | [`export_allowed`]           | `applied::Fold::export` (every export round) | `tests/recreated_fleet.rs` (live) |
+//! | [`lease_takeover_allowed`]    | `export_lease::ExportLease::try_acquire` | Verus (`a_held_lease_is_never_taken`) |
 //! | [`cursorless_fold_is_this_stream`] | `repair::run_watch` (a fold with data and no cursor) | `tests/recreated_fleet.rs` (live) |
 //! | [`restore_key`]            | `repair::restore_diff`              | repair-steps restore op |
 //! | [`gap_holds_no_eviction`]  | `nats` resume (`NatsKvWatcher::resume_point`) | — (unit-tested; `tests/eviction.rs` live) |
@@ -354,6 +356,81 @@ pub fn cursorless_fold_is_this_stream(recorded: Option<u64>, stream: Option<u64>
 /// [`cursorless_fold_is_this_stream`]'s table.
 pub open spec fn cursorless_fold_spec(recorded: Option<u64>, stream: Option<u64>) -> bool {
     recorded is Some && stream is Some && recorded->Some_0 == stream->Some_0
+}
+
+/// THE export guard: may a fold export itself now? An artifact is the fold at its store's cursor, so the cursor must be a position of
+/// THE STREAM THAT EXISTS NOW: it has a position (a cursor-less fold would publish a rank-0 artifact over any pointer of another
+/// incarnation), and, when the log can say which incarnation it is (`stream`), the cursor is that one's ([`same_incarnation`]: a
+/// foreign cursor, one forgotten by the repair, never exports). A node of a dead stream therefore starts no export round after the
+/// recreation: its first export is refused, and its lease is given back.
+pub fn export_allowed(
+    has_position: bool,
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream: Option<u64>,
+    last_sequence: u64,
+) -> (r: bool)
+    ensures
+        r == export_allowed_spec(has_position, cursor_origin, revision, stream, last_sequence),
+        !has_position ==> !r,
+        (has_position && stream is Some && cursor_origin is Some && cursor_origin->Some_0 != stream->Some_0) ==> !r,
+{
+    // Mutation (model tests only): export whatever the fold holds (the pre-guard behaviour).
+    if cfg!(feature = "mut_export_ignores_stream") {
+        return true;
+    }
+    if !has_position {
+        return false;
+    }
+    match stream {
+        Some(s) => same_incarnation(cursor_origin, revision, s, last_sequence),
+        None => true,
+    }
+}
+
+/// [`export_allowed`]'s table.
+pub open spec fn export_allowed_spec(
+    has_position: bool,
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream: Option<u64>,
+    last_sequence: u64,
+) -> bool {
+    has_position && match stream {
+        Some(s) => same_incarnation_spec(cursor_origin, revision, s, last_sequence),
+        None => true,
+    }
+}
+
+/// THE lease takeover guard: may a round be won over the lease record found? A record that parses and has not expired is held; an
+/// expired one, or one that does not parse (`None`: one corrupt write must not wedge exports), is taken over. The takeover is a
+/// compare-and-swap against the version read (O3-style, NATS KV), so of racing takers exactly one wins.
+pub fn lease_takeover_allowed(held_until: Option<u64>, now: u64) -> (r: bool)
+    ensures
+        r == lease_takeover_spec(held_until, now),
+{
+    match held_until {
+        Some(until) => until <= now,
+        None => true,
+    }
+}
+
+/// [`lease_takeover_allowed`]'s table.
+pub open spec fn lease_takeover_spec(held_until: Option<u64>, now: u64) -> bool {
+    match held_until {
+        Some(until) => until <= now,
+        None => true,
+    }
+}
+
+/// THEOREM (a held lease is never taken): while a round's lease has not expired (`now < until`), no other round can take it. So two
+/// rounds overlap only if the first outlives its lease: the one clock assumption is that a round finishes within its ttl.
+pub proof fn a_held_lease_is_never_taken(until: u64, now: u64)
+    requires
+        now < until,
+    ensures
+        !lease_takeover_spec(Some(until), now),
+{
 }
 
 /// THE restore guard: may a fold whose cursor (`local_revision`) fell out of
@@ -814,6 +891,36 @@ mod tests {
         assert!(!payload_prunable(None, ptr, false, true));
         // Grace window holds everything.
         assert!(!payload_prunable(pos(2, 4), ptr, false, false));
+    }
+
+    #[test]
+    fn export_and_lease_guards() {
+        // A cursor of this stream exports; of another, or none, does not.
+        assert!(export_allowed(true, Some(7), 5, Some(7), 10));
+        assert!(
+            !export_allowed(true, Some(6), 5, Some(7), 10),
+            "dead stream"
+        );
+        assert!(
+            !export_allowed(false, Some(7), 0, Some(7), 10),
+            "no position"
+        );
+        assert!(
+            export_allowed(true, None, 5, Some(7), 10),
+            "unrecorded, possible here"
+        );
+        assert!(
+            !export_allowed(true, None, 50, Some(7), 10),
+            "unrecorded, beyond the head"
+        );
+        assert!(
+            export_allowed(true, None, 5, None, 0),
+            "a log that cannot say"
+        );
+        // A held lease is not taken; an expired or unparseable one is.
+        assert!(!lease_takeover_allowed(Some(100), 99));
+        assert!(lease_takeover_allowed(Some(100), 100));
+        assert!(lease_takeover_allowed(None, 0));
     }
 
     #[test]

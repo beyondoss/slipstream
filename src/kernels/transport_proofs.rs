@@ -28,17 +28,23 @@
 //!   ([`a_live_round_ends_the_dangling_window`], ranking function [`rho`]): its round replaces the pointer with a payload that
 //!   exists, in at most one round plus one re-read per dead round still in flight.
 //!
-//! # Environment axioms
+//! # Environment axioms (the object store, NATS, clocks: nothing of slipstream's)
 //!
 //! * **O1** a payload path names its content for ever (content addressing; a hash collision is the only way to break it);
 //! * **O2** the pointer object is written only by [`Act::Swap`] (nothing else deletes or rewrites it);
 //! * **O3** a compare-and-swap succeeds exactly when the object is unchanged since the read (`ver`);
-//! * **F-e** (liveness only) while the live exporter's round runs, no round starts: the export lease admits one live round at a
-//!   time, and a node of a dead stream starts no new round after the recreation (it re-seeds as a live one first), so the dead
-//!   rounds in flight are finitely many ([`credits`]);
-//! * **F-h** (liveness only) the live exporter exports at the live head, which is at least every live rank the pointer or a pruner's
-//!   read holds (nothing of the live incarnation is published above the head), and its own payload exists when the round starts;
-//! * **F-c** the object store answers (the existing fairness axiom: a round's steps run).
+//! * **T** a round finishes before its lease lapses (the clock, and an object store that answers within the round period).
+//!
+//! The liveness lemma's premises ([`round_ok`]) are claims about slipstream's own code, so each is a THEOREM, not an axiom:
+//!
+//! * the live round runs alone: `protocol::a_held_lease_is_never_taken` (the takeover guard `ExportLease` runs) with **T**;
+//! * no dead round starts after the recreation: `protocol::export_allowed` refuses the export of a fold whose cursor is not the
+//!   stream's (`Fold::export`), so a node of a dead stream gives its lease back and publishes nothing; only the dead rounds
+//!   already in flight at the recreation remain, finitely many ([`credits`]);
+//! * the exporter is at the live head: the window ends once a live exporter's fold REACHES the head, which the fleet liveness
+//!   theorem delivers (`fleet_proofs::a_converged_exporter_is_at_the_live_head`: a converged node's cursor is at least every live
+//!   artifact's);
+//! * its payload exists when its round starts: `Act::Upload` inserts it.
 
 use crate::kernels::protocol::*;
 use vstd::prelude::*;
@@ -393,7 +399,7 @@ pub open spec fn credits_upto(actors: Seq<Actor>, live: u64, n: nat) -> nat
     }
 }
 
-/// The dead rounds in flight: finitely many (F-e), and each ends with a swap or a refused guard.
+/// The dead rounds in flight: finitely many (no round starts after the recreation: `export_allowed`), and each ends with a swap or a refused guard.
 pub open spec fn credits(s: TS) -> nat {
     credits_upto(s.actors, s.live, s.actors.len())
 }
@@ -422,8 +428,9 @@ pub open spec fn payload_of(a: Actor) -> Payload {
     }
 }
 
-/// The live exporter `i` is mid-round (F-e: the lease admits one live round, so no other actor is in a live round), its payload
-/// exists, and it exports at the live head (F-h): no live rank in the pointer or in a pruner's read exceeds its own.
+/// The live exporter `i` is mid-round and alone in a live round (the lease with **T**), its payload exists (`Act::Upload`), and it is
+/// at the live head (its fold is converged): no live rank in the pointer or in a pruner's read exceeds its own (each is a
+/// published artifact's cursor, at most the head). The header says why each holds.
 pub open spec fn round_ok(s: TS, i: int) -> bool {
     &&& valid(s, i)
     &&& live_flight(s.live, actor(s, i))
@@ -460,7 +467,7 @@ proof fn credits_update(actors: Seq<Actor>, live: u64, i: int, a2: Actor, n: nat
 }
 
 /// THEOREM (b) (the dangling window ends with the live exporter's round): while the live exporter `i` runs its round (no round
-/// starts meanwhile: F-e), every step of the world either leaves its rank [`rho`] where it was or lowers it, and every step of `i`
+/// starts meanwhile: the header), every step of the world either leaves its rank [`rho`] where it was or lowers it, and every step of `i`
 /// itself lowers it: its read of the pointer is admitted (the pointer is not above its payload, so the guard cannot refuse it:
 /// the refusal clears), its swap succeeds against a fresh read, a lost CAS (a dead round's swap, which lowered the credits) takes
 /// it back to a re-read. Its payload exists throughout (a prune never deletes it: every live read is at most its rank), so the
