@@ -96,9 +96,19 @@ pub open spec fn pre(w: World, e: Event) -> bool {
     }
 }
 
+/// Where a restart resumes from: the production decision, `resume_from`'s table. `mut_resume_from_memory` forges it exactly as that
+/// feature forges the code, so a mutated build fails every proof that rests on a restart (the invariant, the fleet's crash step).
+pub open spec fn resume_source(holds_store: bool) -> ResumeFrom {
+    if cfg!(feature = "mut_resume_from_memory") {
+        ResumeFrom::Memory
+    } else {
+        resume_from_spec(holds_store)
+    }
+}
+
 /// After a crash or a fail-stop: the run restarts from the cursor `resume_from` names; the store keeps what it persisted.
 pub open spec fn restart(w: World) -> World {
-    let resume = match resume_from_spec(true) {
+    let resume = match resume_source(true) {
         ResumeFrom::Store => w.store_cursor,
         ResumeFrom::Memory => w.applied,
     };
@@ -222,6 +232,7 @@ pub proof fn only_a_landed_fold_moves_the_store_cursor(w: World, e: Event, art_n
 /// THEOREM (restore order): the artifact's cursor is committed only by the answer to the chunk fold, from the `Fold` phase, and
 /// the reply to the watch task is the very next action. The restore's phases are a chain: `Ahead -> Diff -> (Listing ->) Fold ->
 /// Idle`, with a refusal returning to `Idle` from `Ahead` or `Listing` only.
+#[verifier::rlimit(40)]
 pub proof fn the_cursor_commits_only_after_the_chunks_fold(s: State, e: Event)
     ensures
         step_spec(s, e).1.contains(Action::CommitCursor) ==> (e is RestoreFolded && s.restore is Fold

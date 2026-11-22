@@ -600,6 +600,19 @@ impl SnapshotStore for AppendLogSnapshot {
     }
 
     fn apply(&mut self, batch: &[KvUpdate], cursor: &WatchCursor) -> Result<(), SnapshotError> {
+        // A fresh fold records which stream incarnation it is of BEFORE its first
+        // data record (a checkpoint, flushed), so a first checkpoint that tears
+        // still names its stream: data plus a recorded incarnation is judged
+        // against the stream on open, and data with none is foreign.
+        if self.entries.is_empty()
+            && self.cursor.origin().is_none()
+            && !batch.is_empty()
+            && let Some(origin) = cursor.origin()
+        {
+            let origin_only = WatchCursor::origin_only(origin);
+            let _ = self.writer.checkpoint(&origin_only)?;
+            self.cursor = origin_only;
+        }
         // Stream the raw records, then the cursor checkpoint — data-then-cursor,
         // so a torn write leaves data ahead of the cursor (re-folded on resume),
         // never a cursor ahead of its data. The in-RAM fold mirrors the same
@@ -1212,12 +1225,23 @@ fn compact_to_file(
             0
         } else {
             4 + 1 + 1 + cursor.to_bytes().len()
+        }
+        + if cursor.origin().is_some() {
+            4 + 1 + 1 + 20
+        } else {
+            0
         };
     let capacity = estimated.clamp(8 * 1024, 1024 * 1024);
     let mut buf = io::BufWriter::with_capacity(capacity, tempfile::NamedTempFile::new_in(dir)?);
 
     buf.write_all(MAGIC)?;
     buf.write_all(&FORMAT_VERSION.to_le_bytes())?;
+
+    // The fold's incarnation BEFORE its data, as `apply` writes it: a log cut
+    // anywhere after this record still names the stream its entries are of.
+    if let Some(origin) = cursor.origin() {
+        write_cursor_record(&mut buf, &WatchCursor::origin_only(origin))?;
+    }
 
     for entry in sorted {
         write_put_record(&mut buf, &entry.key, &entry.value, &entry.version)?;
@@ -1861,6 +1885,44 @@ mod tests {
     /// the file (missing those records), rewrote it, and the old buffer then
     /// flushed into the renamed-away inode — silently dropping the writes. With
     /// the leading flush, an un-checkpointed write survives compaction.
+    /// A fresh fold records its stream's incarnation before its first data
+    /// record, so a first checkpoint that tears (data on disk, the cursor
+    /// record not) still names its stream. A fold with no recorded
+    /// incarnation (a file from before folds recorded one) names none.
+    #[test]
+    fn a_torn_first_checkpoint_still_names_its_stream() {
+        let torn = |origin: Option<u64>| {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("fold");
+            let (_, mut s) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+            let mut v = VersionToken::from_u64(5);
+            if let Some(o) = origin {
+                v = v.with_origin(o);
+            }
+            let c = WatchCursor::from_version(v);
+            s.apply(&[put("a", b"1", 5)], &c).unwrap();
+            drop(s);
+            let len = fs::metadata(&path).unwrap().len();
+            let record = (4 + 1 + 1 + c.to_bytes().len()) as u64;
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(len - record)
+                .unwrap();
+            let (cursor, s) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+            assert!(cursor.is_none(), "the cursor record is torn off");
+            assert!(s.get("a").unwrap().is_some(), "the data is there");
+            // And it survives a compaction on the next open.
+            drop(s);
+            let (again, _) = AppendLogSnapshot::open(&path, u64::MAX).unwrap();
+            assert_eq!(again.origin(), cursor.origin());
+            cursor.origin()
+        };
+        assert_eq!(torn(Some(77)), Some(77));
+        assert_eq!(torn(None), None, "no recorded incarnation: foreign");
+    }
+
     #[test]
     fn compact_preserves_uncheckpointed_writes() {
         let dir = TempDir::new().unwrap();

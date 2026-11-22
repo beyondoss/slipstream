@@ -10,8 +10,10 @@
 //! propagate through artifacts to every node that restores. Here the nodes
 //! ARE the exporters, and the checker proves the induction:
 //!
-//! - **Every published artifact is the truth at its cursor.**
-//! - **Every live node's fold is the truth at its cursor.**
+//! - **Every published artifact is the truth at its cursor** (on this model's
+//!   one key: see the bounds below; what the code keeps on many keys is the
+//!   weaker "complete" statement).
+//! - **Every live node's fold is the truth at its cursor** (same).
 //! - **Every maximal run ends with every live node converged** to every
 //!   write minus every real delete. A node may instead be fail-stopped — and
 //!   then only because a write aged out before ANY node folded it: no fold
@@ -31,9 +33,33 @@
 //! Mutations the checker must catch: the key-listing repair on an evicting
 //! bucket, and a cursor-less start that re-lists an already-evicted bucket —
 //! each poisons the fleet's artifacts.
+//!
+//! **This check is bounded; it has an unbounded twin.** `src/kernels/fleet_proofs.rs`
+//! proves the same induction in Verus for any number of nodes, keys and writes, with
+//! the log's retention eviction and stream recreation, crash/restart at every point
+//! (even mid-restore), and the restore's own steps interleaved, over the same shared
+//! kernels (`applied::step_spec` through `applied_proofs`, and the `protocol` specs).
+//! What it adds, which this model cannot see:
+//!
+//! - on MANY keys the invariant is "complete together with the log after the cursor",
+//!   not "equals the truth at the cursor": a restore keeps a stale entry of a key the
+//!   bucket lists live (`restore_key`), and the resume delivers the later write
+//!   (`fleet_proofs::finding_f3_*`). The two `always` properties below state the
+//!   stronger "equals the truth at its cursor" and PASS ONLY BECAUSE of this model's
+//!   bounds: one key, and an atomic repair. With a second key the stronger statement
+//!   is false of the shipped code (F3), so this model proves the one-key instance, and
+//!   `fleet_proofs::every_live_nodes_fold_is_complete_at_its_cursor` (despite its
+//!   name: complete, exact at the head) proves the statement the code keeps;
+//! - recreated streams, which this model does not have (one incarnation): a restore
+//!   over a fold of another incarnation takes the artifact key for key (`finding_f2_*`),
+//!   a dead incarnation's pointer is replaced by the new stream's first publish
+//!   (`finding_f1_*`), and a foreign cursor forgets the eviction memo (`finding_f4_*`);
+//! - liveness as a ranking function under named fairness axioms (`nrank`).
+//!
+//! The proof's mutations are the same `mut_*` features: `mise run verify -- --features mut_x`.
 
 use slipstream::protocol::{
-    PointerState, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
+    PointerState, Pos, RepairMode, RepairPlan, cursorless_start_needs_repair, listing_is_truth,
     plan_repair, pointer_publish_allowed, restore_allowed, resume_window_ok,
 };
 use stateright::{Checker, Model, Property};
@@ -203,13 +229,19 @@ impl Model for Fleet {
                 acts.push(Act::Expire(i));
             }
             let current = s.pointer.map(|(c, _)| PointerState::Present {
-                rank: Some(c as u64),
+                at: Some(Pos {
+                    origin: 1,
+                    rank: c as u64,
+                }),
             });
             if n.cursor >= 1
                 && s.pointer.is_none_or(|(c, _)| c < n.cursor)
                 && pointer_publish_allowed(
                     &current.unwrap_or(PointerState::Absent),
-                    n.cursor as u64,
+                    Pos {
+                        origin: 1,
+                        rank: n.cursor as u64,
+                    },
                 )
             {
                 acts.push(Act::Publish(i));

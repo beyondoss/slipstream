@@ -425,7 +425,14 @@ impl RepairModel {
             None => KeyState::Absent,
         };
         let identical = s.store_val.is_some() && s.store_val == want;
-        restore_key(state(s.store_val), state(want), identical, listed_live)
+        // One incarnation here: the fold is this stream's (`tests/model_incarnation.rs`, `tests/recreated_fleet.rs`).
+        restore_key(
+            state(s.store_val),
+            state(want),
+            identical,
+            listed_live,
+            true,
+        )
     }
 
     fn upd(target: u8, s: &St, r: KeyRestore) -> Option<Upd> {

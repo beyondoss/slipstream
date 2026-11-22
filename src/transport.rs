@@ -5,7 +5,7 @@
 //!
 //! The payload is a **plain tar** of the artifact directory (`MANIFEST.json`
 //! plus `data/…`) at a **content-addressed** key —
-//! `<prefix>/<key>.payloads/<blake3(manifest)[..8] hex>.tar` — so payload
+//! `<prefix>/<key>.payloads/<origin hex>-<rank hex>-<blake3(manifest)[..8] hex>.tar` — so payload
 //! objects are write-once: two different artifacts can never collide on a
 //! key, and re-uploading the same artifact is an idempotent overwrite. No
 //! compression layer: fjall/RocksDB payload files are already lz4/zstd
@@ -68,7 +68,7 @@ use crate::artifact::{
 };
 use crate::export_lease::ExportLease;
 use crate::kv::WatchCursor;
-use crate::protocol::{PointerState, payload_prunable, pointer_publish_allowed};
+use crate::protocol::{PointerState, Pos, payload_prunable, pointer_publish_allowed};
 use crate::repair::{RestoreSource, RestoredFold};
 use crate::snapshot::SnapshotError;
 
@@ -255,11 +255,14 @@ impl ObjectStoreTransport {
     fn payload_path(&self, key: &str, cursor: &WatchCursor, pointer_bytes: &[u8]) -> ObjPath {
         let digest = blake3::hash(pointer_bytes);
         let hex = hex_encode(&digest.as_bytes()[..8]);
-        ObjPath::from(format!(
-            "{}/{key}.payloads/{:016x}-{hex}.tar",
-            self.prefix,
-            cursor.rank()
-        ))
+        // The name carries the cursor's incarnation (when it records one) as
+        // well as its revision, so the prune guard can order a payload against
+        // the pointer ([`payload_position`]).
+        let name = match cursor.origin() {
+            Some(origin) => format!("{origin:016x}-{:016x}-{hex}.tar", cursor.rank()),
+            None => format!("{:016x}-{hex}.tar", cursor.rank()),
+        };
+        ObjPath::from(format!("{}/{key}.payloads/{name}", self.prefix))
     }
 
     fn manifest_path(&self, key: &str) -> ObjPath {
@@ -329,9 +332,9 @@ impl ObjectStoreTransport {
                     // rank-less and replaced.
                     let existing = manifest_from_slice(&bytes).ok();
                     let observed = PointerState::Present {
-                        rank: existing.as_ref().map(|m| m.cursor.rank()),
+                        at: existing.as_ref().map(|m| m.cursor.position()),
                     };
-                    if !pointer_publish_allowed(&observed, new_cursor.rank()) {
+                    if !pointer_publish_allowed(&observed, new_cursor.position()) {
                         let existing =
                             existing.expect("refusal implies a parseable, newer pointer");
                         return Ok(PublishOutcome::SupersededByNewer {
@@ -625,7 +628,7 @@ impl ArtifactTransport for ObjectStoreTransport {
             return Ok(0);
         };
         let keep = self.payload_path(key, &current.cursor, &pointer);
-        let pointer_rank = current.cursor.rank();
+        let pointer = current.cursor.position();
         let cutoff_millis = std::time::SystemTime::now()
             .checked_sub(grace)
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -645,14 +648,10 @@ impl ArtifactTransport for ObjectStoreTransport {
             // impossibility argument live). The grace period remains as
             // defense in depth for in-flight downloads holding stale
             // pointer reads.
-            let payload_rank = meta
-                .location
-                .filename()
-                .and_then(|f| f.split('-').next())
-                .and_then(|h| u64::from_str_radix(h, 16).ok());
+            let payload = meta.location.filename().and_then(payload_position);
             if payload_prunable(
-                payload_rank,
-                pointer_rank,
+                payload,
+                pointer,
                 meta.location == keep,
                 meta.last_modified.timestamp_millis() <= cutoff_millis,
             ) {
@@ -663,6 +662,31 @@ impl ArtifactTransport for ObjectStoreTransport {
             }
         }
         Ok(deleted)
+    }
+}
+
+/// The position a payload's file name records ([`ObjectStoreTransport::payload_path`]):
+/// `<origin>-<rank>-<digest>.tar`, or `<rank>-<digest>.tar` for a cursor that
+/// recorded no incarnation (origin 0). Anything else is not ours: `None`, and
+/// never pruned.
+fn payload_position(name: &str) -> Option<Pos> {
+    let hex = |h: &str| {
+        (h.len() == 16)
+            .then(|| u64::from_str_radix(h, 16).ok())
+            .flatten()
+    };
+    let mut parts = name.split('-');
+    let (first, second, third) = (parts.next()?, parts.next()?, parts.next());
+    match third {
+        None => Some(Pos {
+            origin: 0,
+            rank: hex(first)?,
+        }),
+        Some(_) if parts.next().is_none() => Some(Pos {
+            origin: hex(first)?,
+            rank: hex(second)?,
+        }),
+        Some(_) => None,
     }
 }
 

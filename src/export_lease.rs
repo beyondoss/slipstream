@@ -156,9 +156,10 @@ impl ExportLease {
         // A live, parseable, unexpired lease wins; anything else (expired,
         // tombstone, unparseable garbage) is taken over. Unparseable leases
         // MUST be stealable or one corrupt write wedges exports fleet-wide.
-        if let Ok(existing) = serde_json::from_slice::<LeaseRecord>(&entry.value)
-            && existing.expires_at_unix > now
-        {
+        let held_until = serde_json::from_slice::<LeaseRecord>(&entry.value)
+            .ok()
+            .map(|r| r.expires_at_unix);
+        if !crate::protocol::lease_takeover_allowed(held_until, now) {
             return Ok(None);
         }
 

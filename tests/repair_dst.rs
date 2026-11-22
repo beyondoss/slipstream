@@ -345,7 +345,7 @@ impl KvWatcher for SimLog {
             evicts_current_values: st.evicts_current,
             first_revision: st.first_revision(),
             last_revision: u64::MAX,
-            incarnation: None,
+            incarnation: Some(SIM_INCARNATION),
         }))
     }
 }
@@ -477,7 +477,7 @@ impl<B> SimRestore<B> {
             schema_version: ARTIFACT_SCHEMA_VERSION,
             backend: "sim".into(),
             backend_version: "0".into(),
-            cursor: WatchCursor::from_u64(self.cursor),
+            cursor: sim_cursor(self.cursor),
             created_at_unix: 0,
             files: vec![],
             scope: Some(vec![String::new()]),
@@ -528,7 +528,7 @@ impl<B: Backend> RestoreSource<FaultStore<B::S>> for SimRestore<B> {
                 })
             })
             .collect();
-        fold.apply(&updates, &WatchCursor::from_u64(self.cursor))?;
+        fold.apply(&updates, &sim_cursor(self.cursor))?;
         Ok(RestoredFold::new(
             self.manifest(),
             FaultStore {
@@ -861,9 +861,10 @@ fn world<B: Backend>(sc: &Scenario, yield_between: bool) -> World<B> {
             .map(to_update)
             .collect();
         let cursor = if sc.unanchored {
-            WatchCursor::none()
+            // Data and no cursor: a torn first checkpoint, which still names its stream.
+            sim_origin_only()
         } else {
-            WatchCursor::from_u64(at)
+            sim_cursor(at)
         };
         fold.apply(&seed, &cursor).unwrap();
     }
@@ -1130,6 +1131,28 @@ struct Cfg {
     yield_between: bool,
     max: usize,
     export: bool,
+}
+
+/// The one stream incarnation the simulated log is, and a cursor of it (the encoding of a cursor that records its stream: the
+/// version padded to 10 bytes, its length, the origin flag, the origin u64 LE). The folds record it, so a fold with data and no
+/// cursor is judged this stream's, as a real watch's would be.
+const SIM_INCARNATION: u64 = 7;
+
+/// What a torn first checkpoint leaves: no position, the stream recorded.
+fn sim_origin_only() -> WatchCursor {
+    let mut bytes = vec![0u8; 12];
+    bytes[11] = 0b100;
+    bytes.extend_from_slice(&SIM_INCARNATION.to_le_bytes());
+    WatchCursor::from_bytes(&bytes).expect("an origin-only cursor")
+}
+
+fn sim_cursor(rev: u64) -> WatchCursor {
+    let mut bytes = vec![0u8; 12];
+    bytes[..8].copy_from_slice(&rev.to_be_bytes());
+    bytes[10] = 8;
+    bytes[11] = 0b100;
+    bytes.extend_from_slice(&SIM_INCARNATION.to_le_bytes());
+    WatchCursor::from_bytes(&bytes).expect("a cursor with an origin")
 }
 
 /// Drive a schedule (faults per run) to convergence and check the outcome.

@@ -14,6 +14,9 @@
 //! | [`listing_is_truth`] / [`listing_truth`] | `repair` (plan, cursor-less start), `Snapshot::stale_keys` | every model's view of retention; repair-steps `ConfigForgot` |
 //! | [`plan_repair`]            | `repair::plan`, `Snapshot::stale_keys` | expiry dispatch in every model |
 //! | [`cursorless_start_needs_repair`] | `repair::run_watch`          | repair-steps `WStart`, fleet `Start` |
+//! | [`export_allowed`]           | `applied::Fold::export` (every export round) | `tests/recreated_fleet.rs` (live) |
+//! | [`lease_takeover_allowed`]    | `export_lease::ExportLease::try_acquire` | Verus (`a_held_lease_is_never_taken`) |
+//! | [`cursorless_fold_is_this_stream`] | `repair::run_watch` (a fold with data and no cursor) | `tests/recreated_fleet.rs` (live) |
 //! | [`restore_key`]            | `repair::restore_diff`              | repair-steps restore op |
 //! | [`gap_holds_no_eviction`]  | `nats` resume (`NatsKvWatcher::resume_point`) | — (unit-tested; `tests/eviction.rs` live) |
 //!
@@ -36,153 +39,205 @@ use vstd::prelude::*;
 // decides, the lemmas are the safety arguments the doc comments make in prose. A normal build erases all of it.
 verus! {
 
+/// A position in the artifact order: the stream incarnation a cursor was taken from (its creation time in Unix ns; 0 for a cursor
+/// that records none) and its revision. Revisions are ordered only WITHIN an incarnation: nothing orders two incarnations (no
+/// clock is assumed), and only one is live at a time. A position of another incarnation is replaceable, not older or newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pos {
+    /// The stream incarnation (0 when the cursor records none).
+    pub origin: u64,
+    /// The cursor's revision.
+    pub rank: u64,
+}
+
+/// `a` is strictly below `b`: the same incarnation at a lower revision. Positions of different incarnations are incomparable.
+pub open spec fn pos_lt(a: Pos, b: Pos) -> bool {
+    a.origin == b.origin && a.rank < b.rank
+}
+
 /// What the publisher observed at the pointer key before deciding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerState {
     /// No pointer object exists — the slot is open (create-only publish).
     Absent,
-    /// A pointer object exists. `rank` is its cursor's rank, or `None` when
+    /// A pointer object exists. `at` is its cursor's position, or `None` when
     /// the object is unparseable — a corrupt pointer MUST be replaceable, or
     /// one bad write wedges publishing forever (the same rule as the export
     /// lease's corrupt-steal).
     Present {
-        /// Rank of the existing pointer's cursor; `None` if unparseable.
-        rank: Option<u64>,
+        /// Position of the existing pointer's cursor; `None` if unparseable.
+        at: Option<Pos>,
     },
 }
 
-/// THE monotonic pointer guard: may `candidate_rank` be published over the
+/// THE monotonic pointer guard: may `candidate` be published over the
 /// observed `current` pointer?
 ///
-/// `true` for an open slot, a corrupt pointer, or a candidate at or above
-/// the existing cursor; `false` exactly when the existing pointer is
-/// parseable and STRICTLY newer — the refusal that makes a slow exporter's
-/// stale publish a no-op instead of a regression.
+/// `true` for an open slot, a corrupt pointer, a pointer of ANOTHER incarnation than the candidate's, or a candidate at or above
+/// the existing cursor in its own incarnation; `false` exactly when the existing pointer is parseable, of the candidate's
+/// incarnation, and STRICTLY higher — the refusal that makes a slow exporter's stale publish a no-op instead of a regression.
+/// A pointer of a dead incarnation, whatever its revision, never refuses a publish of the incarnation that replaced it (ranks
+/// alone left such a pointer, ranked above the new head, refusing every publish of the new stream): it is foreign, like a corrupt
+/// one, and replaceable. A slow exporter of the dead stream can replace the live pointer once; the next live publish replaces it
+/// (restorers refuse it meanwhile: `same_incarnation`).
 ///
-/// Soundness of deciding on a read (before the conditional put): every
-/// writer uses this guard with a compare-and-swap, so the pointer's rank is
-/// monotone non-decreasing — once "strictly newer" is observed, it can never
-/// become false, so refusal needs no CAS. Machine-checked as `published
-/// cursor never regresses` in `tests/model.rs`.
-pub fn pointer_publish_allowed(current: &PointerState, candidate_rank: u64) -> (r: bool)
+/// Soundness of deciding on a read (before the conditional put): every writer uses this guard with a compare-and-swap, so while
+/// the pointer stays in one incarnation its rank is monotone non-decreasing — once "strictly higher" is observed, it stays so
+/// until the pointer leaves that incarnation, so refusal needs no CAS. Machine-checked as `published cursor never regresses` in
+/// `tests/model.rs` (one incarnation).
+pub fn pointer_publish_allowed(current: &PointerState, candidate: Pos) -> (r: bool)
     ensures
-        r == publish_allowed_spec(*current, candidate_rank),
+        r == publish_allowed_spec(*current, candidate),
 {
+    // Mutation (model tests only): compare revisions across incarnations (the pre-fix guard).
+    let candidate = if cfg!(feature = "mut_pointer_ignores_incarnation") {
+        Pos { origin: 0, rank: candidate.rank }
+    } else {
+        candidate
+    };
     match current {
         PointerState::Absent => true,
-        PointerState::Present { rank: None } => true,
-        PointerState::Present { rank: Some(existing) } => candidate_rank >= *existing,
+        PointerState::Present { at: None } => true,
+        PointerState::Present { at: Some(existing) } => {
+            let existing = if cfg!(feature = "mut_pointer_ignores_incarnation") {
+                Pos { origin: 0, rank: existing.rank }
+            } else {
+                *existing
+            };
+            candidate.origin != existing.origin || candidate.rank >= existing.rank
+        },
     }
 }
 
-/// [`pointer_publish_allowed`]: refused exactly when the existing pointer is parseable and strictly newer.
-pub open spec fn publish_allowed_spec(current: PointerState, candidate_rank: u64) -> bool {
-    !(current is Present && current->Present_rank is Some
-        && current->Present_rank->Some_0 > candidate_rank)
+/// [`pointer_publish_allowed`]: refused exactly when the existing pointer is parseable, of the candidate's incarnation, and higher.
+pub open spec fn publish_allowed_spec(current: PointerState, candidate: Pos) -> bool {
+    !(current is Present && current->Present_at is Some && pos_lt(candidate, current->Present_at->Some_0))
 }
 
 /// The pointer after a publish that [`pointer_publish_allowed`] admitted: the candidate's cursor.
-pub open spec fn published(candidate_rank: u64) -> PointerState {
-    PointerState::Present { rank: Some(candidate_rank) }
+pub open spec fn published(candidate: Pos) -> PointerState {
+    PointerState::Present { at: Some(candidate) }
 }
 
-/// THEOREM (monotone pointer): an admitted publish never lowers a parseable pointer, so the pointer's rank is monotone
-/// non-decreasing under every interleaving of admitted publishes. This is what lets a refusal be decided on a read.
-pub proof fn a_publish_never_regresses_the_pointer(current: PointerState, candidate_rank: u64)
+/// THEOREM (monotone within an incarnation): an admitted publish over a parseable pointer of its own incarnation never lowers it,
+/// so while the pointer stays in an incarnation its rank is monotone non-decreasing under every interleaving of admitted
+/// publishes. This is what lets a refusal be decided on a read.
+pub proof fn a_publish_never_regresses_the_pointer_within_an_incarnation(current: PointerState, candidate: Pos)
     requires
-        publish_allowed_spec(current, candidate_rank),
+        publish_allowed_spec(current, candidate),
+        current is Present && current->Present_at is Some && current->Present_at->Some_0.origin == candidate.origin,
     ensures
-        (current is Present && current->Present_rank is Some)
-            ==> published(candidate_rank)->Present_rank->Some_0 >= current->Present_rank->Some_0,
+        candidate.rank >= current->Present_at->Some_0.rank,
 {
 }
 
-/// THEOREM (liveness of the publish guard): the refusal clears. An open slot, a corrupt pointer, and any candidate at or above
-/// the pointer are always admitted, so an exporter that retries with a cursor at or above the pointer's succeeds. A stale
+/// THEOREM (liveness: a dead incarnation's pointer never refuses a live exporter): whatever revision the pointer holds, a candidate
+/// of another incarnation is admitted, with no assumption about time or about which incarnation is newer. The pointer of a deleted
+/// and recreated bucket is replaced by the new stream's first publish, even when ranked above the new head.
+pub proof fn a_pointer_of_another_incarnation_never_refuses_a_publish(current: PointerState, candidate: Pos)
+    requires
+        current is Present && current->Present_at is Some ==> candidate.origin != current->Present_at->Some_0.origin,
+    ensures
+        publish_allowed_spec(current, candidate),
+{
+}
+
+/// THEOREM (liveness of the publish guard): the refusal clears. An open slot, a corrupt pointer, a pointer of another
+/// incarnation, and any candidate at or above the pointer in its incarnation are always admitted, so an exporter that retries with a cursor at or above the pointer's succeeds. A stale
 /// publish is refused only while the pointer is strictly newer, and the pointer never regresses, so it stays refused: the
 /// exporter's exit is a fresher export, never a retry of the stale one. Rank: none needed, the guard is stateless.
-pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState, candidate_rank: u64)
+pub proof fn a_publish_at_or_above_the_pointer_is_admitted(current: PointerState, candidate: Pos)
     requires
-        current is Present && current->Present_rank is Some ==> candidate_rank >= current->Present_rank->Some_0,
+        current is Present && current->Present_at is Some ==> !pos_lt(candidate, current->Present_at->Some_0),
     ensures
-        publish_allowed_spec(current, candidate_rank),
+        publish_allowed_spec(current, candidate),
 {
 }
 
 /// THE prune guard: may this payload object be deleted, given the current
-/// pointer's rank?
+/// pointer's position?
 ///
 /// A payload is prunable only when ALL hold:
 /// - it is not the pointer's own target;
-/// - its rank is parseable AND **strictly below** the pointer's (an
-///   unparseable rank is never deleted — unknown objects are not ours);
+/// - its position is parseable AND **strictly below** the pointer's (an
+///   unparseable name is never deleted — unknown objects are not ours);
 /// - its age has cleared the grace period (`aged_out`; the model passes
 ///   `true`, checking the harshest zero-grace timing).
 ///
-/// Strictly-below is what makes a dangling pointer impossible regardless of
-/// timing: [`pointer_publish_allowed`] refuses any candidate below the
-/// pointer, and the pointer is monotone — so anything this guard deletes
-/// (rank < pointer-at-prune ≤ pointer-at-any-later-swap) can never be
-/// successfully published afterward. The model checker FOUND the dangling
+/// Strictly-below, in the pointer's own incarnation, is what makes a dangling
+/// pointer impossible regardless of timing, WHILE THE POINTER STAYS IN THAT
+/// INCARNATION: [`pointer_publish_allowed`] refuses any candidate below the
+/// pointer in its incarnation, and the pointer's rank is monotone there — so
+/// anything this guard deletes (rank < pointer-at-prune ≤ pointer-at-any-later
+/// -swap) can never be successfully published afterward. The payload's name
+/// carries its incarnation as well as its revision so that a payload of another
+/// incarnation is never judged by a revision that means nothing to it (it is
+/// never pruned here). The bound is real: a slow exporter of a dead
+/// incarnation can move the pointer out of the live one, and a stale live
+/// exporter can then publish a payload this guard already deleted (fleet
+/// finding F1b, `transport_proofs`: a detected miss, ended by the live exporter's next round).
+/// The model checker FOUND the dangling
 /// counterexample under the earlier age-only rule (a same-cursor payload
 /// collected mid-publish, then published by the `>=` swap guard); this rule
 /// is the structural fix, machine-checked as `pointer target always
 /// fetchable` under zero-grace pruning.
 pub fn payload_prunable(
-    payload_rank: Option<u64>,
-    pointer_rank: u64,
+    payload: Option<Pos>,
+    pointer: Pos,
     is_pointer_target: bool,
     aged_out: bool,
 ) -> (r: bool)
     ensures
-        r == prunable_spec(payload_rank, pointer_rank, is_pointer_target, aged_out),
+        r == prunable_spec(payload, pointer, is_pointer_target, aged_out),
 {
     if is_pointer_target || !aged_out {
         return false;
     }
-    match payload_rank {
-        Some(rank) => rank < pointer_rank,
+    match payload {
+        Some(p) => p.origin == pointer.origin && p.rank < pointer.rank,
         None => false,
     }
 }
 
 /// [`payload_prunable`]: not the target, aged out, and parseable strictly below the pointer.
 pub open spec fn prunable_spec(
-    payload_rank: Option<u64>,
-    pointer_rank: u64,
+    payload: Option<Pos>,
+    pointer: Pos,
     is_pointer_target: bool,
     aged_out: bool,
 ) -> bool {
-    !is_pointer_target && aged_out && payload_rank is Some && payload_rank->Some_0 < pointer_rank
+    !is_pointer_target && aged_out && payload is Some && pos_lt(payload->Some_0, pointer)
 }
 
-/// THEOREM (no dangling pointer): a payload the prune guard deletes can never be published afterwards. The pointer's rank is
-/// monotone ([`a_publish_never_regresses_the_pointer`]), so at any later swap it is `later >= pointer_rank > payload`, and the
-/// publish guard refuses that candidate. Holds for every timing, including zero grace (`aged_out` is a free input).
+/// THEOREM (no dangling pointer, within an incarnation): a payload the prune guard deletes can never be published afterwards while
+/// the pointer stays in its incarnation. The rank is monotone there ([`a_publish_never_regresses_the_pointer_within_an_incarnation`]),
+/// so at any later swap it is `later >= pointer > payload`, and the publish guard refuses that candidate. Holds for every timing,
+/// including zero grace (`aged_out` is a free input). Across incarnations it does not hold: see F1b.
 pub proof fn a_pruned_payload_is_never_published_after(
-    payload_rank: u64,
-    pointer_rank: u64,
-    later_pointer_rank: u64,
+    payload: Pos,
+    pointer: Pos,
+    later_pointer: Pos,
     is_pointer_target: bool,
     aged_out: bool,
 )
     requires
-        prunable_spec(Some(payload_rank), pointer_rank, is_pointer_target, aged_out),
-        later_pointer_rank >= pointer_rank,
+        prunable_spec(Some(payload), pointer, is_pointer_target, aged_out),
+        later_pointer.origin == pointer.origin,
+        later_pointer.rank >= pointer.rank,
     ensures
-        !publish_allowed_spec(PointerState::Present { rank: Some(later_pointer_rank) }, payload_rank),
+        !publish_allowed_spec(PointerState::Present { at: Some(later_pointer) }, payload),
 {
 }
 
-/// THEOREM: the pointer's own target and an unparseable payload are never pruned, whatever the ranks and ages.
+/// THEOREM: the pointer's own target and an unparseable payload are never pruned, whatever the positions and ages.
 pub proof fn the_target_and_unknown_objects_are_never_pruned(
-    payload_rank: Option<u64>,
-    pointer_rank: u64,
+    payload: Option<Pos>,
+    pointer: Pos,
     aged_out: bool,
 )
     ensures
-        !prunable_spec(payload_rank, pointer_rank, true, aged_out),
-        !prunable_spec(None, pointer_rank, false, aged_out),
+        !prunable_spec(payload, pointer, true, aged_out),
+        !prunable_spec(None, pointer, false, aged_out),
 {
 }
 
@@ -252,10 +307,7 @@ pub fn same_incarnation(
     last_sequence: u64,
 ) -> (r: bool)
     ensures
-        r == match cursor_origin {
-            Some(origin) => origin == stream_origin,
-            None => revision <= last_sequence,
-        },
+        r == same_incarnation_spec(cursor_origin, revision, stream_origin, last_sequence),
         // A recorded origin decides alone: the position is never consulted, so a recreated stream refuses an old cursor
         // wherever it falls.
         cursor_origin is Some ==> (r <==> cursor_origin->Some_0 == stream_origin),
@@ -264,6 +316,121 @@ pub fn same_incarnation(
         Some(origin) => origin == stream_origin,
         None => revision <= last_sequence,
     }
+}
+
+/// [`same_incarnation`]'s table.
+pub open spec fn same_incarnation_spec(
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream_origin: u64,
+    last_sequence: u64,
+) -> bool {
+    match cursor_origin {
+        Some(origin) => origin == stream_origin,
+        None => revision <= last_sequence,
+    }
+}
+
+/// THE provenance guard for a fold that holds data and NO cursor (a torn first checkpoint, or a restore cut short): is its data of
+/// the stream that exists now? The fold persists its stream's incarnation (`recorded`) before any data; the stream's own is
+/// `stream` (`Retention::incarnation`). Only an exact match is this stream's. A fold that names another incarnation is foreign, and
+/// so is one that names none (a file written before folds recorded one: a one-time re-seed on upgrade) or a stream that cannot say:
+/// what cannot be proven to be this stream's is treated as foreign, and the repair replaces it key for key.
+pub fn cursorless_fold_is_this_stream(recorded: Option<u64>, stream: Option<u64>) -> (r: bool)
+    ensures
+        r == cursorless_fold_spec(recorded, stream),
+        recorded is None ==> !r,
+        stream is None ==> !r,
+        (recorded is Some && stream is Some && recorded->Some_0 != stream->Some_0) ==> !r,
+{
+    // Mutation (model tests only): trust any fold with data and no cursor (the pre-provenance restore).
+    if cfg!(feature = "mut_cursorless_fold_trusted") {
+        return true;
+    }
+    match (recorded, stream) {
+        (Some(r), Some(s)) => r == s,
+        _ => false,
+    }
+}
+
+/// [`cursorless_fold_is_this_stream`]'s table.
+pub open spec fn cursorless_fold_spec(recorded: Option<u64>, stream: Option<u64>) -> bool {
+    recorded is Some && stream is Some && recorded->Some_0 == stream->Some_0
+}
+
+/// THE export guard: may a fold export itself now? An artifact is the fold at its store's cursor, so the cursor must be a position of
+/// THE STREAM THAT EXISTS NOW: it has a position (a cursor-less fold would publish a rank-0 artifact over any pointer of another
+/// incarnation), and, when the log can say which incarnation it is (`stream`), the cursor is that one's ([`same_incarnation`]: a
+/// foreign cursor, one forgotten by the repair, never exports). A node of a dead stream therefore starts no export round after the
+/// recreation: its first export is refused, and its lease is given back.
+pub fn export_allowed(
+    has_position: bool,
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream: Option<u64>,
+    last_sequence: u64,
+) -> (r: bool)
+    ensures
+        r == export_allowed_spec(has_position, cursor_origin, revision, stream, last_sequence),
+        !has_position ==> !r,
+        (has_position && stream is Some && cursor_origin is Some && cursor_origin->Some_0 != stream->Some_0) ==> !r,
+{
+    // Mutation (model tests only): export whatever the fold holds (the pre-guard behaviour).
+    if cfg!(feature = "mut_export_ignores_stream") {
+        return true;
+    }
+    if !has_position {
+        return false;
+    }
+    match stream {
+        Some(s) => same_incarnation(cursor_origin, revision, s, last_sequence),
+        None => true,
+    }
+}
+
+/// [`export_allowed`]'s table.
+pub open spec fn export_allowed_spec(
+    has_position: bool,
+    cursor_origin: Option<u64>,
+    revision: u64,
+    stream: Option<u64>,
+    last_sequence: u64,
+) -> bool {
+    has_position && match stream {
+        Some(s) => same_incarnation_spec(cursor_origin, revision, s, last_sequence),
+        None => true,
+    }
+}
+
+/// THE lease takeover guard: may a round be won over the lease record found? A record that parses and has not expired is held; an
+/// expired one, or one that does not parse (`None`: one corrupt write must not wedge exports), is taken over. The takeover is a
+/// compare-and-swap against the version read (O3-style, NATS KV), so of racing takers exactly one wins.
+pub fn lease_takeover_allowed(held_until: Option<u64>, now: u64) -> (r: bool)
+    ensures
+        r == lease_takeover_spec(held_until, now),
+{
+    match held_until {
+        Some(until) => until <= now,
+        None => true,
+    }
+}
+
+/// [`lease_takeover_allowed`]'s table.
+pub open spec fn lease_takeover_spec(held_until: Option<u64>, now: u64) -> bool {
+    match held_until {
+        Some(until) => until <= now,
+        None => true,
+    }
+}
+
+/// THEOREM (a held lease is never taken): while a round's lease has not expired (`now < until`), no other round can take it. So two
+/// rounds overlap only if the first outlives its lease: the one clock assumption is that a round finishes within its ttl.
+pub proof fn a_held_lease_is_never_taken(until: u64, now: u64)
+    requires
+        now < until,
+    ensures
+        !lease_takeover_spec(Some(until), now),
+{
 }
 
 /// THE restore guard: may a fold whose cursor (`local_revision`) fell out of
@@ -286,7 +453,7 @@ pub fn same_incarnation(
 /// (`GuardRepair`).
 pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> (r: bool)
     ensures
-        r == (artifact_revision > local_revision && resume_window_spec(artifact_revision, first_sequence)),
+        r == restore_allowed_spec(artifact_revision, local_revision, first_sequence),
         // Never backward, never stale: an admitted restore is strictly ahead of the fold and resumable from its cursor.
         r ==> artifact_revision > local_revision && first_sequence as int <= artifact_revision as int + 1,
 {
@@ -296,6 +463,11 @@ pub fn restore_allowed(artifact_revision: u64, local_revision: u64, first_sequen
     }
     restore_ahead(artifact_revision, local_revision)
         && resume_window_ok(artifact_revision, first_sequence)
+}
+
+/// [`restore_allowed`]: strictly ahead of the fold, and resumable from the artifact's cursor.
+pub open spec fn restore_allowed_spec(artifact_revision: u64, local_revision: u64, first_sequence: u64) -> bool {
+    artifact_revision > local_revision && resume_window_spec(artifact_revision, first_sequence)
 }
 
 /// The "ahead" half of [`restore_allowed`], on its own: what the main loop
@@ -516,6 +688,10 @@ pub enum KeyRestore {
 /// together with the log after `C`: a key whose latest write is after `C`
 /// may be missing or older in it, and the resume delivers that write. So:
 ///
+/// - the local fold is not this stream's (`!local_known`: its cursor was another incarnation's, which the repair forgets): its
+///   entries and revision numbers say nothing about this log, so the artifact's entry is taken whenever it has one and a
+///   local entry it lacks is deleted (the bucket's listing proves nothing about an entry of another stream; the resume
+///   delivers every write after the artifact's cursor). What follows is for a known fold;
 /// - the artifact has the key: take it, unless the local entry is NEWER
 ///   (revisions decide; without both, only `identical` entries are kept) —
 ///   never a move backward;
@@ -528,16 +704,21 @@ pub fn restore_key(
     artifact: KeyState,
     identical: bool,
     listed_live: bool,
+    local_known: bool,
 ) -> (r: KeyRestore)
     ensures
-        r == restore_key_spec(local, artifact, identical, listed_live),
-        // Never a move backward: a local entry strictly newer than the artifact's is kept.
-        (local is At && artifact is At && local->At_0 is Some && artifact->At_0 is Some
+        r == restore_key_spec(local, artifact, identical, listed_live, local_known),
+        // A fold of another incarnation has entries whose revision numbers mean nothing here: the restore makes it the
+        // artifact's, key for key.
+        !local_known ==> (r is TakeArtifact <==> artifact is At),
+        !local_known ==> (r is Delete <==> (local is At && artifact is Absent)),
+        // Never a move backward: a known local entry strictly newer than the artifact's is kept.
+        (local_known && local is At && artifact is At && local->At_0 is Some && artifact->At_0 is Some
             && local->At_0->Some_0 > artifact->At_0->Some_0) ==> r is Keep,
-        // Never a phantom delete: a key the bucket lists live is not deleted.
-        listed_live ==> !(r is Delete),
-        // A delete needs a local entry the artifact lacks.
-        r is Delete ==> (local is At && artifact is Absent && !listed_live),
+        // Never a phantom delete: a key of a known fold that the bucket lists live is not deleted.
+        (local_known && listed_live) ==> !(r is Delete),
+        // A delete needs a local entry the artifact lacks (and, of a known fold, the bucket not listing it live).
+        r is Delete ==> (local is At && artifact is Absent && (!listed_live || !local_known)),
         // The artifact's entry is taken only if it has one.
         r is TakeArtifact ==> artifact is At,
         // Nothing on either side: nothing to do.
@@ -551,6 +732,15 @@ pub fn restore_key(
         (local, artifact)
     };
     let listed_live = listed_live && !cfg!(feature = "mut_restore_ignores_listing");
+    // Mutation (model tests only): trust a fold of another incarnation (the pre-fix restore).
+    let local_known = local_known || cfg!(feature = "mut_restore_trusts_foreign");
+    if !local_known {
+        return match (local, artifact) {
+            (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
+            (KeyState::At(_), KeyState::Absent) => KeyRestore::Delete,
+            (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
+        };
+    }
     match (local, artifact) {
         (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
             if l > a {
@@ -587,7 +777,15 @@ pub open spec fn restore_key_spec(
     artifact: KeyState,
     identical: bool,
     listed_live: bool,
+    local_known: bool,
 ) -> KeyRestore {
+    if !local_known {
+        match (local, artifact) {
+            (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
+            (KeyState::At(_), KeyState::Absent) => KeyRestore::Delete,
+            (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
+        }
+    } else {
     match (local, artifact) {
         (KeyState::At(Some(l)), KeyState::At(Some(a))) if l != a => {
             if l > a { KeyRestore::Keep } else { KeyRestore::TakeArtifact }
@@ -596,6 +794,7 @@ pub open spec fn restore_key_spec(
         (_, KeyState::At(_)) => KeyRestore::TakeArtifact,
         (KeyState::At(_), KeyState::Absent) => if listed_live { KeyRestore::Keep } else { KeyRestore::Delete },
         (KeyState::Absent, KeyState::Absent) => KeyRestore::Keep,
+    }
     }
 }
 
@@ -650,27 +849,78 @@ mod tests {
     #[test]
     fn publish_guard_boundaries() {
         let absent = PointerState::Absent;
-        let corrupt = PointerState::Present { rank: None };
-        let at = |r| PointerState::Present { rank: Some(r) };
-        assert!(pointer_publish_allowed(&absent, 0));
-        assert!(pointer_publish_allowed(&corrupt, 0));
-        assert!(pointer_publish_allowed(&at(5), 5), "equal republishes");
-        assert!(pointer_publish_allowed(&at(5), 6));
-        assert!(!pointer_publish_allowed(&at(5), 4), "stale is refused");
+        let corrupt = PointerState::Present { at: None };
+        let at = |origin, rank| PointerState::Present {
+            at: Some(Pos { origin, rank }),
+        };
+        let pos = |origin, rank| Pos { origin, rank };
+        assert!(pointer_publish_allowed(&absent, pos(1, 0)));
+        assert!(pointer_publish_allowed(&corrupt, pos(1, 0)));
+        assert!(
+            pointer_publish_allowed(&at(1, 5), pos(1, 5)),
+            "equal republishes"
+        );
+        assert!(pointer_publish_allowed(&at(1, 5), pos(1, 6)));
+        assert!(
+            !pointer_publish_allowed(&at(1, 5), pos(1, 4)),
+            "stale is refused"
+        );
+        // A dead incarnation's pointer, ranked above the new head, is replaced...
+        assert!(pointer_publish_allowed(&at(1, 500), pos(2, 3)));
+        // ...and nothing orders incarnations: no clock is assumed, a pointer of another incarnation is replaceable either way.
+        assert!(pointer_publish_allowed(&at(2, 3), pos(1, 500)));
+        // A pointer that records no incarnation is another incarnation to every recorded one.
+        assert!(pointer_publish_allowed(&at(0, 500), pos(2, 3)));
+        assert!(pointer_publish_allowed(&at(2, 3), pos(0, 500)));
     }
 
     #[test]
     fn prune_guard_boundaries() {
+        let pos = |origin, rank| Some(Pos { origin, rank });
+        let ptr = Pos { origin: 2, rank: 5 };
         // Strictly below, aged, not the target: prunable.
-        assert!(payload_prunable(Some(4), 5, false, true));
-        // Equal rank is NOT prunable — it is still publishable (>= guard).
-        assert!(!payload_prunable(Some(5), 5, false, true));
-        assert!(!payload_prunable(Some(6), 5, false, true));
-        // The pointer's own target and unparseable ranks are never prunable.
-        assert!(!payload_prunable(Some(4), 5, true, true));
-        assert!(!payload_prunable(None, 5, false, true));
+        assert!(payload_prunable(pos(2, 4), ptr, false, true));
+        // Equal position is NOT prunable: it is still publishable (>= guard).
+        assert!(!payload_prunable(pos(2, 5), ptr, false, true));
+        assert!(!payload_prunable(pos(2, 6), ptr, false, true));
+        // A payload of another incarnation is never judged by a revision that means nothing to it.
+        assert!(!payload_prunable(pos(1, 4), ptr, false, true));
+        assert!(!payload_prunable(pos(3, 1), ptr, false, true));
+        // The pointer's own target and unparseable names are never prunable.
+        assert!(!payload_prunable(pos(2, 4), ptr, true, true));
+        assert!(!payload_prunable(None, ptr, false, true));
         // Grace window holds everything.
-        assert!(!payload_prunable(Some(4), 5, false, false));
+        assert!(!payload_prunable(pos(2, 4), ptr, false, false));
+    }
+
+    #[test]
+    fn export_and_lease_guards() {
+        // A cursor of this stream exports; of another, or none, does not.
+        assert!(export_allowed(true, Some(7), 5, Some(7), 10));
+        assert!(
+            !export_allowed(true, Some(6), 5, Some(7), 10),
+            "dead stream"
+        );
+        assert!(
+            !export_allowed(false, Some(7), 0, Some(7), 10),
+            "no position"
+        );
+        assert!(
+            export_allowed(true, None, 5, Some(7), 10),
+            "unrecorded, possible here"
+        );
+        assert!(
+            !export_allowed(true, None, 50, Some(7), 10),
+            "unrecorded, beyond the head"
+        );
+        assert!(
+            export_allowed(true, None, 5, None, 0),
+            "a log that cannot say"
+        );
+        // A held lease is not taken; an expired or unparseable one is.
+        assert!(!lease_takeover_allowed(Some(100), 99));
+        assert!(lease_takeover_allowed(Some(100), 100));
+        assert!(lease_takeover_allowed(None, 0));
     }
 
     #[test]
@@ -777,28 +1027,60 @@ mod tests {
         use KeyRestore::*;
         use KeyState::*;
         assert_eq!(
-            restore_key(At(Some(5)), At(Some(3)), false, false),
+            restore_key(At(Some(5)), At(Some(3)), false, false, true),
             Keep,
             "local newer"
         );
         assert_eq!(
-            restore_key(At(Some(3)), At(Some(5)), false, false),
+            restore_key(At(Some(3)), At(Some(5)), false, false, true),
             TakeArtifact
         );
         assert_eq!(
-            restore_key(At(Some(3)), At(Some(3)), true, false),
+            restore_key(At(Some(3)), At(Some(3)), true, false, true),
             Keep,
             "identical"
         );
-        assert_eq!(restore_key(At(None), At(None), false, false), TakeArtifact);
-        assert_eq!(restore_key(Absent, At(Some(1)), false, false), TakeArtifact);
         assert_eq!(
-            restore_key(At(Some(1)), Absent, false, true),
+            restore_key(At(None), At(None), false, false, true),
+            TakeArtifact
+        );
+        assert_eq!(
+            restore_key(Absent, At(Some(1)), false, false, true),
+            TakeArtifact
+        );
+        assert_eq!(
+            restore_key(At(Some(1)), Absent, false, true, true),
             Keep,
             "listed live"
         );
-        assert_eq!(restore_key(At(Some(1)), Absent, false, false), Delete);
-        assert_eq!(restore_key(Absent, Absent, false, true), Keep);
+        assert_eq!(restore_key(At(Some(1)), Absent, false, false, true), Delete);
+        assert_eq!(restore_key(Absent, Absent, false, true, true), Keep);
+    }
+
+    #[test]
+    fn restore_key_over_an_unknown_fold_is_the_artifacts() {
+        use KeyRestore::*;
+        use KeyState::*;
+        // A local entry the old stream numbered above the artifact's is not newer.
+        assert_eq!(
+            restore_key(At(Some(500)), At(Some(3)), false, false, false),
+            TakeArtifact
+        );
+        // Even when identical: nothing is kept on a foreign claim.
+        assert_eq!(
+            restore_key(At(Some(3)), At(Some(3)), true, false, false),
+            TakeArtifact
+        );
+        // The bucket listing the key proves nothing about an entry of another stream.
+        assert_eq!(
+            restore_key(At(Some(500)), Absent, false, true, false),
+            Delete
+        );
+        assert_eq!(restore_key(Absent, Absent, false, true, false), Keep);
+        assert_eq!(
+            restore_key(Absent, At(Some(1)), false, false, false),
+            TakeArtifact
+        );
     }
 
     #[test]

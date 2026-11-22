@@ -70,7 +70,7 @@ use crate::kernels::applied::{
     Action, Actions, Event, Fatal, Queued, ResumeFrom, State as KState, StoreOutcome, resume_from,
     step,
 };
-use crate::kv::{KvError, KvUpdate, KvWatcher, WatchCursor};
+use crate::kv::{KvError, KvUpdate, KvWatcher, Retention, WatchCursor};
 use crate::repair::{self, ExpiryRepair};
 use crate::snapshot::{SnapshotError, SnapshotStore};
 
@@ -378,13 +378,15 @@ where
     // `repair::run_watch`).
     let unanchored = match &store {
         Some(st) if resume.as_ref().is_none_or(WatchCursor::is_none) => match st.has_entries() {
-            Ok(has) => has,
+            // The incarnation the store's data records as its own: what a fold
+            // with data and no cursor is judged by (`repair::run_watch`).
+            Ok(has) => has.then(|| st.cursor().origin()),
             Err(e) => {
                 let e = KvError::WatchError(format!("reading the fold at start failed: {e}"));
                 return early(e, store);
             }
         },
-        _ => false,
+        _ => None,
     };
 
     // The cursor we'll return. Initialized from the resume position so that a
@@ -419,6 +421,7 @@ where
         // Spawn the watch task. It owns the cursor-expiry handling so the main loop
         // only ever sees a clean ordered stream of updates on `rx`, plus repairs.
         let (tx, mut rx) = mpsc::channel::<KvUpdate>(config.channel_capacity.max(1));
+        let export_watcher = Arc::clone(&watcher);
         let handle = tokio::spawn(repair::run_watch(
             watcher,
             scope,
@@ -496,7 +499,12 @@ where
                 req = async { exports.as_mut().expect("arm guarded by is_some").recv().await },
                     if exports.is_some() => {
                     match req {
-                        Some(req) => fold.export(req, &prefixes).await.map_err(stop)?,
+                        Some(req) => {
+                            // The stream as it is now: an export is refused
+                            // unless the fold's cursor is this stream's.
+                            let retention = export_watcher.retention().await;
+                            fold.export(req, &prefixes, retention).await.map_err(stop)?
+                        }
                         // Sender dropped: disarm the arm for the rest of the run.
                         None => exports = None,
                     }
@@ -869,6 +877,27 @@ where
         }
     }
 
+    /// The fold's cursor was another incarnation's: its position, its
+    /// incarnation and its eviction memo are the old stream's, so the fold is
+    /// a cursor-less one that holds data until a repair commits the new
+    /// stream's cursor. Run after the repair's settle, so nothing queued under
+    /// the old cursor is lost.
+    pub(crate) fn forget_cursor(&mut self) {
+        // Mutation (model tests only): keep the memo (the pre-fix repair).
+        let seen = self.applied.seen_evicting() && cfg!(feature = "mut_foreign_keeps_memo");
+        self.applied = WatchCursor::none().remembering(seen);
+    }
+
+    /// A fold of this stream that has no cursor records the stream's incarnation
+    /// on the commits a repair makes under it, so they do not erase the record
+    /// that says whose its data is (a position-less, origin-only cursor).
+    pub(crate) fn stamp_incarnation(&mut self, origin: Option<u64>) {
+        if let (true, Some(o)) = (self.applied.is_none(), origin) {
+            let seen = self.applied.seen_evicting();
+            self.applied = WatchCursor::origin_only(o).remembering(seen);
+        }
+    }
+
     /// Remember, durably, that the bucket's retention evicts current values:
     /// from now on every cursor this fold commits carries the memo, and so
     /// does every artifact exported from it. Commits at once, even with
@@ -922,6 +951,7 @@ where
         &mut self,
         ExportRequest { dest_dir, reply }: ExportRequest,
         scope: &[String],
+        retention: Result<Option<Retention>, KvError>,
     ) -> Result<(), KvError> {
         let acts = self.decide(Event::ExportRequested {
             has_store: self.store.is_some(),
@@ -940,6 +970,30 @@ where
             }
         }
         let mut st = self.store.take().expect("ExportStore implies a store");
+        // THE export guard: the store's cursor must be a position of the stream
+        // that exists now (`protocol::export_allowed`). A node of a dead stream,
+        // a fold whose foreign cursor was forgotten, and a cursor-less fold
+        // start no round: the lease is given back, nothing is published. A
+        // stream that cannot be read fails closed.
+        let cursor = st.cursor();
+        let allowed = match &retention {
+            Ok(r) => crate::protocol::export_allowed(
+                cursor.as_u64().is_some(),
+                cursor.origin(),
+                cursor.rank(),
+                r.and_then(|r| r.incarnation),
+                r.map_or(0, |r| r.last_revision),
+            ),
+            Err(_) => false,
+        };
+        if !allowed {
+            self.store = Some(st);
+            let _ = reply.send(Err(SnapshotError::Backend(format!(
+                "export refused: the fold's cursor ({cursor:?}) is not a position of the stream \
+                 that exists now (a foreign cursor, no cursor, or the stream could not be read)"
+            ))));
+            return Ok(());
+        }
         let scope = scope.to_vec();
         match tokio::task::spawn_blocking(move || {
             let res = st
@@ -2257,6 +2311,97 @@ mod tests {
 
         sd_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    /// A watcher over a stream of incarnation `.1` that delivers `.0`'s script.
+    struct OfStream(MockWatcher, u64);
+
+    #[async_trait]
+    impl KvWatcher for OfStream {
+        async fn watch_all(&self, tx: Sender<KvUpdate>) -> Result<(), KvError> {
+            self.0.watch_all(tx).await
+        }
+
+        async fn watch_prefix(&self, prefix: &str, tx: Sender<KvUpdate>) -> Result<(), KvError> {
+            self.0.watch_prefix(prefix, tx).await
+        }
+
+        async fn watch_prefixes(
+            &self,
+            prefixes: &[&str],
+            tx: Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            self.0.watch_prefixes(prefixes, tx).await
+        }
+
+        async fn retention(&self) -> Result<Option<Retention>, KvError> {
+            Ok(Some(Retention {
+                evicts_current_values: false,
+                first_revision: 1,
+                last_revision: 1_000,
+                incarnation: Some(self.1),
+            }))
+        }
+    }
+
+    /// THE export guard, end to end: a fold exports only a cursor that is a
+    /// position of the stream that exists now. A fold folded on incarnation 7
+    /// exports while the stream is 7, and is refused (its lease given back,
+    /// nothing published) once the stream is 9: a node of a dead stream starts
+    /// no export round. A fold with no cursor never exports.
+    #[tokio::test(start_paused = true)]
+    async fn a_fold_of_a_dead_stream_exports_nothing() {
+        let versioned = |rev: u64| {
+            KvUpdate::Put(KvEntry {
+                key: format!("k{rev}"),
+                value: b"v".to_vec(),
+                version: VersionToken::from_u64(rev).with_origin(7),
+            })
+        };
+        for (stream, updates, expect_export) in [
+            (7, vec![versioned(1), versioned(2)], true),
+            (9, vec![versioned(1), versioned(2)], false),
+            (7, vec![], false),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (_r, store) = AppendLogSnapshot::open(&dir.path().join("fold"), u64::MAX).unwrap();
+            let watcher = Arc::new(OfStream(MockWatcher::new(updates, true), stream));
+            let (sd_tx, sd_rx) = watch::channel(false);
+            let (ex_tx, ex_rx) = mpsc::channel(1);
+            let task = tokio::spawn(watch_applied(
+                watcher,
+                WatchScope::All,
+                None,
+                None,
+                Some(store),
+                Some(ex_rx),
+                BatchConfig {
+                    window: Duration::from_secs(3600),
+                    max: 100,
+                    ..BatchConfig::default()
+                },
+                parse_put,
+                move |_batch: Vec<Vec<u8>>| {},
+                move |_| {},
+                sd_rx,
+            ));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            ex_tx
+                .send(ExportRequest {
+                    dest_dir: dir.path().join("artifact"),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            let reply = reply_rx.await.unwrap();
+            assert_eq!(reply.is_ok(), expect_export, "stream {stream}: {reply:?}");
+            if !expect_export {
+                assert!(!dir.path().join("artifact").exists(), "nothing was staged");
+            }
+            sd_tx.send(true).unwrap();
+            task.await.unwrap().unwrap();
+        }
     }
 
     /// An [`ExportRequest`] that arrives with NOTHING pending (the window

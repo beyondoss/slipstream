@@ -488,6 +488,14 @@ impl<const N: usize> SnapshotProtocol<N> {
     }
 }
 
+/// A cursor in the artifact order: this model has one incarnation.
+fn pos(cursor: u8) -> slipstream::protocol::Pos {
+    slipstream::protocol::Pos {
+        origin: 1,
+        rank: u64::from(cursor),
+    }
+}
+
 impl<const N: usize> Model for SnapshotProtocol<N> {
     type State = St<N>;
     type Action = Act;
@@ -649,14 +657,11 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                     let observed = match s.manifest {
                         None => slipstream::protocol::PointerState::Absent,
                         Some(m) => slipstream::protocol::PointerState::Present {
-                            rank: Some(m.cursor as u64),
+                            at: Some(pos(m.cursor)),
                         },
                     };
                     let allowed = self.mutation == Mutation::LwwPointer
-                        || slipstream::protocol::pointer_publish_allowed(
-                            &observed,
-                            a.cursor as u64,
-                        );
+                        || slipstream::protocol::pointer_publish_allowed(&observed, pos(a.cursor));
                     if allowed {
                         if let Some(m) = s.manifest
                             && m.cursor > a.cursor
@@ -731,8 +736,8 @@ impl<const N: usize> Model for SnapshotProtocol<N> {
                 } else {
                     s.uploaded.retain(|a| {
                         !slipstream::protocol::payload_prunable(
-                            Some(a.cursor as u64),
-                            keep.cursor as u64,
+                            Some(pos(a.cursor)),
+                            pos(keep.cursor),
                             *a == keep,
                             true,
                         )
