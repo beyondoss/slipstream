@@ -20,14 +20,14 @@ path = "src/lib.rs"
 
 [dependencies]
 aho-corasick = "1"
-async-nats = "0.46"
+async-nats = "0.53"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8.5"
 crc32fast = "1"
 fjall = { version = "3", optional = true }
 futures = "0.3"
-object_store = { version = "0.13.2", optional = true, features = ["aws", "fs"] }
+object_store = { version = "0.14.2", optional = true, features = ["aws", "fs"] }
 rocksdb = { package = "rust-rocksdb", version = "0.50", optional = true, default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
